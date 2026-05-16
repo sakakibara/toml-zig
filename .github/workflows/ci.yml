@@ -1,0 +1,211 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Cancel any in-flight runs for the same ref when a new commit lands.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ZIG_VERSION: "0.16.0"
+  TOML_TEST_VERSION: "v2.2.0"
+
+jobs:
+  # Native build + full test + spec conformance suite.
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest          # x86_64-linux
+          - ubuntu-24.04-arm       # aarch64-linux
+          - macos-latest           # aarch64-macos
+          - windows-latest         # x86_64-windows
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: install zig (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          case "${{ runner.os }}-${{ runner.arch }}" in
+            Linux-X64)    triple=x86_64-linux ;;
+            Linux-ARM64)  triple=aarch64-linux ;;
+            macOS-ARM64)  triple=aarch64-macos ;;
+            *) echo "unsupported runner: ${{ runner.os }}-${{ runner.arch }}"; exit 1 ;;
+          esac
+          url="https://ziglang.org/download/${ZIG_VERSION}/zig-${triple}-${ZIG_VERSION}.tar.xz"
+          mkdir -p "$HOME/zig"
+          curl -fsSL "$url" | tar -xJ -C "$HOME/zig"
+          echo "$HOME/zig/zig-${triple}-${ZIG_VERSION}" >> "$GITHUB_PATH"
+
+      - name: install zig (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $url = "https://ziglang.org/download/$env:ZIG_VERSION/zig-x86_64-windows-$env:ZIG_VERSION.zip"
+          $dst = Join-Path $env:USERPROFILE 'zig'
+          New-Item -ItemType Directory -Force -Path $dst | Out-Null
+          Invoke-WebRequest -Uri $url -OutFile zig.zip
+          Expand-Archive -LiteralPath zig.zip -DestinationPath $dst
+          "$dst\zig-x86_64-windows-$env:ZIG_VERSION" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+      - uses: actions/cache@v5
+        with:
+          path: .zig-cache
+          key: zig-cache-${{ runner.os }}-${{ runner.arch }}-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
+          restore-keys: |
+            zig-cache-${{ runner.os }}-${{ runner.arch }}-${{ env.ZIG_VERSION }}-
+
+      - name: zig build test
+        run: zig build test --summary all
+
+      - name: zig build (release)
+        run: zig build -Doptimize=ReleaseFast --summary all
+
+      - name: install toml-test (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          case "${{ runner.os }}-${{ runner.arch }}" in
+            Linux-X64)    triple=linux-amd64 ;;
+            Linux-ARM64)  triple=linux-arm64 ;;
+            macOS-ARM64)  triple=darwin-arm64 ;;
+            macOS-X64)    triple=darwin-amd64 ;;
+            *) echo "unsupported: ${{ runner.os }}-${{ runner.arch }}"; exit 1 ;;
+          esac
+          url="https://github.com/toml-lang/toml-test/releases/download/${TOML_TEST_VERSION}/toml-test-${TOML_TEST_VERSION}-${triple}.gz"
+          curl -fsSL "$url" | gunzip > toml-test
+          chmod +x toml-test
+
+      - name: install toml-test (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $url = "https://github.com/toml-lang/toml-test/releases/download/$env:TOML_TEST_VERSION/toml-test-$env:TOML_TEST_VERSION-windows-amd64.exe.gz"
+          Invoke-WebRequest -Uri $url -OutFile toml-test.exe.gz
+          $gz = [System.IO.File]::OpenRead("toml-test.exe.gz")
+          $gzs = New-Object System.IO.Compression.GzipStream($gz, [System.IO.Compression.CompressionMode]::Decompress)
+          $out = [System.IO.File]::Create("toml-test.exe")
+          $gzs.CopyTo($out)
+          $out.Close(); $gzs.Close(); $gz.Close()
+
+      - name: toml-test conformance (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          ./toml-test test -toml=1.1 \
+            -decoder=zig-out/bin/toml-test-decoder \
+            -encoder=zig-out/bin/toml-test-encoder
+
+      # `--%` is PowerShell's stop-parsing token: everything to its right is
+      # passed verbatim to the native command. Without it, pwsh's argument
+      # parsing mangles `-toml=1.1` so toml-test sees an unexpected positional.
+      - name: toml-test conformance (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          ./toml-test.exe --% test -toml=1.1 -decoder=zig-out/bin/toml-test-decoder.exe -encoder=zig-out/bin/toml-test-encoder.exe
+
+  # Cross-compile only (no test execution) for every Zig-supported target
+  # we can't run natively in CI. Verifies the lib builds cleanly on all
+  # platforms.
+  cross-compile:
+    name: cross (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86-linux-gnu
+          - x86-linux-musl
+          - x86_64-linux-musl
+          - aarch64-linux-musl
+          - arm-linux-gnueabihf
+          - arm-linux-musleabihf
+          - riscv64-linux-gnu
+          - riscv64-linux-musl
+          - powerpc64-linux-gnu
+          - powerpc64le-linux-gnu
+          - mips64-linux-gnuabi64
+          - mips-linux-gnueabihf
+          - x86-windows-gnu
+          - aarch64-windows-gnu
+          - wasm32-wasi
+          - wasm32-freestanding
+          - x86_64-freebsd
+          - aarch64-freebsd
+          - x86_64-netbsd
+          - x86_64-openbsd
+    steps:
+      - uses: actions/checkout@v6
+      - name: install zig
+        shell: bash
+        run: |
+          url="https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          mkdir -p "$HOME/zig"
+          curl -fsSL "$url" | tar -xJ -C "$HOME/zig"
+          echo "$HOME/zig/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+      - uses: actions/cache@v5
+        with:
+          path: .zig-cache
+          key: zig-cache-cross-${{ matrix.target }}-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
+          restore-keys: |
+            zig-cache-cross-${{ matrix.target }}-${{ env.ZIG_VERSION }}-
+      - name: build for ${{ matrix.target }}
+        run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSafe
+
+  # Random-input fuzzing. Asserts no panic, round-trip invariant on
+  # parse/encode, byte-identical lossless on document model, and span
+  # bounds. 200k iterations flushes low-effort bugs in ~1 minute on CI.
+  fuzz:
+    name: fuzz
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: install zig
+        shell: bash
+        run: |
+          url="https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          mkdir -p "$HOME/zig"
+          curl -fsSL "$url" | tar -xJ -C "$HOME/zig"
+          echo "$HOME/zig/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+      - uses: actions/cache@v5
+        with:
+          path: .zig-cache
+          key: zig-cache-fuzz-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
+          restore-keys: |
+            zig-cache-fuzz-${{ env.ZIG_VERSION }}-
+      - name: 200k iter fuzz
+        run: zig build fuzz -- --iters 200000
+
+  # Microbenchmarks. Reports numbers; doesn't gate on regression.
+  bench:
+    name: bench
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v6
+      - name: install zig
+        shell: bash
+        run: |
+          url="https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          mkdir -p "$HOME/zig"
+          curl -fsSL "$url" | tar -xJ -C "$HOME/zig"
+          echo "$HOME/zig/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+      - uses: actions/cache@v5
+        with:
+          path: .zig-cache
+          key: zig-cache-bench-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
+          restore-keys: |
+            zig-cache-bench-${{ env.ZIG_VERSION }}-
+      - name: bench
+        run: zig build bench

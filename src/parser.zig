@@ -1,0 +1,2322 @@
+//! TOML 1.1 parser  -  single-pass recursive descent, arena-allocated.
+//!
+//! Entry point: `parse(arena, input, options) -> Value` (always returns a table).
+//! On error: returns `error.TomlParseError`. Set `options.errors` to a
+//! `*std.ArrayList(Diagnostic)` to recover line/col/message.
+
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const ArrayList = std.ArrayList;
+const StringArrayHashMap = std.array_hash_map.String;
+const StringHashMap = std.StringHashMapUnmanaged;
+
+const v = @import("value.zig");
+const dt = @import("datetime.zig");
+const lev = @import("levenshtein.zig");
+
+pub const Value = v.Value;
+pub const Date = v.Date;
+pub const Time = v.Time;
+pub const DateTime = v.DateTime;
+
+pub const Diagnostic = struct {
+    /// 1-based line of the error's primary span.
+    line: u32,
+    /// 1-based column of the error's primary span start.
+    col: u32,
+    /// Arena-allocated. Lifetime: the parse arena.
+    message: []const u8,
+    /// Byte range of the offending token within the original source.
+    /// `null` only when the error site has no associated token (e.g.,
+    /// unexpected EOF -- there is no byte to underline).
+    range: ?[2]u32 = null,
+    /// Path context for decode errors (e.g., "users[2].name"). Empty
+    /// for parser-side errors.
+    path: ?[]const u8 = null,
+    /// "Did you mean X?" suggestion. Set when a typo'd key or value
+    /// is rejected. Arena-allocated.
+    suggestion: ?[]const u8 = null,
+    /// Secondary annotations (e.g., "previously declared here at 5:1").
+    notes: []const Note = &.{},
+
+    pub const Note = struct {
+        line: u32,
+        col: u32,
+        message: []const u8,
+    };
+
+    pub fn format(self: Diagnostic, writer: *std.Io.Writer) !void {
+        try writer.print("TOML parse error at {d}:{d}: {s}", .{ self.line, self.col, self.message });
+    }
+
+    /// Multi-line rich form. Emits a rustc-style block: header,
+    /// source-line with caret underline, notes, suggestion.
+    /// Caller provides the original source bytes (the same slice passed
+    /// to `parse`). ASCII only -- no terminal color escapes.
+    pub fn formatRich(self: Diagnostic, w: *std.Io.Writer, source: []const u8) !void {
+        try w.print("error at {d}:{d}: {s}\n", .{ self.line, self.col, self.message });
+        if (self.path) |p| try w.print("  at {s}\n", .{p});
+
+        // Source snippet (only if we have line/col and source bounds match).
+        if (self.line > 0 and self.range != null) blk: {
+            var line_start: usize = 0;
+            var lineno: u32 = 1;
+            var i: usize = 0;
+            while (i < source.len and lineno < self.line) : (i += 1) {
+                if (source[i] == '\n') {
+                    lineno += 1;
+                    line_start = i + 1;
+                }
+            }
+            if (lineno != self.line) break :blk;
+            var line_end = line_start;
+            while (line_end < source.len and source[line_end] != '\n') line_end += 1;
+
+            const line_text = source[line_start..line_end];
+            try w.print("  |\n{d:>3} | {s}\n  | ", .{ self.line, line_text });
+
+            const r = self.range.?;
+            const col0 = if (r[0] >= line_start) r[0] - line_start else 0;
+            const carets = if (r[1] > r[0]) r[1] - r[0] else 1;
+            var c: usize = 0;
+            while (c < col0) : (c += 1) try w.writeByte(' ');
+            var k: usize = 0;
+            while (k < carets) : (k += 1) try w.writeByte('^');
+            try w.writeByte('\n');
+        }
+
+        for (self.notes) |n| {
+            try w.print("  = note: at {d}:{d}: {s}\n", .{ n.line, n.col, n.message });
+        }
+
+        if (self.suggestion) |s| {
+            try w.print("  = help: did you mean `{s}`?\n", .{s});
+        }
+    }
+};
+
+pub const Error = error{
+    TomlParseError,
+    OutOfMemory,
+};
+
+/// All knobs for parse / parseReader / parseInto / parseIntoReader.
+/// Default `.{}` is the no-knob common case. Defined here; re-exported
+/// by `toml.zig` as `toml.ParseOptions` (which is the canonical name
+/// callers should use).
+pub const ParseOptions = struct {
+    /// When non-null, parser appends each error and continues (recover-and-
+    /// skip-to-next-newline). Returns `error.TomlParseError` if any errors
+    /// were collected. When null, parser bails on the first error with no
+    /// error info captured.
+    errors: ?*std.ArrayList(Diagnostic) = null,
+
+    /// If non-null, populated with one Span per emitted Value, keyed by
+    /// dotted path. Array elements use `[N]` index segments.
+    spans: ?*v.Spans = null,
+
+    /// Decode-only. When true, TOML keys absent from the target struct
+    /// are silently dropped instead of triggering `error.UnknownField`.
+    /// Honored by parseInto / parseIntoReader / decode. Ignored by
+    /// dynamic parse / parseReader.
+    ignore_unknown_fields: bool = false,
+};
+
+const MAX_RECOVERY_ERRORS: usize = 100;
+
+/// Skip ASCII bytes in `bytes` that are unambiguously safe to include in
+/// a basic string (i.e., not `"`, `\`, control char, DEL, or non-ASCII).
+/// Returns the number of bytes skipped. The caller handles the byte at
+/// the returned offset (or hits EOF).
+fn scanBasicStringFast(bytes: []const u8) usize {
+    const W = 16;
+    var i: usize = 0;
+    const quote: @Vector(W, u8) = @splat('"');
+    const backslash: @Vector(W, u8) = @splat('\\');
+    const ctrl_max: @Vector(W, u8) = @splat(0x1f);
+    const tab: @Vector(W, u8) = @splat('\t');
+    const del: @Vector(W, u8) = @splat(0x7f);
+    const high: @Vector(W, u8) = @splat(0x80);
+    while (i + W <= bytes.len) {
+        const chunk: @Vector(W, u8) = bytes[i..][0..W].*;
+        const stop =
+            (chunk == quote) |
+            (chunk == backslash) |
+            (chunk == del) |
+            (chunk >= high) |
+            ((chunk <= ctrl_max) & (chunk != tab));
+        const mask: u16 = @bitCast(stop);
+        if (mask != 0) return i + @ctz(mask);
+        i += W;
+    }
+    while (i < bytes.len) {
+        const c = bytes[i];
+        if (c == '"' or c == '\\' or c == 0x7f or c >= 0x80 or
+            (c <= 0x1f and c != '\t')) return i;
+        i += 1;
+    }
+    return i;
+}
+
+/// Fast path for the common case: decimal integer, no underscores, no
+/// sign, no leading zero (unless the value is exactly "0"), fits in
+/// i64. Returns null otherwise; caller falls back to the full parser.
+fn parseDecFast(s: []const u8) ?i64 {
+    if (s.len == 0 or s.len > 19) return null;
+    // TOML rejects leading zeros (except for "0" itself).
+    if (s.len > 1 and s[0] == '0') return null;
+    var result: i64 = 0;
+    for (s) |c| {
+        if (c < '0' or c > '9') return null;
+        const digit: i64 = @intCast(c - '0');
+        const product = @mulWithOverflow(result, 10);
+        if (product[1] != 0) return null;
+        const sum = @addWithOverflow(product[0], digit);
+        if (sum[1] != 0) return null;
+        result = sum[0];
+    }
+    return result;
+}
+
+/// Options-aware parse. See `toml.ParseOptions`.
+pub fn parse(arena: Allocator, input: []const u8, options: ParseOptions) Error!Value {
+    var p = Parser.init(arena, input);
+    p.spans = options.spans;
+    p.errors = options.errors;
+    return p.parseDocument();
+}
+
+pub const ReaderError = Error || std.Io.Reader.AllocError;
+
+/// Reader-input variant. Pulls the full input into arena memory first,
+/// then runs `parse` over it. TOML's grammar requires the whole document
+/// to be available before the value tree is complete.
+pub fn parseReader(arena: Allocator, reader: *std.Io.Reader, options: ParseOptions) ReaderError!Value {
+    const input = try reader.allocRemaining(arena, .unlimited);
+    return parse(arena, input, options);
+}
+
+
+const Parser = struct {
+    arena: Allocator,
+    input: []const u8,
+    pos: usize = 0,
+    line: u32 = 1,
+    col: u32 = 1,
+    /// Byte position of the current token attempt's start. Captured at the
+    /// top of parse* helpers that may error; used to populate Diagnostic.range.
+    token_start: u32 = 0,
+
+    /// Top-level (root) table. Always returned as the result.
+    root: StringArrayHashMap(Value) = .empty,
+
+    /// Where the next `key = value` pair lands. Changes on
+    /// `[header]` / `[[array-of-tables]]`.
+    current: *StringArrayHashMap(Value) = undefined,
+    /// Dotted path prefix that identifies `current` (empty at root).
+    /// Used to build full keys during kv dotted-descent.
+    current_prefix: ArrayList(u8) = .empty,
+
+    /// Tables that were explicitly defined via `[header]`  -  redefining
+    /// one is an error. Header-defined tables cannot be extended via
+    /// dotted-key from a different `[header]` scope.
+    defined_tables: StringHashMap(void) = .empty,
+    /// Tables that were created as implicit intermediates of an
+    /// `[a.b.c]` header (only). These can still be promoted to
+    /// defined by a later `[a.b]` header. Populated only in parseHeader.
+    implicit_tables: StringHashMap(void) = .empty,
+    /// Keys that are inline-defined (value of `key = {...}` or nested
+    /// within an inline table literal). Any such key and its sub-paths
+    /// are permanently sealed  -  no header may re-open them, no dotted-key
+    /// may extend them.
+    inline_tables: StringHashMap(void) = .empty,
+    /// Full paths of tables that were created as intermediates by a
+    /// dotted-key kv descent (in ANY header's scope, cumulative).
+    /// A later `[p.q]` header must reject if `p.q` is in this set.
+    dotted_created: StringHashMap(void) = .empty,
+    /// Full paths of tables kv-dotted-created within the CURRENT header
+    /// scope. Cleared on each header. Used to allow same-header dotted
+    /// extension while rejecting cross-header extension.
+    dotted_current: StringHashMap(void) = .empty,
+    /// Names of arrays-of-tables (tracked so we know to append).
+    array_tables: StringHashMap(void) = .empty,
+
+    /// Multi-error sink. When set, each error append + recover; when null,
+    /// first error bails. Set from ParseOptions.errors in `parse` / `parseReader`.
+    errors: ?*std.ArrayList(Diagnostic) = null,
+
+    /// When non-null, populated with one entry per emitted value
+    /// (path -> source span). Set via `ParseOptions.spans`.
+    spans: ?*v.Spans = null,
+    /// Mutable buffer holding the current value's full dotted path while
+    /// inside `parseValue`. Composite parsers (`parseArray`,
+    /// `parseInlineTable`) push child segments before recursing and
+    /// restore the buffer length on exit. Only meaningful when
+    /// `spans != null`.
+    current_path: ArrayList(u8) = .empty,
+
+    fn init(arena: Allocator, input: []const u8) Parser {
+        return .{ .arena = arena, .input = input };
+    }
+
+    /// Snapshot the current source position. Used at value start.
+    fn here(self: *const Parser) v.Span {
+        return .{
+            .start = @intCast(self.pos),
+            .end = @intCast(self.pos),
+            .line = self.line,
+            .col = self.col,
+        };
+    }
+
+    /// Record a span for a value at `path`. No-op if span tracking is off.
+    fn recordSpan(self: *Parser, path: []const u8, start: v.Span) Error!void {
+        const sm = self.spans orelse return;
+        const dup = try self.arena.dupe(u8, path);
+        try sm.put(self.arena, dup, .{
+            .start = start.start,
+            .end = @intCast(self.pos),
+            .line = start.line,
+            .col = start.col,
+        });
+    }
+
+    /// Append a child path segment, returning the previous length so the
+    /// caller can restore via `popPath`. Cheap when spans are off.
+    fn pushPath(self: *Parser, separator: u8, segment: []const u8) Error!usize {
+        if (self.spans == null) return 0;
+        const prev_len = self.current_path.items.len;
+        if (prev_len > 0 and separator != 0) try self.current_path.append(self.arena, separator);
+        try self.current_path.appendSlice(self.arena, segment);
+        return prev_len;
+    }
+
+    /// Append `[N]` index segment.
+    fn pushIndex(self: *Parser, idx: usize) Error!usize {
+        if (self.spans == null) return 0;
+        const prev_len = self.current_path.items.len;
+        try self.current_path.print(self.arena, "[{d}]", .{idx});
+        return prev_len;
+    }
+
+    fn popPath(self: *Parser, prev_len: usize) void {
+        if (self.spans == null) return;
+        self.current_path.shrinkRetainingCapacity(prev_len);
+    }
+
+    fn parseDocument(self: *Parser) Error!Value {
+        self.current = &self.root;
+        var had_error = false;
+
+        while (true) {
+            try self.skipWsAndComments();
+            if (self.eof()) break;
+
+            const c = self.peek();
+            const stmt_result: Error!void = if (c == '[')
+                self.parseHeader()
+            else
+                self.parseKeyValue(self.current);
+
+            if (stmt_result) |_| {
+                try self.expectEol();
+            } else |err| {
+                if (err != error.TomlParseError) return err;
+                had_error = true;
+                if (self.errors == null) return err;
+                if (self.errors.?.items.len >= MAX_RECOVERY_ERRORS) return err;
+                self.recoverToNextStatement();
+                continue;
+            }
+        }
+
+        if (had_error) return error.TomlParseError;
+        return Value{ .table = self.root };
+    }
+
+    // ----- location / lookahead primitives -----
+
+    inline fn eof(self: *Parser) bool {
+        return self.pos >= self.input.len;
+    }
+
+    inline fn peek(self: *Parser) u8 {
+        return self.input[self.pos];
+    }
+
+    inline fn peekAt(self: *Parser, offset: usize) ?u8 {
+        const idx = self.pos + offset;
+        if (idx >= self.input.len) return null;
+        return self.input[idx];
+    }
+
+    inline fn advance(self: *Parser) void {
+        const c = self.input[self.pos];
+        self.pos += 1;
+        if (c == '\n') {
+            self.line += 1;
+            self.col = 1;
+        } else {
+            self.col += 1;
+        }
+    }
+
+    inline fn match(self: *Parser, c: u8) bool {
+        if (self.eof() or self.peek() != c) return false;
+        self.advance();
+        return true;
+    }
+
+    fn matchStr(self: *Parser, s: []const u8) bool {
+        if (self.pos + s.len > self.input.len) return false;
+        if (!std.mem.eql(u8, self.input[self.pos .. self.pos + s.len], s)) return false;
+        var i: usize = 0;
+        while (i < s.len) : (i += 1) self.advance();
+        return true;
+    }
+
+    fn skipWs(self: *Parser) void {
+        while (!self.eof()) {
+            const c = self.peek();
+            if (c == ' ' or c == '\t') self.advance() else return;
+        }
+    }
+
+    /// Skip to the end of the current line and consume the newline.
+    /// Used for error recovery: after a statement-level parse failure,
+    /// advance past the bad line so the outer loop can attempt the next one.
+    fn recoverToNextStatement(self: *Parser) void {
+        while (!self.eof() and self.peek() != '\n') self.advance();
+        if (!self.eof()) self.advance(); // consume the newline
+    }
+
+    /// Skip whitespace, comments, and newlines. Used at statement
+    /// boundaries. Returns an error on malformed comments or bare CR.
+    fn skipWsAndComments(self: *Parser) Error!void {
+        while (!self.eof()) {
+            const c = self.peek();
+            switch (c) {
+                ' ', '\t' => self.advance(),
+                '\n' => self.advance(),
+                '\r' => {
+                    // A lone CR (not part of CRLF) is invalid.
+                    if (self.peekAt(1) != '\n') {
+                        return self.setError("bare CR is invalid");
+                    }
+                    self.advance();
+                },
+                '#' => {
+                    try self.consumeComment();
+                },
+                else => return,
+            }
+        }
+    }
+
+    /// Consume a `#`-prefixed comment up to (but not including) the
+    /// terminating newline. Returns an error if the comment contains
+    /// disallowed control characters or invalid UTF-8.
+    fn consumeComment(self: *Parser) Error!void {
+        _ = self.match('#');
+        while (!self.eof() and self.peek() != '\n') {
+            const k = self.peek();
+            if (k == '\r') {
+                if (self.peekAt(1) == '\n') return; // CRLF ends comment.
+                return self.setError("bare CR in comment");
+            }
+            if (k < 0x20 and k != 0x09) {
+                return self.setError("control character in comment");
+            }
+            if (k == 0x7F) {
+                return self.setError("DEL control character in comment");
+            }
+            if (k >= 0x80) {
+                // Validate UTF-8 multi-byte sequence.
+                try self.validateUtf8();
+                continue;
+            }
+            self.advance();
+        }
+    }
+
+    /// Validate that the current position is the start of a valid UTF-8
+    /// multi-byte sequence and advance past it. Rejects overlong
+    /// encodings and surrogate code points.
+    fn validateUtf8(self: *Parser) Error!void {
+        const b0 = self.peek();
+        const seq_len: usize = if (b0 < 0x80) 1 else if (b0 < 0xC2) 0 // 0x80..0xC1: invalid continuation or overlong
+        else if (b0 < 0xE0) 2 else if (b0 < 0xF0) 3 else if (b0 < 0xF5) 4 else 0;
+        if (seq_len == 0) return self.setError("invalid UTF-8 byte");
+        if (self.pos + seq_len > self.input.len) return self.setError("truncated UTF-8 sequence");
+        const bytes = self.input[self.pos .. self.pos + seq_len];
+        const cp = std.unicode.utf8Decode(bytes) catch return self.setError("invalid UTF-8 sequence");
+        // Surrogates (encoded as 3 bytes) are rejected by utf8Decode,
+        // but double-check code point range.
+        if (cp > 0x10FFFF) return self.setError("code point out of range");
+        var i: usize = 0;
+        while (i < seq_len) : (i += 1) self.advance();
+    }
+
+    /// Expect end-of-line (newline or EOF), possibly preceded by whitespace
+    /// and a comment.
+    fn expectEol(self: *Parser) Error!void {
+        self.skipWs();
+        if (self.eof()) return;
+        if (self.peek() == '#') {
+            try self.consumeComment();
+        }
+        if (self.eof()) return;
+        if (self.peek() == '\n') {
+            self.advance();
+            return;
+        }
+        if (self.peek() == '\r') {
+            if (self.peekAt(1) != '\n') return self.setError("bare CR");
+            self.advance();
+            self.advance();
+            return;
+        }
+        return self.setError("expected newline");
+    }
+
+    fn setError(self: *Parser, comptime msg: []const u8) Error {
+        if (self.errors) |list| {
+            const owned_msg = self.arena.dupe(u8, msg) catch return error.OutOfMemory;
+            list.append(self.arena, .{
+                .line = self.line,
+                .col = self.col,
+                .message = owned_msg,
+                .range = .{ self.token_start, @intCast(self.pos) },
+            }) catch return error.OutOfMemory;
+        }
+        return error.TomlParseError;
+    }
+
+    fn setErrorFmt(self: *Parser, comptime fmt: []const u8, args: anytype) Error {
+        if (self.errors) |list| {
+            const msg = std.fmt.allocPrint(self.arena, fmt, args) catch return error.OutOfMemory;
+            list.append(self.arena, .{
+                .line = self.line,
+                .col = self.col,
+                .message = msg,
+                .range = .{ self.token_start, @intCast(self.pos) },
+            }) catch return error.OutOfMemory;
+        }
+        return error.TomlParseError;
+    }
+
+    fn setErrorWithSuggestion(self: *Parser, msg: []const u8, suggestion: ?[]const u8) Error {
+        if (self.errors) |list| {
+            const owned_msg = self.arena.dupe(u8, msg) catch return error.OutOfMemory;
+            const owned_sug = if (suggestion) |s| self.arena.dupe(u8, s) catch return error.OutOfMemory else null;
+            list.append(self.arena, .{
+                .line = self.line,
+                .col = self.col,
+                .message = owned_msg,
+                .range = .{ self.token_start, @intCast(self.pos) },
+                .suggestion = owned_sug,
+            }) catch return error.OutOfMemory;
+        }
+        return error.TomlParseError;
+    }
+
+    // ----- header / array-of-tables parsing -----
+
+    fn parseHeader(self: *Parser) Error!void {
+        // Already saw `[`
+        _ = self.match('[');
+        const is_array = self.match('[');
+
+        self.skipWs();
+        self.token_start = @intCast(self.pos);
+        var key_parts: ArrayList([]const u8) = .empty;
+        defer key_parts.deinit(self.arena);
+
+        try self.parseKeyPath(&key_parts);
+        self.skipWs();
+
+        if (is_array) {
+            if (!self.match(']')) return self.setError("expected ']]'");
+            if (!self.match(']')) return self.setError("expected ']]'");
+        } else {
+            if (!self.match(']')) return self.setError("expected ']'");
+        }
+
+        // Entering a new header invalidates the "dotted in current header"
+        // scope  -  headers never share dotted-created tables.
+        self.dotted_current.clearRetainingCapacity();
+
+        // Navigate / create intermediate tables.
+        var table = &self.root;
+        var full_key: ArrayList(u8) = .empty;
+        defer full_key.deinit(self.arena);
+
+        for (key_parts.items, 0..) |part, i| {
+            if (i > 0) try full_key.append(self.arena, '.');
+            try full_key.appendSlice(self.arena, part);
+
+            const last = i == key_parts.items.len - 1;
+            const key_owned = try self.arena.dupe(u8, full_key.items);
+
+            // Inline-defined paths are sealed  -  never re-openable via
+            // `[header]` (even for intermediates, you can't traverse
+            // into an inline table's sub-structure).
+            if (self.inline_tables.contains(key_owned)) {
+                return self.setErrorFmt("cannot extend inline table '{s}'", .{full_key.items});
+            }
+            // Dotted-key-created paths only block direct RE-DEFINITION
+            // by a header with the exact same path. Deeper sub-tables
+            // (`[a.b.seeds]` after `a.b.x = ...`) are allowed.
+            if (last and self.dotted_created.contains(key_owned)) {
+                return self.setErrorFmt("cannot redefine dotted-key-created table '{s}'", .{full_key.items});
+            }
+
+            if (last) {
+                if (is_array) {
+                    try self.openArrayOfTables(table, part, key_owned);
+                    // current becomes the newly appended table element
+                    const gop = table.getPtr(part).?; // array entry
+                    const idx = gop.array.items.len - 1;
+                    const last_elem = &gop.array.items[idx];
+                    self.current = &last_elem.table;
+                    // Update the current prefix for future kv full-key
+                    // lookups. Use a synthetic index so paths inside
+                    // different array elements don't collide.
+                    self.current_prefix.clearRetainingCapacity();
+                    try self.current_prefix.appendSlice(self.arena, full_key.items);
+                    try self.current_prefix.print(self.arena, "[{d}]", .{idx});
+                } else {
+                    try self.openTable(table, part, key_owned);
+                    self.current = &table.getPtr(part).?.table;
+                    self.current_prefix.clearRetainingCapacity();
+                    try self.current_prefix.appendSlice(self.arena, full_key.items);
+                }
+            } else {
+                // Intermediate  -  walk or create, but forbid traversing
+                // through scalars, inline tables, or arrays-of-tables
+                // (must target the last element of array-of-tables) or
+                // normal arrays.
+                if (table.getPtr(part)) |existing| {
+                    switch (existing.*) {
+                        .table => table = &existing.table,
+                        .array => {
+                            if (!self.array_tables.contains(key_owned)) {
+                                return self.setErrorFmt("cannot redefine array '{s}' as table", .{full_key.items});
+                            }
+                            const last_elem = &existing.array.items[existing.array.items.len - 1];
+                            table = &last_elem.table;
+                        },
+                        else => return self.setErrorFmt("key '{s}' is not a table", .{full_key.items}),
+                    }
+                } else {
+                    // Create implicit intermediate table. `part` is a
+                    // zero-copy slice into self.input.
+                    try table.put(self.arena, part, .{ .table = .empty });
+                    try self.implicit_tables.put(self.arena, key_owned, {});
+                    table = &table.getPtr(part).?.table;
+                }
+            }
+        }
+    }
+
+    fn openTable(self: *Parser, parent: *StringArrayHashMap(Value), key: []const u8, full_key: []const u8) Error!void {
+        if (self.inline_tables.contains(full_key)) {
+            return self.setErrorFmt("cannot redefine inline table '{s}'", .{full_key});
+        }
+        if (parent.getPtr(key)) |existing| {
+            switch (existing.*) {
+                .table => {
+                    // Allowed only if this was an implicit (intermediate) table.
+                    if (self.defined_tables.contains(full_key)) {
+                        return self.setErrorFmt("table '{s}' redefined", .{full_key});
+                    }
+                    _ = self.implicit_tables.remove(full_key);
+                    try self.defined_tables.put(self.arena, full_key, {});
+                    return;
+                },
+                else => return self.setErrorFmt("key '{s}' already defined with different type", .{full_key}),
+            }
+        }
+        // Zero-copy: `key` is a slice into self.input.
+        try parent.put(self.arena, key, .{ .table = .empty });
+        try self.defined_tables.put(self.arena, full_key, {});
+    }
+
+    fn openArrayOfTables(self: *Parser, parent: *StringArrayHashMap(Value), key: []const u8, full_key: []const u8) Error!void {
+        if (parent.getPtr(key)) |existing| {
+            switch (existing.*) {
+                .array => {
+                    if (!self.array_tables.contains(full_key)) {
+                        return self.setErrorFmt("cannot append to static array '{s}'", .{full_key});
+                    }
+                    try existing.array.append(self.arena, .{ .table = .empty });
+                    return;
+                },
+                else => return self.setErrorFmt("key '{s}' already defined", .{full_key}),
+            }
+        }
+        // Zero-copy: `key` is a slice into self.input.
+        var arr: ArrayList(Value) = .empty;
+        try arr.append(self.arena, .{ .table = .empty });
+        try parent.put(self.arena, key, .{ .array = arr });
+        try self.array_tables.put(self.arena, full_key, {});
+    }
+
+    // ----- key/value parsing -----
+
+    fn parseKeyValue(self: *Parser, target: *StringArrayHashMap(Value)) Error!void {
+        self.skipWs();
+        self.token_start = @intCast(self.pos);
+        var parts: ArrayList([]const u8) = .empty;
+        defer parts.deinit(self.arena);
+        try self.parseKeyPath(&parts);
+        self.skipWs();
+        if (!self.match('=')) return self.setError("expected '=' after key");
+        self.skipWs();
+
+        // Build the full key prefix so we can check against closed-set
+        // rules. The prefix is `current_prefix` + parts joined by '.'.
+        var full_key: ArrayList(u8) = .empty;
+        defer full_key.deinit(self.arena);
+        try full_key.appendSlice(self.arena, self.current_prefix.items);
+
+        // Descend intermediate tables for dotted keys.
+        var t = target;
+        for (parts.items[0 .. parts.items.len - 1], 0..) |part, i| {
+            // Always emit a separator for joins  -  empty keys are valid
+            // in TOML (e.g. `""."x" = 1`) and would otherwise collapse.
+            if (self.current_prefix.items.len > 0 or i > 0) try full_key.append(self.arena, '.');
+            try full_key.appendSlice(self.arena, part);
+            const fk = try self.arena.dupe(u8, full_key.items);
+
+            // Inline/header-defined/other-header-dotted-created tables
+            // cannot be extended via dotted-key descent.
+            if (self.inline_tables.contains(fk)) {
+                return self.setErrorFmt("cannot extend inline table '{s}'", .{fk});
+            }
+            if (self.defined_tables.contains(fk)) {
+                return self.setErrorFmt("cannot extend header-defined table '{s}'", .{fk});
+            }
+            if (self.dotted_created.contains(fk) and !self.dotted_current.contains(fk)) {
+                return self.setErrorFmt("cannot extend dotted-key-created table '{s}' from a different scope", .{fk});
+            }
+
+            if (t.getPtr(part)) |existing| {
+                switch (existing.*) {
+                    .table => {
+                        t = &existing.table;
+                    },
+                    else => return self.setErrorFmt("key '{s}' is not a table", .{fk}),
+                }
+            } else {
+                // Zero-copy: `part` is a slice into self.input.
+                try t.put(self.arena, part, .{ .table = .empty });
+                t = &t.getPtr(part).?.table;
+                try self.dotted_created.put(self.arena, fk, {});
+                try self.dotted_current.put(self.arena, fk, {});
+            }
+        }
+
+        // Final key: full path for this leaf.
+        const last = parts.items[parts.items.len - 1];
+        if (self.current_prefix.items.len > 0 or parts.items.len > 1) try full_key.append(self.arena, '.');
+        try full_key.appendSlice(self.arena, last);
+        const fk_final = try self.arena.dupe(u8, full_key.items);
+
+        if (t.contains(last)) {
+            return self.setErrorFmt("duplicate key '{s}'", .{last});
+        }
+
+        // Set the current path so parseValue records its span (and
+        // nested element spans, recursively) against the right key.
+        const prev_path_len = self.current_path.items.len;
+        self.current_path.clearRetainingCapacity();
+        try self.current_path.appendSlice(self.arena, fk_final);
+        defer {
+            self.current_path.shrinkRetainingCapacity(prev_path_len);
+        }
+
+        const value = try self.parseValue();
+        // Zero-copy: `last` is a slice into self.input, which the caller
+        // guarantees outlives the parse tree (documented contract). The
+        // HashMap stores the slice header, not a copy of the bytes.
+        try t.put(self.arena, last, value);
+
+        // If value is an inline table or an array containing inline
+        // tables, seal the affected paths so they can't be reopened
+        // or extended.
+        try self.sealInlineValue(fk_final, value);
+    }
+
+    /// Recursively mark `full_key` (and, if the value is a table or array
+    /// of tables, its children) as inline-defined.
+    fn sealInlineValue(self: *Parser, full_key: []const u8, value: Value) Error!void {
+        // Only inline-table values (and their sub-tables) need sealing.
+        // Scalars and inline arrays don't introduce header-extendable
+        // table paths, so we save the HashMap insert in the hot path.
+        switch (value) {
+            .table => |t| {
+                try self.inline_tables.put(self.arena, full_key, {});
+                var it = t.iterator();
+                while (it.next()) |entry| {
+                    const sub = try std.fmt.allocPrint(self.arena, "{s}.{s}", .{ full_key, entry.key_ptr.* });
+                    try self.sealInlineValue(sub, entry.value_ptr.*);
+                }
+            },
+            else => {},
+        }
+    }
+
+    fn parseKeyPath(self: *Parser, out: *ArrayList([]const u8)) Error!void {
+        while (true) {
+            self.skipWs();
+            const part = try self.parseOneKey();
+            try out.append(self.arena, part);
+            self.skipWs();
+            if (!self.match('.')) return;
+        }
+    }
+
+    fn parseOneKey(self: *Parser) Error![]const u8 {
+        if (self.eof()) return self.setError("expected key");
+        const c = self.peek();
+        if (c == '"') {
+            return self.parseBasicString();
+        }
+        if (c == '\'') {
+            return self.parseLiteralString();
+        }
+        // Bare key: A-Za-z0-9_-
+        const start = self.pos;
+        while (!self.eof()) {
+            const k = self.peek();
+            if ((k >= 'A' and k <= 'Z') or (k >= 'a' and k <= 'z') or (k >= '0' and k <= '9') or k == '_' or k == '-') {
+                self.advance();
+            } else break;
+        }
+        if (self.pos == start) return self.setError("expected key");
+        return self.input[start..self.pos];
+    }
+
+    // ----- values -----
+
+    fn parseValue(self: *Parser) Error!Value {
+        if (self.eof()) return self.setError("expected value");
+
+        self.token_start = @intCast(self.pos);
+        // Snapshot the value's byte-precise start so any nested parser
+        // (parseArray, parseInlineTable) can record spans against this
+        // exact position regardless of how deep we recurse.
+        const start = self.here();
+        const value = try self.parseValueInner();
+        try self.recordSpanAtCurrentPath(start);
+        return value;
+    }
+
+    fn parseValueInner(self: *Parser) Error!Value {
+        const c = self.peek();
+        switch (c) {
+            '"' => {
+                if (self.peekAt(1) == '"' and self.peekAt(2) == '"') {
+                    const s = try self.parseMultilineBasicString();
+                    return .{ .string = s };
+                }
+                const s = try self.parseBasicString();
+                return .{ .string = s };
+            },
+            '\'' => {
+                if (self.peekAt(1) == '\'' and self.peekAt(2) == '\'') {
+                    const s = try self.parseMultilineLiteralString();
+                    return .{ .string = s };
+                }
+                const s = try self.parseLiteralString();
+                return .{ .string = s };
+            },
+            '[' => return self.parseArray(),
+            '{' => return self.parseInlineTable(),
+            't', 'f' => return self.parseBoolean(),
+            else => return self.parseNumberOrDateTime(),
+        }
+    }
+
+    /// Record a span for the value currently being parsed at the current
+    /// path. No-op when spans are disabled.
+    fn recordSpanAtCurrentPath(self: *Parser, start: v.Span) Error!void {
+        const sm = self.spans orelse return;
+        const dup = try self.arena.dupe(u8, self.current_path.items);
+        try sm.put(self.arena, dup, .{
+            .start = start.start,
+            .end = @intCast(self.pos),
+            .line = start.line,
+            .col = start.col,
+        });
+    }
+
+    // ----- strings -----
+
+    fn parseBasicString(self: *Parser) Error![]const u8 {
+        self.token_start = @intCast(self.pos);
+        if (!self.match('"')) return self.setError("expected '\"'");
+
+        // Zero-copy fast-path: scan for end-of-string without building a buffer.
+        // SIMD bulk-skip plain ASCII 16 bytes at a time; only drop to scalar for
+        // stop bytes (quote, backslash, control, DEL, non-ASCII).
+        const start = self.pos;
+        var has_escape = false;
+        while (!self.eof()) {
+            // Bulk-advance past plain ASCII before touching individual bytes.
+            const skip = scanBasicStringFast(self.input[self.pos..]);
+            self.col += @intCast(skip);
+            self.pos += skip;
+            if (self.eof()) break;
+
+            const c = self.peek();
+            if (c == '"') break;
+            if (c == '\\') {
+                has_escape = true;
+                break;
+            }
+            if (c == '\n' or c == '\r') return self.setError("newline in basic string");
+            if (c < 0x20 and c != 0x09) return self.setError("control character in string");
+            if (c == 0x7F) return self.setError("DEL in string");
+            if (c >= 0x80) {
+                try self.validateUtf8();
+                continue;
+            }
+            self.advance();
+        }
+        if (!has_escape) {
+            if (self.eof() or self.peek() != '"') return self.setError("unterminated string");
+            const slice = self.input[start..self.pos];
+            self.advance();
+            return slice;
+        }
+
+        var buf: ArrayList(u8) = .empty;
+        try buf.appendSlice(self.arena, self.input[start..self.pos]);
+        while (!self.eof()) {
+            // Bulk-advance past plain ASCII.
+            const skip = scanBasicStringFast(self.input[self.pos..]);
+            if (skip > 0) {
+                try buf.appendSlice(self.arena, self.input[self.pos .. self.pos + skip]);
+                self.col += @intCast(skip);
+                self.pos += skip;
+                if (self.eof()) break;
+            }
+
+            const c = self.peek();
+            if (c == '"') {
+                self.advance();
+                return buf.items;
+            }
+            if (c == '\\') {
+                try self.consumeEscape(&buf, false);
+                continue;
+            }
+            if (c == '\n' or c == '\r') return self.setError("newline in basic string");
+            if (c < 0x20 and c != 0x09) return self.setError("control character in string");
+            if (c == 0x7F) return self.setError("DEL in string");
+            if (c >= 0x80) {
+                const before = self.pos;
+                try self.validateUtf8();
+                try buf.appendSlice(self.arena, self.input[before..self.pos]);
+                continue;
+            }
+            try buf.append(self.arena, c);
+            self.advance();
+        }
+        return self.setError("unterminated string");
+    }
+
+    fn consumeEscape(self: *Parser, buf: *ArrayList(u8), multiline: bool) Error!void {
+        _ = self.match('\\');
+        if (self.eof()) return self.setError("unterminated escape");
+        const e = self.peek();
+        switch (e) {
+            'b' => {
+                try buf.append(self.arena, 0x08);
+                self.advance();
+            },
+            't' => {
+                try buf.append(self.arena, 0x09);
+                self.advance();
+            },
+            'n' => {
+                try buf.append(self.arena, 0x0A);
+                self.advance();
+            },
+            'f' => {
+                try buf.append(self.arena, 0x0C);
+                self.advance();
+            },
+            'r' => {
+                try buf.append(self.arena, 0x0D);
+                self.advance();
+            },
+            'e' => {
+                // TOML 1.1: \e -> U+001B (ESC).
+                try buf.append(self.arena, 0x1B);
+                self.advance();
+            },
+            '"' => {
+                try buf.append(self.arena, '"');
+                self.advance();
+            },
+            '\\' => {
+                try buf.append(self.arena, '\\');
+                self.advance();
+            },
+            'x' => {
+                // TOML 1.1: \xHH -> single byte. The two hex digits form
+                // a codepoint < 256; emit as UTF-8.
+                self.advance();
+                const cp = try self.parseUnicodeEscape(2);
+                try appendCodepoint(buf, self.arena, cp);
+            },
+            'u' => {
+                self.advance();
+                const cp = try self.parseUnicodeEscape(4);
+                try appendCodepoint(buf, self.arena, cp);
+            },
+            'U' => {
+                self.advance();
+                const cp = try self.parseUnicodeEscape(8);
+                try appendCodepoint(buf, self.arena, cp);
+            },
+            '\n', '\r', ' ', '\t' => {
+                if (!multiline) return self.setError("invalid escape");
+                // Line-ending backslash: eat whitespace+newline+whitespace.
+                // Must reach a newline or the sequence is an error.
+                // Skip trailing spaces/tabs on this line.
+                while (!self.eof() and (self.peek() == ' ' or self.peek() == '\t')) self.advance();
+                if (self.eof()) return self.setError("unterminated string");
+                if (self.peek() == '\r') self.advance();
+                if (self.eof() or self.peek() != '\n') return self.setError("invalid line-ending backslash");
+                self.advance();
+                // Now skip ALL subsequent whitespace incl. newlines.
+                while (!self.eof()) {
+                    const k = self.peek();
+                    if (k == ' ' or k == '\t' or k == '\n' or k == '\r') self.advance() else break;
+                }
+            },
+            else => return self.setError("invalid escape"),
+        }
+    }
+
+    fn parseUnicodeEscape(self: *Parser, n: usize) Error!u32 {
+        if (self.pos + n > self.input.len) return self.setError("short unicode escape");
+        var cp: u32 = 0;
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const c = self.peek();
+            const d: u32 = switch (c) {
+                '0'...'9' => c - '0',
+                'a'...'f' => c - 'a' + 10,
+                'A'...'F' => c - 'A' + 10,
+                else => return self.setError("invalid hex in \\u escape"),
+            };
+            cp = cp * 16 + d;
+            self.advance();
+        }
+        if (cp > 0x10FFFF) return self.setError("\\U code point out of range");
+        // Surrogates are invalid.
+        if (cp >= 0xD800 and cp <= 0xDFFF) return self.setError("surrogate code point in \\u escape");
+        return cp;
+    }
+
+    fn appendCodepoint(buf: *ArrayList(u8), arena: Allocator, cp: u32) Error!void {
+        var utf8: [4]u8 = undefined;
+        const n = std.unicode.utf8Encode(@intCast(cp), &utf8) catch return error.TomlParseError;
+        try buf.appendSlice(arena, utf8[0..n]);
+    }
+
+    fn parseLiteralString(self: *Parser) Error![]const u8 {
+        self.token_start = @intCast(self.pos);
+        if (!self.match('\'')) return self.setError("expected '\\''");
+        const start = self.pos;
+        while (!self.eof()) {
+            const c = self.peek();
+            if (c == '\'') {
+                const slice = self.input[start..self.pos];
+                self.advance();
+                return slice;
+            }
+            if (c == '\n' or c == '\r') return self.setError("newline in literal string");
+            if (c < 0x20 and c != 0x09) return self.setError("control in literal string");
+            if (c == 0x7F) return self.setError("DEL in literal string");
+            if (c >= 0x80) {
+                try self.validateUtf8();
+                continue;
+            }
+            self.advance();
+        }
+        return self.setError("unterminated literal string");
+    }
+
+    fn parseMultilineBasicString(self: *Parser) Error![]const u8 {
+        self.token_start = @intCast(self.pos);
+        // consume opening """
+        _ = self.match('"');
+        _ = self.match('"');
+        _ = self.match('"');
+        // Optional immediate newline after opening delimiter is trimmed.
+        if (!self.eof() and self.peek() == '\r') self.advance();
+        if (!self.eof() and self.peek() == '\n') self.advance();
+
+        var buf: ArrayList(u8) = .empty;
+
+        while (!self.eof()) {
+            // Look for closing """
+            if (self.peek() == '"') {
+                if (self.peekAt(1) == '"' and self.peekAt(2) == '"') {
+                    // Consume three ", then allow up to 2 more as content.
+                    self.advance();
+                    self.advance();
+                    self.advance();
+                    if (!self.eof() and self.peek() == '"') {
+                        try buf.append(self.arena, '"');
+                        self.advance();
+                        if (!self.eof() and self.peek() == '"') {
+                            try buf.append(self.arena, '"');
+                            self.advance();
+                        }
+                    }
+                    return buf.items;
+                }
+                // else: single/double " not at terminator
+                try buf.append(self.arena, '"');
+                self.advance();
+                continue;
+            }
+            if (self.peek() == '\\') {
+                try self.consumeEscape(&buf, true);
+                continue;
+            }
+            const c = self.peek();
+            if (c < 0x20 and c != 0x09 and c != 0x0A and c != 0x0D) return self.setError("control character in string");
+            if (c == 0x7F) return self.setError("DEL in string");
+            // Normalize CRLF to LF.
+            if (c == '\r') {
+                if (self.peekAt(1) == '\n') {
+                    self.advance();
+                    continue;
+                }
+                return self.setError("bare CR in multiline string");
+            }
+            if (c >= 0x80) {
+                const before = self.pos;
+                try self.validateUtf8();
+                try buf.appendSlice(self.arena, self.input[before..self.pos]);
+                continue;
+            }
+            try buf.append(self.arena, c);
+            self.advance();
+        }
+        return self.setError("unterminated multiline string");
+    }
+
+    fn parseMultilineLiteralString(self: *Parser) Error![]const u8 {
+        self.token_start = @intCast(self.pos);
+        _ = self.match('\'');
+        _ = self.match('\'');
+        _ = self.match('\'');
+        if (!self.eof() and self.peek() == '\r') self.advance();
+        if (!self.eof() and self.peek() == '\n') self.advance();
+
+        // Try zero-copy: scan for ''' without any special processing.
+        const start = self.pos;
+        var zero_copy_possible = true;
+        while (!self.eof()) {
+            const c = self.peek();
+            if (c == '\r' and self.peekAt(1) == '\n') {
+                // Zero-copy would preserve CR  -  TOML wants LF only here.
+                zero_copy_possible = false;
+                break;
+            }
+            if (c == '\'') {
+                if (self.peekAt(1) == '\'' and self.peekAt(2) == '\'') {
+                    const end = self.pos;
+                    self.advance();
+                    self.advance();
+                    self.advance();
+                    // Content may have up to 2 trailing single quotes folded in.
+                    var tail: usize = 0;
+                    while (tail < 2 and !self.eof() and self.peek() == '\'') {
+                        self.advance();
+                        tail += 1;
+                    }
+                    if (tail == 0) {
+                        return self.input[start..end];
+                    }
+                    // Fall through: we consumed extras, need copy path.
+                    var buf: ArrayList(u8) = .empty;
+                    try buf.appendSlice(self.arena, self.input[start..end]);
+                    var k: usize = 0;
+                    while (k < tail) : (k += 1) try buf.append(self.arena, '\'');
+                    return buf.items;
+                }
+            }
+            // Lone CR (not followed by LF) is invalid per TOML 1.1.
+            if (c == 0x0D and self.peekAt(1) != '\n') return self.setError("lone CR in literal string");
+            if (c < 0x20 and c != 0x09 and c != 0x0A and c != 0x0D) return self.setError("control in literal string");
+            if (c == 0x7F) return self.setError("DEL in literal string");
+            if (c >= 0x80) {
+                try self.validateUtf8();
+                continue;
+            }
+            self.advance();
+        }
+        if (!zero_copy_possible) {
+            // Rewind to start of body and walk with copy path.
+            self.pos = start;
+            // Recompute line/col is impractical here; for simplicity the
+            // error location may be off by at most this single string,
+            // which is acceptable for diagnostics.
+            var buf: ArrayList(u8) = .empty;
+            while (!self.eof()) {
+                const c = self.peek();
+                if (c == '\r' and self.peekAt(1) == '\n') {
+                    try buf.append(self.arena, '\n');
+                    self.advance();
+                    self.advance();
+                    continue;
+                }
+                if (c == '\'') {
+                    if (self.peekAt(1) == '\'' and self.peekAt(2) == '\'') {
+                        self.advance();
+                        self.advance();
+                        self.advance();
+                        var tail: usize = 0;
+                        while (tail < 2 and !self.eof() and self.peek() == '\'') {
+                            try buf.append(self.arena, '\'');
+                            self.advance();
+                            tail += 1;
+                        }
+                        return buf.items;
+                    }
+                }
+                if (c < 0x20 and c != 0x09 and c != 0x0A and c != 0x0D) return self.setError("control in literal string");
+                if (c == 0x7F) return self.setError("DEL in literal string");
+                if (c >= 0x80) {
+                    const before = self.pos;
+                    try self.validateUtf8();
+                    try buf.appendSlice(self.arena, self.input[before..self.pos]);
+                    continue;
+                }
+                try buf.append(self.arena, c);
+                self.advance();
+            }
+            return self.setError("unterminated multiline literal string");
+        }
+        return self.setError("unterminated multiline literal string");
+    }
+
+    // ----- booleans -----
+
+    fn parseBoolean(self: *Parser) Error!Value {
+        self.token_start = @intCast(self.pos);
+        if (self.matchStr("true")) return .{ .boolean = true };
+        if (self.matchStr("false")) return .{ .boolean = false };
+        // Scan the bareword so we can give a suggestion.
+        const word_start = self.pos;
+        while (self.pos < self.input.len) {
+            const c = self.input[self.pos];
+            if (std.ascii.isAlphanumeric(c) or c == '_') {
+                self.pos += 1;
+                self.col += 1;
+            } else break;
+        }
+        const word = self.input[word_start..self.pos];
+        const known = [_][]const u8{ "true", "false", "inf", "nan" };
+        const suggestion = lev.closestMatch(word, &known, lev.suggestionThreshold(word.len));
+        const msg = std.fmt.allocPrint(self.arena, "invalid value `{s}`", .{word}) catch return error.OutOfMemory;
+        return self.setErrorWithSuggestion(msg, suggestion);
+    }
+
+    // ----- numbers / datetimes -----
+
+    /// Unified entry point for unquoted values: integers, floats, inf/nan,
+    /// and datetimes. Needs lookahead because `1979-05-27` looks like a
+    /// subtraction in integer context.
+    fn parseNumberOrDateTime(self: *Parser) Error!Value {
+        self.token_start = @intCast(self.pos);
+        // Scan the token.
+        const start = self.pos;
+        // Allow a leading sign for numbers only.
+        var has_sign = false;
+        if (self.peek() == '+' or self.peek() == '-') {
+            has_sign = true;
+            self.advance();
+        }
+
+        // inf / nan keywords
+        if (self.peekKeyword("inf")) {
+            _ = self.matchStr("inf");
+            const f: f64 = if (self.input[start] == '-') -std.math.inf(f64) else std.math.inf(f64);
+            return .{ .float = f };
+        }
+        if (self.peekKeyword("nan")) {
+            _ = self.matchStr("nan");
+            // Bit-set nan; sign preserved for completeness but TOML reader
+            // treats nan as nan regardless.
+            const base = std.math.nan(f64);
+            const f: f64 = if (self.input[start] == '-') -base else base;
+            return .{ .float = f };
+        }
+
+        // Collect the token. For a datetime we need at least 4 digits + '-',
+        // so look ahead.
+        if (!has_sign and self.pos + 4 < self.input.len and
+            isDig(self.input[self.pos]) and isDig(self.input[self.pos + 1]) and
+            isDig(self.input[self.pos + 2]) and isDig(self.input[self.pos + 3]) and
+            self.input[self.pos + 4] == '-')
+        {
+            // Likely a date/datetime. Scan to end of token.
+            const token = self.scanDateTimeLiteral();
+            const parsed = dt.parseAny(token) catch return self.setError("invalid datetime");
+            return switch (parsed) {
+                .datetime => |d| .{ .datetime = d },
+                .date => |d| .{ .date = d },
+                .time => |t| .{ .time = t },
+            };
+        }
+        // Time literal: HH:MM:SS...
+        if (!has_sign and self.pos + 2 < self.input.len and
+            isDig(self.input[self.pos]) and isDig(self.input[self.pos + 1]) and self.input[self.pos + 2] == ':')
+        {
+            const token = self.scanTimeLiteral();
+            const parsed = dt.parseAny(token) catch return self.setError("invalid time");
+            return switch (parsed) {
+                .time => |t| .{ .time = t },
+                else => self.setError("invalid time"),
+            };
+        }
+
+        // Number. Distinguish integer from float by scanning.
+        // Check for radix prefix (only after optional sign and only if no sign).
+        if (!has_sign and self.pos + 1 < self.input.len and self.input[self.pos] == '0') {
+            const prefix = self.input[self.pos + 1];
+            if (prefix == 'x' or prefix == 'o' or prefix == 'b') {
+                self.advance();
+                self.advance();
+                return switch (prefix) {
+                    'x' => self.parseRadixInteger(16),
+                    'o' => self.parseRadixInteger(8),
+                    'b' => self.parseRadixInteger(2),
+                    else => unreachable,
+                };
+            }
+        }
+
+        // Decimal int or float. Scan digits, check for `.` or `e`/`E`.
+        var has_dot = false;
+        var has_exp = false;
+        var scan = self.pos;
+        while (scan < self.input.len) : (scan += 1) {
+            const c = self.input[scan];
+            switch (c) {
+                '0'...'9', '_' => {},
+                '.' => {
+                    if (has_dot or has_exp) break;
+                    has_dot = true;
+                },
+                'e', 'E' => {
+                    if (has_exp) break;
+                    has_exp = true;
+                    // optional sign follows
+                    if (scan + 1 < self.input.len and (self.input[scan + 1] == '+' or self.input[scan + 1] == '-')) scan += 1;
+                },
+                else => break,
+            }
+        }
+        const end = scan;
+
+        if (has_dot or has_exp) {
+            // float
+            const raw = self.input[start..end];
+            const f = parseFloatRaw(raw) catch return self.setError("invalid float");
+            // Advance parser.
+            while (self.pos < end) self.advance();
+            return .{ .float = f };
+        }
+
+        // integer (decimal)
+        const raw = self.input[start..end];
+        const i = parseDecFast(raw) orelse
+            (parseDecIntRaw(raw) catch return self.setError("invalid integer"));
+        while (self.pos < end) self.advance();
+        return .{ .integer = i };
+    }
+
+    fn peekKeyword(self: *Parser, kw: []const u8) bool {
+        if (self.pos + kw.len > self.input.len) return false;
+        if (!std.mem.eql(u8, self.input[self.pos .. self.pos + kw.len], kw)) return false;
+        // Must be followed by a non-identifier char.
+        const after_idx = self.pos + kw.len;
+        if (after_idx < self.input.len) {
+            const c = self.input[after_idx];
+            if ((c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_') return false;
+        }
+        return true;
+    }
+
+    fn scanDateTimeLiteral(self: *Parser) []const u8 {
+        // Scan characters valid in a TOML datetime literal:
+        // digits, `-`, `:`, `T`, `t`, ` `, `.`, `+`, `Z`, `z`.
+        // Stop at whitespace/comma/]/}/#/newline.
+        const start = self.pos;
+        var last_nonspace_end = start;
+        // The space separator between date and time complicates this:
+        // `1979-05-27 07:32:00`  -  the space is content. We allow a single
+        // space only if immediately followed by a digit (time section).
+        while (self.pos < self.input.len) {
+            const c = self.input[self.pos];
+            switch (c) {
+                '0'...'9', '-', ':', '.', '+', 'T', 't', 'Z', 'z' => {
+                    self.advance();
+                    last_nonspace_end = self.pos;
+                },
+                ' ' => {
+                    // Only valid if it separates date from time (first space only).
+                    if (self.pos + 1 < self.input.len and isDig(self.input[self.pos + 1]) and self.pos - start == 10) {
+                        self.advance();
+                        last_nonspace_end = self.pos;
+                    } else break;
+                },
+                else => break,
+            }
+        }
+        self.pos = last_nonspace_end;
+        // Recompute is unnecessary for pos-only consumers; line/col is
+        // whatever we walked to.
+        return self.input[start..last_nonspace_end];
+    }
+
+    fn scanTimeLiteral(self: *Parser) []const u8 {
+        const start = self.pos;
+        while (self.pos < self.input.len) {
+            const c = self.input[self.pos];
+            switch (c) {
+                '0'...'9', ':', '.' => self.advance(),
+                else => break,
+            }
+        }
+        return self.input[start..self.pos];
+    }
+
+    fn parseArray(self: *Parser) Error!Value {
+        self.token_start = @intCast(self.pos);
+        _ = self.match('[');
+        var arr: ArrayList(Value) = .empty;
+        try self.skipWsAndComments();
+        if (self.match(']')) return .{ .array = arr };
+        var idx: usize = 0;
+        while (true) : (idx += 1) {
+            try self.skipWsAndComments();
+
+            // Push `[N]` onto the current path so parseValue records the
+            // element span at e.g. `users[0]` rather than the parent's path.
+            const prev = try self.pushIndex(idx);
+            const value = try self.parseValue();
+            self.popPath(prev);
+
+            try arr.append(self.arena, value);
+            try self.skipWsAndComments();
+            if (self.match(',')) {
+                try self.skipWsAndComments();
+                if (self.match(']')) return .{ .array = arr };
+                continue;
+            }
+            if (self.match(']')) return .{ .array = arr };
+            return self.setError("expected ',' or ']'");
+        }
+    }
+
+    fn parseInlineTable(self: *Parser) Error!Value {
+        self.token_start = @intCast(self.pos);
+        _ = self.match('{');
+        var tbl: StringArrayHashMap(Value) = .empty;
+        // Local seal set: paths (as joined dotted keys) that have been
+        // directly assigned within THIS inline-table literal and therefore
+        // cannot be extended via dotted-key in a later kv entry.
+        var sealed: StringHashMap(void) = .empty;
+        defer sealed.deinit(self.arena);
+
+        // TOML 1.1 allows newlines, comments, and trailing commas inside
+        // inline tables.
+        try self.skipWsAndComments();
+        if (self.match('}')) return .{ .table = tbl };
+        while (true) {
+            try self.skipWsAndComments();
+            // Trailing comma support: closer may immediately follow.
+            if (self.match('}')) return .{ .table = tbl };
+            var parts: ArrayList([]const u8) = .empty;
+            defer parts.deinit(self.arena);
+            try self.parseKeyPath(&parts);
+            self.skipWs();
+            if (!self.match('=')) return self.setError("expected '=' in inline table");
+            try self.skipWsAndComments();
+
+            // Build the path incrementally so we can check the seal set.
+            var fkbuf: ArrayList(u8) = .empty;
+            defer fkbuf.deinit(self.arena);
+
+            var t = &tbl;
+            for (parts.items[0 .. parts.items.len - 1], 0..) |part, i| {
+                if (i > 0) try fkbuf.append(self.arena, '.');
+                try fkbuf.appendSlice(self.arena, part);
+                if (sealed.contains(fkbuf.items)) {
+                    return self.setErrorFmt("cannot extend inline key '{s}'", .{fkbuf.items});
+                }
+                if (t.getPtr(part)) |existing| {
+                    switch (existing.*) {
+                        .table => t = &existing.table,
+                        else => return self.setError("key is not a table"),
+                    }
+                } else {
+                    // Zero-copy: `part` is a slice into self.input.
+                    try t.put(self.arena, part, .{ .table = .empty });
+                    t = &t.getPtr(part).?.table;
+                }
+            }
+            const last = parts.items[parts.items.len - 1];
+            if (parts.items.len > 1) try fkbuf.append(self.arena, '.');
+            try fkbuf.appendSlice(self.arena, last);
+            if (sealed.contains(fkbuf.items)) {
+                return self.setErrorFmt("cannot redefine inline key '{s}'", .{fkbuf.items});
+            }
+            if (t.contains(last)) return self.setError("duplicate key in inline table");
+
+            // Push `.fkbuf` onto current_path so parseValue records the
+            // span at the right path inside this inline table literal.
+            const prev = try self.pushPath('.', fkbuf.items);
+            const value = try self.parseValue();
+            self.popPath(prev);
+
+            // Zero-copy: `last` is a slice into self.input.
+            try t.put(self.arena, last, value);
+            // Seal key MUST be duped: fkbuf is a temporary buffer.
+            const seal_key = try self.arena.dupe(u8, fkbuf.items);
+            try sealed.put(self.arena, seal_key, {});
+
+            try self.skipWsAndComments();
+            if (self.match(',')) {
+                try self.skipWsAndComments();
+                continue;
+            }
+            if (self.match('}')) return .{ .table = tbl };
+            return self.setError("expected ',' or '}'");
+        }
+    }
+
+    fn parseRadixInteger(self: *Parser, comptime base: u8) Error!Value {
+        const start = self.pos;
+        var last_was_underscore = true; // require digit first
+        while (self.pos < self.input.len) {
+            const c = self.peek();
+            if (c == '_') {
+                if (last_was_underscore) return self.setError("invalid underscore in integer");
+                last_was_underscore = true;
+                self.advance();
+                continue;
+            }
+            const ok = switch (base) {
+                16 => (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F'),
+                8 => c >= '0' and c <= '7',
+                2 => c == '0' or c == '1',
+                else => unreachable,
+            };
+            if (!ok) break;
+            last_was_underscore = false;
+            self.advance();
+        }
+        if (last_was_underscore) return self.setError("trailing underscore in integer");
+        if (self.pos == start) return self.setError("missing digits");
+
+        // Parse. Build from bytes skipping underscores.
+        var acc: u64 = 0;
+        var i: usize = start;
+        while (i < self.pos) : (i += 1) {
+            const c = self.input[i];
+            if (c == '_') continue;
+            const d: u64 = switch (base) {
+                16 => switch (c) {
+                    '0'...'9' => c - '0',
+                    'a'...'f' => c - 'a' + 10,
+                    'A'...'F' => c - 'A' + 10,
+                    else => unreachable,
+                },
+                8 => c - '0',
+                2 => c - '0',
+                else => unreachable,
+            };
+            // Overflow-aware multiply+add.
+            const mul = std.math.mul(u64, acc, base) catch return self.setError("integer overflow");
+            acc = std.math.add(u64, mul, d) catch return self.setError("integer overflow");
+            if (acc > @as(u64, std.math.maxInt(i64))) return self.setError("integer overflow");
+        }
+        return .{ .integer = @intCast(acc) };
+    }
+};
+
+fn isDig(c: u8) bool {
+    return c >= '0' and c <= '9';
+}
+
+/// Parse a TOML decimal integer (allowing underscore separators and a
+/// leading sign). No radix prefix allowed.
+fn parseDecIntRaw(s: []const u8) error{InvalidInteger}!i64 {
+    if (s.len == 0) return error.InvalidInteger;
+    var i: usize = 0;
+    var neg = false;
+    if (s[0] == '+') i += 1 else if (s[0] == '-') {
+        neg = true;
+        i += 1;
+    }
+    if (i >= s.len) return error.InvalidInteger;
+
+    // No leading zeros (except for literal 0).
+    if (s[i] == '0' and i + 1 < s.len) {
+        // Allow "0" only; "00", "01" etc. invalid.
+        if (s[i + 1] != 0) return error.InvalidInteger;
+    }
+
+    var last_underscore = true; // require digit first
+    var acc: u64 = 0;
+    const max_pos: u64 = @as(u64, std.math.maxInt(i64));
+    const max_neg: u64 = @as(u64, std.math.maxInt(i64)) + 1;
+
+    while (i < s.len) : (i += 1) {
+        const c = s[i];
+        if (c == '_') {
+            if (last_underscore) return error.InvalidInteger;
+            last_underscore = true;
+            continue;
+        }
+        if (c < '0' or c > '9') return error.InvalidInteger;
+        last_underscore = false;
+        const d: u64 = c - '0';
+        const mul = std.math.mul(u64, acc, 10) catch return error.InvalidInteger;
+        acc = std.math.add(u64, mul, d) catch return error.InvalidInteger;
+        if (!neg and acc > max_pos) return error.InvalidInteger;
+        if (neg and acc > max_neg) return error.InvalidInteger;
+    }
+    if (last_underscore) return error.InvalidInteger;
+    if (neg) {
+        if (acc == max_neg) return std.math.minInt(i64);
+        return -@as(i64, @intCast(acc));
+    }
+    return @intCast(acc);
+}
+
+/// Parse a TOML float literal (decimal, with optional exponent; underscores).
+fn parseFloatRaw(s: []const u8) error{InvalidFloat}!f64 {
+    // Strip underscores: TOML underscores cannot be adjacent, nor leading/
+    // trailing, nor next to `.`/`e`. We enforce those conditions here.
+    var buf: [128]u8 = undefined;
+    if (s.len > buf.len) return error.InvalidFloat;
+    var n: usize = 0;
+
+    var prev_was_digit = false;
+    var prev_was_underscore = false;
+    var seen_dot = false;
+    var seen_exp = false;
+    var digits_since_dot_or_start: usize = 0;
+
+    // Reject leading zeros in the integer part: `03.14` or `+03.14` or
+    // `-03.14` are invalid. A single `0` before `.` or `e` is fine.
+    {
+        var idx: usize = 0;
+        if (idx < s.len and (s[idx] == '+' or s[idx] == '-')) idx += 1;
+        if (idx + 1 < s.len and s[idx] == '0' and s[idx + 1] >= '0' and s[idx + 1] <= '9') {
+            return error.InvalidFloat;
+        }
+    }
+
+    for (s, 0..) |c, idx| {
+        switch (c) {
+            '+', '-' => {
+                if (idx != 0 and !(idx > 0 and (s[idx - 1] == 'e' or s[idx - 1] == 'E'))) return error.InvalidFloat;
+                buf[n] = c;
+                n += 1;
+                prev_was_digit = false;
+                prev_was_underscore = false;
+            },
+            '0'...'9' => {
+                buf[n] = c;
+                n += 1;
+                prev_was_digit = true;
+                prev_was_underscore = false;
+                digits_since_dot_or_start += 1;
+            },
+            '_' => {
+                if (!prev_was_digit) return error.InvalidFloat;
+                if (idx + 1 >= s.len) return error.InvalidFloat;
+                const next = s[idx + 1];
+                if (next < '0' or next > '9') return error.InvalidFloat;
+                prev_was_digit = false;
+                prev_was_underscore = true;
+                // don't copy underscore
+            },
+            '.' => {
+                if (seen_dot or seen_exp) return error.InvalidFloat;
+                if (!prev_was_digit) return error.InvalidFloat;
+                seen_dot = true;
+                buf[n] = c;
+                n += 1;
+                prev_was_digit = false;
+                prev_was_underscore = false;
+                digits_since_dot_or_start = 0;
+            },
+            'e', 'E' => {
+                if (seen_exp) return error.InvalidFloat;
+                if (!prev_was_digit) return error.InvalidFloat;
+                seen_exp = true;
+                buf[n] = c;
+                n += 1;
+                prev_was_digit = false;
+                prev_was_underscore = false;
+            },
+            else => return error.InvalidFloat,
+        }
+    }
+    if (prev_was_underscore) return error.InvalidFloat;
+    if (!seen_dot and !seen_exp) return error.InvalidFloat;
+    // If we have a fractional part, must have digits after dot.
+    if (seen_dot and !seen_exp and digits_since_dot_or_start == 0) return error.InvalidFloat;
+    // std.fmt.parseFloat rejects leading + signs on some Zig versions; trim.
+    const slice = buf[0..n];
+    return std.fmt.parseFloat(f64, slice) catch error.InvalidFloat;
+}
+
+const testing = std.testing;
+
+
+test "parse empty document" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const val = try parse(arena.allocator(), "", .{});
+    try testing.expect(val == .table);
+    try testing.expectEqual(@as(usize, 0), val.table.count());
+}
+
+test "parse whitespace + comments only" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\# comment
+        \\
+        \\   # another
+    ;
+    const val = try parse(arena.allocator(), src, .{});
+    try testing.expect(val == .table);
+    try testing.expectEqual(@as(usize, 0), val.table.count());
+}
+
+test "parse basic string kv" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const val = try parse(arena.allocator(),
+        \\title = "TOML Example"
+    , .{});
+    try testing.expectEqualStrings("TOML Example", val.table.get("title").?.string);
+}
+
+test "parse literal string kv" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const val = try parse(arena.allocator(),
+        \\path = 'C:\Users\nodejs\templates'
+    , .{});
+    try testing.expectEqualStrings("C:\\Users\\nodejs\\templates", val.table.get("path").?.string);
+}
+
+test "parse basic string escapes" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const val = try parse(arena.allocator(),
+        \\s = "a\tb\nc\"d\\e"
+    , .{});
+    try testing.expectEqualStrings("a\tb\nc\"d\\e", val.table.get("s").?.string);
+}
+
+test "parse unicode escapes" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const val = try parse(arena.allocator(),
+        \\s = "\u00e9\U0001F600"
+    , .{});
+    try testing.expectEqualStrings("\u{e9}\u{1F600}", val.table.get("s").?.string);
+}
+
+test "parse multiline basic string" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\s = """
+        \\Roses are red
+        \\Violets are blue"""
+    ;
+    const val = try parse(arena.allocator(), src, .{});
+    try testing.expectEqualStrings("Roses are red\nViolets are blue", val.table.get("s").?.string);
+}
+
+test "parse multiline basic string with backslash line ending" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\s = """\
+        \\    The quick brown \
+        \\    fox jumps over \
+        \\    the lazy dog.\
+        \\    """
+    ;
+    const val = try parse(arena.allocator(), src, .{});
+    try testing.expectEqualStrings("The quick brown fox jumps over the lazy dog.", val.table.get("s").?.string);
+}
+
+test "parse multiline literal string" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\s = '''
+        \\I [dw]on't need \d{2} apples'''
+    ;
+    const val = try parse(arena.allocator(), src, .{});
+    try testing.expectEqualStrings("I [dw]on't need \\d{2} apples", val.table.get("s").?.string);
+}
+
+test "parse integers all radixes" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\a = 42
+        \\b = -17
+        \\c = +99
+        \\hex = 0xdeadBEEF
+        \\oct = 0o755
+        \\bin = 0b1010
+        \\underscores = 1_000_000
+    ;
+    const val = try parse(arena.allocator(), src, .{});
+    try testing.expectEqual(@as(i64, 42), val.table.get("a").?.integer);
+    try testing.expectEqual(@as(i64, -17), val.table.get("b").?.integer);
+    try testing.expectEqual(@as(i64, 99), val.table.get("c").?.integer);
+    try testing.expectEqual(@as(i64, 0xDEADBEEF), val.table.get("hex").?.integer);
+    try testing.expectEqual(@as(i64, 0o755), val.table.get("oct").?.integer);
+    try testing.expectEqual(@as(i64, 0b1010), val.table.get("bin").?.integer);
+    try testing.expectEqual(@as(i64, 1_000_000), val.table.get("underscores").?.integer);
+}
+
+test "parse floats" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\pi = 3.14
+        \\neg = -0.01
+        \\sci = 5e+22
+        \\big = 1e6
+        \\smell = 6.626e-34
+        \\under = 9_224_617.445_991_228
+    ;
+    const val = try parse(arena.allocator(), src, .{});
+    try testing.expectEqual(@as(f64, 3.14), val.table.get("pi").?.float);
+    try testing.expectEqual(@as(f64, -0.01), val.table.get("neg").?.float);
+    try testing.expectEqual(@as(f64, 5e22), val.table.get("sci").?.float);
+    try testing.expectEqual(@as(f64, 1e6), val.table.get("big").?.float);
+}
+
+test "parse inf/nan" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\a = inf
+        \\b = +inf
+        \\c = -inf
+        \\d = nan
+    ;
+    const val = try parse(arena.allocator(), src, .{});
+    try testing.expect(std.math.isPositiveInf(val.table.get("a").?.float));
+    try testing.expect(std.math.isPositiveInf(val.table.get("b").?.float));
+    try testing.expect(std.math.isNegativeInf(val.table.get("c").?.float));
+    try testing.expect(std.math.isNan(val.table.get("d").?.float));
+}
+
+test "parse booleans" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const val = try parse(arena.allocator(),
+        \\a = true
+        \\b = false
+    , .{});
+    try testing.expectEqual(true, val.table.get("a").?.boolean);
+    try testing.expectEqual(false, val.table.get("b").?.boolean);
+}
+
+test "parse datetime" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const val = try parse(arena.allocator(),
+        \\dt = 1979-05-27T07:32:00Z
+        \\ld = 1979-05-27
+        \\lt = 07:32:00
+    , .{});
+    try testing.expectEqual(@as(u16, 1979), val.table.get("dt").?.datetime.date.year);
+    try testing.expectEqual(@as(i16, 0), val.table.get("dt").?.datetime.tz_offset_minutes.?);
+    try testing.expectEqual(@as(u8, 27), val.table.get("ld").?.date.day);
+    try testing.expectEqual(@as(u8, 32), val.table.get("lt").?.time.minute);
+}
+
+test "parse arrays" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\nums = [1, 2, 3]
+        \\strs = ["a", "b", "c"]
+        \\nested = [[1, 2], [3, 4]]
+        \\trailing = [
+        \\  1,
+        \\  2,
+        \\  3,
+        \\]
+    ;
+    const val = try parse(arena.allocator(), src, .{});
+    try testing.expectEqual(@as(usize, 3), val.table.get("nums").?.array.items.len);
+    try testing.expectEqual(@as(i64, 2), val.table.get("nums").?.array.items[1].integer);
+    try testing.expectEqual(@as(usize, 2), val.table.get("nested").?.array.items.len);
+    try testing.expectEqual(@as(i64, 3), val.table.get("nested").?.array.items[1].array.items[0].integer);
+    try testing.expectEqual(@as(usize, 3), val.table.get("trailing").?.array.items.len);
+}
+
+test "parse inline table" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const src = "point = { x = 1, y = 2 }";
+    const val = try parse(arena.allocator(), src, .{});
+    const pt = val.table.get("point").?.table;
+    try testing.expectEqual(@as(i64, 1), pt.get("x").?.integer);
+    try testing.expectEqual(@as(i64, 2), pt.get("y").?.integer);
+}
+
+test "parse table headers + dotted keys" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\[servers]
+        \\hostname = "localhost"
+        \\
+        \\[servers.alpha]
+        \\ip = "10.0.0.1"
+        \\
+        \\[servers.beta]
+        \\ip = "10.0.0.2"
+    ;
+    const val = try parse(arena.allocator(), src, .{});
+    const servers = val.table.get("servers").?.table;
+    try testing.expectEqualStrings("localhost", servers.get("hostname").?.string);
+    try testing.expectEqualStrings("10.0.0.1", servers.get("alpha").?.table.get("ip").?.string);
+    try testing.expectEqualStrings("10.0.0.2", servers.get("beta").?.table.get("ip").?.string);
+}
+
+test "parse array of tables" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\[[products]]
+        \\name = "Hammer"
+        \\sku = 738594937
+        \\
+        \\[[products]]
+        \\name = "Nail"
+        \\sku = 284758393
+    ;
+    const val = try parse(arena.allocator(), src, .{});
+    const products = val.table.get("products").?.array;
+    try testing.expectEqual(@as(usize, 2), products.items.len);
+    try testing.expectEqualStrings("Hammer", products.items[0].table.get("name").?.string);
+    try testing.expectEqualStrings("Nail", products.items[1].table.get("name").?.string);
+}
+
+test "duplicate key error" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var errs: std.ArrayList(Diagnostic) = .empty;
+    defer errs.deinit(arena.allocator());
+    const res = parse(arena.allocator(), "a = 1\na = 2\n", .{ .errors = &errs });
+    try testing.expectError(error.TomlParseError, res);
+    try testing.expect(errs.items.len > 0);
+}
+
+test "redefine table error" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\[a]
+        \\x = 1
+        \\[a]
+        \\y = 2
+    ;
+    try testing.expectError(error.TomlParseError, parse(arena.allocator(), src, .{}));
+}
+
+test "dotted keys create tables" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\a.b.c = 1
+        \\a.b.d = 2
+    ;
+    const val = try parse(arena.allocator(), src, .{});
+    const abc = val.table.get("a").?.table.get("b").?.table.get("c").?;
+    const abd = val.table.get("a").?.table.get("b").?.table.get("d").?;
+    try testing.expectEqual(@as(i64, 1), abc.integer);
+    try testing.expectEqual(@as(i64, 2), abd.integer);
+}
+
+test "spans: top-level scalar" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var spans: v.Spans = .empty;
+    _ = try parse(arena.allocator(),
+        \\title = "toml"
+    , .{ .spans = &spans });
+    const s = spans.get("title").?;
+    try testing.expectEqual(@as(u32, 8), s.start); // after `title = `
+    try testing.expectEqual(@as(u32, 14), s.end); // after closing quote of "toml"
+    try testing.expectEqual(@as(u32, 1), s.line);
+    try testing.expectEqual(@as(u32, 9), s.col);
+}
+
+test "spans: nested table value" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var spans: v.Spans = .empty;
+    _ = try parse(arena.allocator(),
+        \\[server]
+        \\port = 8080
+    , .{ .spans = &spans });
+    const s = spans.get("server.port").?;
+    try testing.expectEqual(@as(u32, 2), s.line);
+    try testing.expectEqual(@as(u32, 8), s.col);
+}
+
+test "spans: array of tables uses bracket index" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var spans: v.Spans = .empty;
+    _ = try parse(arena.allocator(),
+        \\[[users]]
+        \\name = "alice"
+        \\
+        \\[[users]]
+        \\name = "bob"
+    , .{ .spans = &spans });
+    const s0 = spans.get("users[0].name").?;
+    const s1 = spans.get("users[1].name").?;
+    try testing.expectEqual(@as(u32, 2), s0.line);
+    try testing.expectEqual(@as(u32, 5), s1.line);
+}
+
+test "spans: dotted-key path" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var spans: v.Spans = .empty;
+    _ = try parse(arena.allocator(),
+        \\physical.color = "red"
+    , .{ .spans = &spans });
+    const s = spans.get("physical.color").?;
+    try testing.expectEqual(@as(u32, 1), s.line);
+}
+
+test "spans: missing path returns null" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var spans: v.Spans = .empty;
+    _ = try parse(arena.allocator(),
+        \\a = 1
+    , .{ .spans = &spans });
+    try testing.expect(spans.get("nonexistent") == null);
+}
+
+test "spans: opt-out doesn't pay cost" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const val = try parse(arena.allocator(),
+        \\a = 1
+    , .{});
+    try testing.expectEqual(@as(i64, 1), val.table.get("a").?.integer);
+}
+
+test "spans: inline array elements get byte-precise spans" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var spans: v.Spans = .empty;
+    const src = "tags = [\"alpha\", \"beta\", \"gamma\"]";
+    _ = try parse(arena.allocator(), src, .{ .spans = &spans });
+
+    const s0 = spans.get("tags[0]").?;
+    const s1 = spans.get("tags[1]").?;
+    const s2 = spans.get("tags[2]").?;
+
+    try testing.expectEqualStrings("\"alpha\"", src[s0.start..s0.end]);
+    try testing.expectEqualStrings("\"beta\"", src[s1.start..s1.end]);
+    try testing.expectEqualStrings("\"gamma\"", src[s2.start..s2.end]);
+}
+
+test "spans: nested array element spans are byte-precise" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var spans: v.Spans = .empty;
+    const src = "matrix = [[1, 2], [3, 4]]";
+    _ = try parse(arena.allocator(), src, .{ .spans = &spans });
+
+    try testing.expectEqualStrings("[1, 2]", src[spans.get("matrix[0]").?.start..spans.get("matrix[0]").?.end]);
+    try testing.expectEqualStrings("3", src[spans.get("matrix[1][0]").?.start..spans.get("matrix[1][0]").?.end]);
+    try testing.expectEqualStrings("4", src[spans.get("matrix[1][1]").?.start..spans.get("matrix[1][1]").?.end]);
+}
+
+test "spans: inline table value spans are byte-precise" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var spans: v.Spans = .empty;
+    const src = "point = { x = 10, y = 20 }";
+    _ = try parse(arena.allocator(), src, .{ .spans = &spans });
+
+    try testing.expectEqualStrings("10", src[spans.get("point.x").?.start..spans.get("point.x").?.end]);
+    try testing.expectEqualStrings("20", src[spans.get("point.y").?.start..spans.get("point.y").?.end]);
+}
+
+test "parseDecFast: matches std.fmt.parseInt for common cases" {
+    const cases = [_]struct { s: []const u8, expect: ?i64 }{
+        .{ .s = "0", .expect = 0 },
+        .{ .s = "1", .expect = 1 },
+        .{ .s = "42", .expect = 42 },
+        .{ .s = "8080", .expect = 8080 },
+        .{ .s = "9223372036854775807", .expect = 9223372036854775807 }, // i64 max
+        .{ .s = "9223372036854775808", .expect = null }, // i64 max + 1 (overflow)
+        .{ .s = "99999999999999999999", .expect = null }, // way overflow (20 digits)
+        .{ .s = "01", .expect = null }, // leading zero rejected
+        .{ .s = "07", .expect = null }, // leading zero rejected
+        .{ .s = "0a", .expect = null }, // non-digit
+        .{ .s = "", .expect = null }, // empty
+        .{ .s = "12345678901234567890", .expect = null }, // 20 digits, > i64 max
+        .{ .s = "1_000", .expect = null }, // underscore -- fast path rejects
+        .{ .s = "-5", .expect = null }, // sign -- fast path rejects
+    };
+    for (cases) |c| {
+        try testing.expectEqual(c.expect, parseDecFast(c.s));
+    }
+}
+
+test "scanBasicStringFast: matches byte-loop on quote/backslash/control/high" {
+    const fixtures = [_][]const u8{
+        "hello",                       // all plain
+        "hello\"world",                // quote at index 5
+        "hello\\world",                // backslash at 5
+        "hello\x01world",              // control at 5
+        "hello\x7fworld",              // DEL at 5
+        "hello\xc2\xa0world",          // high-bit at 5
+        "abcdefghijklmnopqrstuvwxyz",  // long plain (exercises SIMD lane)
+        "abcdefghijklmnop\"rest",      // quote exactly at lane boundary (idx 16)
+        "abcde\"fghijklmnop\"rest",    // quote inside first lane
+        "\"first",                     // quote at idx 0
+        "",                            // empty
+        "\t",                          // tab is OK (not a stop byte)
+    };
+    for (fixtures) |f| {
+        const fast = scanBasicStringFast(f);
+        var slow: usize = 0;
+        while (slow < f.len) : (slow += 1) {
+            const c = f[slow];
+            if (c == '"' or c == '\\' or c == 0x7f or c >= 0x80 or
+                (c <= 0x1f and c != '\t')) break;
+        }
+        try testing.expectEqual(slow, fast);
+    }
+}
+
+test "Diagnostic: extended struct supports default-null new fields" {
+    const d: Diagnostic = .{
+        .line = 3,
+        .col = 12,
+        .message = "expected u16, got string",
+    };
+    try testing.expect(d.range == null);
+    try testing.expect(d.path == null);
+    try testing.expect(d.suggestion == null);
+    try testing.expectEqual(@as(usize, 0), d.notes.len);
+}
+
+test "Diagnostic.Note: shape" {
+    const n: Diagnostic.Note = .{
+        .line = 5,
+        .col = 1,
+        .message = "previously declared here",
+    };
+    try testing.expectEqual(@as(u32, 5), n.line);
+}
+
+test "Diagnostic.range covers the offending token" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var errs: std.ArrayList(Diagnostic) = .empty;
+    defer errs.deinit(arena.allocator());
+
+    // `port = "\q"` -- \q is an invalid escape inside a basic string.
+    // The opening `"` is at byte 7 (after "port = "), so range[0] must be 7.
+    // The error fires after consuming the `\`, with pos pointing at `q`
+    // (byte 9), giving a non-zero-width span.
+    _ = parse(arena.allocator(), "port = \"\\q\"\n", .{ .errors = &errs }) catch {};
+    try testing.expect(errs.items.len == 1);
+    const d = errs.items[0];
+    try testing.expect(d.range != null);
+    try testing.expectEqual(@as(u32, 7), d.range.?[0]);
+    try testing.expect(d.range.?[1] > d.range.?[0]);
+}
+
+test "multi-error mode collects all errors in one parse" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var errs: std.ArrayList(Diagnostic) = .empty;
+    defer errs.deinit(arena.allocator());
+
+    // 5 lines: bad, good, bad, good, bad. Expect 3 errors.
+    // "\q" is an invalid escape in a basic string -- confirmed to produce a
+    // parser-side diagnostic with a non-zero range (see DT3 test above).
+    const src =
+        \\port = "\q"
+        \\name = "ok"
+        \\flag = "\q"
+        \\count = 42
+        \\extra = "\q"
+    ;
+    _ = parse(arena.allocator(), src, .{ .errors = &errs }) catch {};
+
+    try testing.expect(errs.items.len == 3);
+    try testing.expectEqual(@as(u32, 1), errs.items[0].line);
+    try testing.expectEqual(@as(u32, 3), errs.items[1].line);
+    try testing.expectEqual(@as(u32, 5), errs.items[2].line);
+}
+
+test "multi-error mode bounded by MAX_RECOVERY_ERRORS" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var errs: std.ArrayList(Diagnostic) = .empty;
+    defer errs.deinit(arena.allocator());
+
+    // 200 bad lines. Bound should cap at 100.
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(arena.allocator());
+    var i: u32 = 0;
+    while (i < 200) : (i += 1) {
+        try src.appendSlice(arena.allocator(), "x = \"\\q\"\n");
+    }
+
+    _ = parse(arena.allocator(), src.items, .{ .errors = &errs }) catch {};
+    try testing.expect(errs.items.len <= 100);
+    try testing.expect(errs.items.len >= 99); // allow off-by-one
+}
+
+test "parser: typo'd keyword suggests correct form" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var errs: std.ArrayList(Diagnostic) = .empty;
+    defer errs.deinit(arena.allocator());
+
+    _ = parse(arena.allocator(), "x = tru\n", .{ .errors = &errs }) catch {};
+    try testing.expect(errs.items.len == 1);
+    try testing.expect(errs.items[0].suggestion != null);
+    try testing.expectEqualStrings("true", errs.items[0].suggestion.?);
+}
+
+test "Diagnostic.formatRich: basic shape" {
+    const src =
+        \\title = "x"
+        \\port = "8080"
+        \\name = "ef"
+    ;
+    const d: Diagnostic = .{
+        .line = 2,
+        .col = 8,
+        .message = "expected integer, got string",
+        .range = .{ 19, 25 }, // covers "8080"
+    };
+
+    var buf: [1024]u8 = undefined;
+    var aw: std.Io.Writer = .fixed(&buf);
+    try d.formatRich(&aw, src);
+    const out = aw.buffered();
+
+    try testing.expect(std.mem.indexOf(u8, out, "error at 2:8") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "expected integer") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "port = \"8080\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "^") != null);
+}
+
+test "Diagnostic.formatRich: includes path and suggestion" {
+    const src = "prt = 8080\n";
+    const d: Diagnostic = .{
+        .line = 0,
+        .col = 0,
+        .message = "unknown field `prt`",
+        .path = "config.prt",
+        .suggestion = "port",
+    };
+
+    var buf: [1024]u8 = undefined;
+    var aw: std.Io.Writer = .fixed(&buf);
+    try d.formatRich(&aw, src);
+    const out = aw.buffered();
+
+    try testing.expect(std.mem.indexOf(u8, out, "at config.prt") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "did you mean `port`?") != null);
+}
+
+test "Diagnostic.formatRich: emits notes" {
+    const src = "[server]\n[server]\n";
+    const d: Diagnostic = .{
+        .line = 2,
+        .col = 1,
+        .message = "redefinition of section [server]",
+        .range = .{ 9, 17 },
+        .notes = &.{
+            .{ .line = 1, .col = 1, .message = "previously declared here" },
+        },
+    };
+
+    var buf: [1024]u8 = undefined;
+    var aw: std.Io.Writer = .fixed(&buf);
+    try d.formatRich(&aw, src);
+    const out = aw.buffered();
+
+    try testing.expect(std.mem.indexOf(u8, out, "previously declared here") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "1:1") != null);
+}
+
+test "end-to-end: multi-error parse + rich rendering of each" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var errs: std.ArrayList(Diagnostic) = .empty;
+    defer errs.deinit(arena.allocator());
+
+    const src =
+        \\port = "\q"
+        \\name = "ok"
+        \\flag = "\q"
+        \\
+        \\[server]
+        \\port = "8080"
+    ;
+
+    _ = parse(arena.allocator(), src, .{ .errors = &errs }) catch {};
+
+    try testing.expect(errs.items.len >= 2);
+
+    // Verify rich rendering doesn't crash and produces non-empty output.
+    var buf: [4096]u8 = undefined;
+    for (errs.items) |d| {
+        var aw: std.Io.Writer = .fixed(&buf);
+        try d.formatRich(&aw, src);
+        try testing.expect(aw.buffered().len > 0);
+    }
+}

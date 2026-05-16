@@ -1,0 +1,16 @@
+.{
+    .name = .toml,
+    .version = "0.1.0",
+    .fingerprint = 0x12c55c537b09b32f,
+    .minimum_zig_version = "0.16.0",
+
+    .dependencies = .{},
+
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "LICENSE",
+        "README.md",
+    },
+}
