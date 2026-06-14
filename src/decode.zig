@@ -349,9 +349,12 @@ fn decodeStruct(comptime T: type, comptime s: std.builtin.Type.Struct, arena: Al
         }
         if (comptime isFlattened(T, field.name)) {
             // Decode the inner struct from the SAME parent value (no key lookup).
-            // The parent's expectedKeys already validated all keys, so suppress
-            // unknown-field errors in the inner struct to avoid false positives
-            // on sibling fields the inner type doesn't know about.
+            // The parent's expectedKeys recurses through flattened field types,
+            // so a genuinely-unknown key (belonging to neither the parent nor any
+            // flattened sub-struct) is already rejected above in strict mode.
+            // The inner decode must therefore ignore unknown fields: at its level
+            // every parent-owned sibling key (e.g. the parent's other fields) is
+            // "unknown", and rejecting those would break flatten entirely.
             const prev = try path.pushSegment(arena, field.name);
             defer path.restore(prev);
             const flat_opts: parser_mod.ParseOptions = .{
@@ -822,6 +825,54 @@ test "decode: toml_flatten unknown-field check expands flattened keys" {
         \\unexpected = "boom"
     , .{});
     try testing.expectError(error.UnknownField, decode(Outer, arena.allocator(), v, .{}));
+}
+
+test "decode: toml_flatten strict mode catches key owned by nobody" {
+    // A key that matches NEITHER the parent's own fields NOR the flattened
+    // sub-struct's fields must still raise UnknownField in strict mode, even
+    // though the inner flatten decode runs with ignore_unknown_fields=true.
+    const Inner = struct { x: u32, y: u32 };
+    const Outer = struct {
+        pub const toml_flatten = .{"inner"};
+        name: []const u8,
+        count: u32,
+        inner: Inner,
+    };
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const v = try parse(arena.allocator(),
+        \\name = "foo"
+        \\count = 3
+        \\x = 1
+        \\y = 2
+        \\nobody = "boom"
+    , .{});
+    try testing.expectError(error.UnknownField, decode(Outer, arena.allocator(), v, .{}));
+}
+
+test "decode: toml_flatten strict mode accepts all valid sibling + inner keys" {
+    // Sibling keys belonging to the parent's OTHER fields must NOT be rejected
+    // by the inner flatten decode in strict mode.
+    const Inner = struct { x: u32, y: u32 };
+    const Outer = struct {
+        pub const toml_flatten = .{"inner"};
+        name: []const u8,
+        count: u32,
+        inner: Inner,
+    };
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const v = try parse(arena.allocator(),
+        \\name = "foo"
+        \\count = 3
+        \\x = 1
+        \\y = 2
+    , .{});
+    const cfg = try decode(Outer, arena.allocator(), v, .{});
+    try testing.expectEqualStrings("foo", cfg.name);
+    try testing.expectEqual(@as(u32, 3), cfg.count);
+    try testing.expectEqual(@as(u32, 1), cfg.inner.x);
+    try testing.expectEqual(@as(u32, 2), cfg.inner.y);
 }
 
 test "decode: toml_skip excludes field from decode" {
