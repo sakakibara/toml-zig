@@ -1334,7 +1334,10 @@ const Parser = struct {
         if (has_dot or has_exp) {
             // float
             const raw = self.input[start..end];
-            const f = parseFloatRaw(raw) catch return self.setError("invalid float");
+            const f = parseFloatRaw(self.arena, raw) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.InvalidFloat => return self.setError("invalid float"),
+            };
             // Advance parser.
             while (self.pos < end) self.advance();
             return .{ .float = f };
@@ -1610,11 +1613,13 @@ fn parseDecIntRaw(s: []const u8) error{InvalidInteger}!i64 {
 }
 
 /// Parse a TOML float literal (decimal, with optional exponent; underscores).
-fn parseFloatRaw(s: []const u8) error{InvalidFloat}!f64 {
+fn parseFloatRaw(arena: Allocator, s: []const u8) error{ InvalidFloat, OutOfMemory }!f64 {
     // Strip underscores: TOML underscores cannot be adjacent, nor leading/
     // trailing, nor next to `.`/`e`. We enforce those conditions here.
-    var buf: [128]u8 = undefined;
-    if (s.len > buf.len) return error.InvalidFloat;
+    // Stripping only removes bytes, so the input length is a safe upper
+    // bound for the output; a fixed buffer would reject long-but-valid
+    // literals (e.g. the full decimal form of floatMin / subnormals).
+    const buf = try arena.alloc(u8, s.len);
     var n: usize = 0;
 
     var prev_was_digit = false;
