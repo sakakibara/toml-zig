@@ -20,7 +20,7 @@ const std = @import("std");
 const Io = std.Io;
 const toml = @import("toml");
 
-const Mode = enum { random_bytes, biased };
+const Mode = enum { random_bytes, biased, deep_nesting };
 
 pub fn main(init: std.process.Init) !u8 {
     const gpa = init.gpa;
@@ -76,12 +76,31 @@ pub fn main(init: std.process.Init) !u8 {
     var n: usize = 0;
 
     while (n < iters) : (n += 1) {
-        const mode: Mode = if (rng.boolean()) .biased else .random_bytes;
+        // One in eight iterations stresses pathological deep nesting (long
+        // runs of `[` / `{` and `a.a.a...` dotted keys) -- the class of
+        // input that recursive-descent value parsing can stack-overflow on
+        // without a depth bound. The rest split between biased and random.
+        const mode: Mode = switch (rng.uintLessThan(u8, 8)) {
+            0 => .deep_nesting,
+            1...4 => .biased,
+            else => .random_bytes,
+        };
+
+        if (mode == .deep_nesting) {
+            const input = generateDeepNesting(rng, input_buf);
+            if (try fuzzDeep(gpa, input)) |err| {
+                failures += 1;
+                try reportFailure(ew, n, seed, input, err);
+            }
+            continue;
+        }
+
         const len = rng.intRangeAtMost(usize, 0, max_input);
         const input = input_buf[0..len];
         switch (mode) {
             .random_bytes => rng.bytes(input),
             .biased => generateBiased(rng, input),
+            .deep_nesting => unreachable,
         }
 
         if (try fuzzOnce(gpa, input)) |err| {
@@ -107,6 +126,7 @@ const FuzzError = error{
     RoundTripMismatch,
     LosslessFailure,
     SpanOutOfBounds,
+    DepthNotBounded,
 };
 
 fn fuzzOnce(gpa: std.mem.Allocator, input: []const u8) !?FuzzError {
@@ -150,6 +170,28 @@ fn fuzzOnce(gpa: std.mem.Allocator, input: []const u8) !?FuzzError {
     return null;
 }
 
+/// Deep-nesting invariant: parse must RETURN (not stack-overflow) on
+/// pathologically nested input. Surviving the call is the primary
+/// assertion -- a regression of the depth bound crashes the process here
+/// instead of reaching the return below. When the nesting actually
+/// exceeds the parser's default ceiling, the error must be the distinct
+/// `error.NestingTooDeep`.
+fn fuzzDeep(gpa: std.mem.Allocator, input: []const u8) !?FuzzError {
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const r = toml.parse(arena.allocator(), input, .{});
+    if (r) |_| {
+        // Parsed cleanly: nesting stayed under the ceiling. Fine.
+        return null;
+    } else |err| {
+        return switch (err) {
+            error.NestingTooDeep, error.TomlParseError => null,
+            error.OutOfMemory => null,
+            else => FuzzError.DepthNotBounded,
+        };
+    }
+}
+
 fn didParse(gpa: std.mem.Allocator, input: []const u8) bool {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
@@ -170,6 +212,53 @@ fn reportFailure(w: *Io.Writer, iter: usize, seed: u64, input: []const u8, err: 
     };
     try w.writeAll("\"\n");
     try w.flush();
+}
+
+/// Emit a `key = ` prefix followed by a long run of array / inline-table
+/// openers (and sometimes `a.a.a...` dotted keys), to a depth far past
+/// the parser's default 128 ceiling. Returns the populated prefix of
+/// `buf`. The depth is bounded by the buffer length, so the generator
+/// itself can't run away; the parser's depth guard is what must hold.
+fn generateDeepNesting(rng: std.Random, buf: []u8) []const u8 {
+    if (buf.len < 8) {
+        // Too small to be interesting; fall back to a short bracket run.
+        const n = @min(buf.len, 4);
+        for (buf[0..n]) |*b| b.* = '[';
+        return buf[0..n];
+    }
+
+    var i: usize = 0;
+    const prefix = "x = ";
+    @memcpy(buf[0..prefix.len], prefix);
+    i += prefix.len;
+
+    // Choose the opener style for this input. `dotted` mode interleaves
+    // `a.` segments inside inline tables to also stress dotted-key descent.
+    const style = rng.uintLessThan(u8, 3);
+    while (i < buf.len) {
+        const remaining = buf.len - i;
+        switch (style) {
+            0 => {
+                buf[i] = '[';
+                i += 1;
+            },
+            1 => {
+                if (remaining < 3) break;
+                @memcpy(buf[i .. i + 3], "{a=");
+                i += 3;
+            },
+            else => {
+                if (remaining < 4) break;
+                @memcpy(buf[i .. i + 4], "{a.a"); // dotted key inside inline table
+                i += 4;
+                if (i < buf.len) {
+                    buf[i] = '=';
+                    i += 1;
+                }
+            },
+        }
+    }
+    return buf[0..i];
 }
 
 fn generateBiased(rng: std.Random, out: []u8) void {
