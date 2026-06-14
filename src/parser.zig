@@ -186,7 +186,7 @@ pub fn parse(arena: Allocator, input: []const u8, options: ParseOptions) Error!V
     return p.parseDocument();
 }
 
-pub const ReaderError = Error || std.Io.Reader.AllocError;
+pub const ReaderError = Error || std.Io.Reader.LimitedAllocError;
 
 /// Reader-input variant. Pulls the full input into arena memory first,
 /// then runs `parse` over it. TOML's grammar requires the whole document

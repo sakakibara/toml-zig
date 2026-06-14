@@ -42,7 +42,7 @@ pub const Error = error{
 
 /// Reader-input variants additionally surface the reader's allocation
 /// failure path.
-pub const ReaderError = Error || std.Io.Reader.AllocError;
+pub const ReaderError = Error || std.Io.Reader.LimitedAllocError;
 
 /// All knobs for `parse` / `parseReader` / `parseInto` / `parseIntoReader`.
 /// Default is `.{}` (no error capture, no spans, strict struct decode).
@@ -111,4 +111,38 @@ test {
     _ = @import("tokenizer.zig");
     _ = @import("conformance.zig");
     _ = @import("levenshtein.zig");
+}
+
+test "parseReader matches parse for the same document" {
+    const std_testing = std.testing;
+    const src =
+        \\title = "TOML"
+        \\count = 42
+        \\nested = { a = 1, b = 2 }
+    ;
+    var arena_a: std.heap.ArenaAllocator = .init(std_testing.allocator);
+    defer arena_a.deinit();
+    const from_slice = try parse(arena_a.allocator(), src, .{});
+
+    var arena_b: std.heap.ArenaAllocator = .init(std_testing.allocator);
+    defer arena_b.deinit();
+    var reader: std.Io.Reader = .fixed(src);
+    const from_reader = try parseReader(arena_b.allocator(), &reader, .{});
+
+    try std_testing.expect(Value.eql(from_slice, from_reader));
+}
+
+test "parseIntoReader decodes from a reader" {
+    const std_testing = std.testing;
+    const Config = struct { title: []const u8, count: u32 };
+    const src =
+        \\title = "TOML"
+        \\count = 42
+    ;
+    var arena: std.heap.ArenaAllocator = .init(std_testing.allocator);
+    defer arena.deinit();
+    var reader: std.Io.Reader = .fixed(src);
+    const cfg = try parseIntoReader(Config, arena.allocator(), &reader, .{});
+    try std_testing.expectEqualStrings("TOML", cfg.title);
+    try std_testing.expectEqual(@as(u32, 42), cfg.count);
 }
