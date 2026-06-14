@@ -18,9 +18,15 @@ const v = @import("value.zig");
 
 pub const Value = v.Value;
 
-pub const EncodeError = std.Io.Writer.Error || error{ ExpectedTable, OutOfMemory };
+pub const EncodeError = std.Io.Writer.Error || error{ ExpectedTable, NestingTooDeep, OutOfMemory };
 
 const max_path_depth = 256;
+
+/// Maximum table / array / inline-table nesting depth. Parsed trees are
+/// already capped by the parser's `max_depth` (128); this constant
+/// matches that default so hand-built `Value` trees get the same bound,
+/// returning `error.NestingTooDeep` rather than overflowing the stack.
+const max_encode_depth = 128;
 
 /// Encode `value` as TOML to `w`. `value` must be `.table`.
 pub fn encode(w: *Io.Writer, value: Value) EncodeError!void {
@@ -31,7 +37,7 @@ pub fn encode(w: *Io.Writer, value: Value) EncodeError!void {
     var path: ArrayList([]const u8) = .empty;
     defer path.deinit(fba.allocator());
 
-    try encodeTable(w, value.table, &path, fba.allocator(), true);
+    try encodeTable(w, value.table, &path, fba.allocator(), true, 0);
 }
 
 /// Encode a typed Zig value as TOML, consulting any `toml_*`
@@ -201,7 +207,7 @@ fn writeTypedValue(comptime T: type, value: T, w: *std.Io.Writer, arena: std.mem
         const hooked = T.toToml(value, arena) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
         };
-        return writeValue(w, hooked);
+        return writeValue(w, hooked, 0);
     }
     return switch (@typeInfo(T)) {
         .bool => w.writeAll(if (value) "true" else "false"),
@@ -221,7 +227,9 @@ fn encodeTable(
     path: *ArrayList([]const u8),
     path_alloc: std.mem.Allocator,
     is_root: bool,
+    depth: usize,
 ) EncodeError!void {
+    if (depth > max_encode_depth) return error.NestingTooDeep;
     var has_any_kv = false;
 
     // Pass 1: scalars, arrays of non-tables.
@@ -236,7 +244,7 @@ fn encodeTable(
         }
         try writeKey(w, k);
         try w.writeAll(" = ");
-        try writeValue(w, val);
+        try writeValue(w, val, depth);
         try w.writeByte('\n');
         has_any_kv = true;
     }
@@ -255,7 +263,7 @@ fn encodeTable(
                 try w.writeByte('[');
                 try writePath(w, path.items);
                 try w.writeAll("]\n");
-                try encodeTable(w, sub, path, path_alloc, false);
+                try encodeTable(w, sub, path, path_alloc, false, depth + 1);
             },
             .array => |arr| {
                 if (!isArrayOfTables(arr)) continue;
@@ -267,7 +275,7 @@ fn encodeTable(
                     try w.writeAll("[[");
                     try writePath(w, path.items);
                     try w.writeAll("]]\n");
-                    try encodeTable(w, elem.table, path, path_alloc, false);
+                    try encodeTable(w, elem.table, path, path_alloc, false, depth + 1);
                 }
             },
             else => {},
@@ -314,10 +322,11 @@ fn isBareKey(k: []const u8) bool {
 /// `w`. Used by the document model when inserting or replacing a typed
 /// value via canonical formatting.
 pub fn writeInlineValue(w: *Io.Writer, val: Value) EncodeError!void {
-    return writeValue(w, val);
+    return writeValue(w, val, 0);
 }
 
-fn writeValue(w: *Io.Writer, val: Value) EncodeError!void {
+fn writeValue(w: *Io.Writer, val: Value, depth: usize) EncodeError!void {
+    if (depth > max_encode_depth) return error.NestingTooDeep;
     switch (val) {
         .string => |s| try writeQuotedString(w, s),
         .integer => |i| try w.print("{d}", .{i}),
@@ -326,21 +335,21 @@ fn writeValue(w: *Io.Writer, val: Value) EncodeError!void {
         .datetime => |d| try writeDateTime(w, d),
         .date => |d| try w.print("{d:0>4}-{d:0>2}-{d:0>2}", .{ d.year, d.month, d.day }),
         .time => |t| try writeTime(w, t),
-        .array => |arr| try writeArrayValue(w, arr),
-        .table => |tbl| try writeInlineTable(w, tbl),
+        .array => |arr| try writeArrayValue(w, arr, depth),
+        .table => |tbl| try writeInlineTable(w, tbl, depth),
     }
 }
 
-fn writeArrayValue(w: *Io.Writer, arr: ArrayList(Value)) EncodeError!void {
+fn writeArrayValue(w: *Io.Writer, arr: ArrayList(Value), depth: usize) EncodeError!void {
     try w.writeByte('[');
     for (arr.items, 0..) |item, i| {
         if (i > 0) try w.writeAll(", ");
-        try writeValue(w, item);
+        try writeValue(w, item, depth + 1);
     }
     try w.writeByte(']');
 }
 
-fn writeInlineTable(w: *Io.Writer, tbl: StringArrayHashMap(Value)) EncodeError!void {
+fn writeInlineTable(w: *Io.Writer, tbl: StringArrayHashMap(Value), depth: usize) EncodeError!void {
     try w.writeAll("{ ");
     var it = tbl.iterator();
     var first = true;
@@ -349,7 +358,7 @@ fn writeInlineTable(w: *Io.Writer, tbl: StringArrayHashMap(Value)) EncodeError!v
         first = false;
         try writeKey(w, entry.key_ptr.*);
         try w.writeAll(" = ");
-        try writeValue(w, entry.value_ptr.*);
+        try writeValue(w, entry.value_ptr.*, depth + 1);
     }
     try w.writeAll(" }");
 }
@@ -802,4 +811,66 @@ test "encodeTyped: tagged union writes discriminator + payload" {
     try testing.expect(std.mem.indexOf(u8, out, "kind = \"http\"") != null);
     try testing.expect(std.mem.indexOf(u8, out, "host = \"localhost\"") != null);
     try testing.expect(std.mem.indexOf(u8, out, "port = 8080") != null);
+}
+
+test "encode nesting depth guard: deep array tree errors, shallow succeeds" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Build a (max_encode_depth + 2)-deep chain of single-element arrays
+    // wrapped in a root table, then encode it. The bracket depth past the
+    // ceiling must surface error.NestingTooDeep, not overflow the stack.
+    // The loop count bounds the construction so the test can't run away.
+    const over = max_encode_depth + 2;
+    var inner: Value = .{ .integer = 0 };
+    var d: usize = 0;
+    while (d < over) : (d += 1) {
+        var arr: Value.Array = .empty;
+        try arr.append(a, inner);
+        inner = .{ .array = arr };
+    }
+    var over_tbl: Value.Table = .empty;
+    try over_tbl.put(a, "x", inner);
+    {
+        var aw: Io.Writer.Allocating = .init(a);
+        defer aw.deinit();
+        try testing.expectError(error.NestingTooDeep, encode(&aw.writer, .{ .table = over_tbl }));
+    }
+
+    // A shallow chain (well under the ceiling) encodes without error.
+    var shallow: Value = .{ .integer = 0 };
+    d = 0;
+    while (d < 64) : (d += 1) {
+        var arr: Value.Array = .empty;
+        try arr.append(a, shallow);
+        shallow = .{ .array = arr };
+    }
+    var ok_tbl: Value.Table = .empty;
+    try ok_tbl.put(a, "x", shallow);
+    {
+        var aw: Io.Writer.Allocating = .init(a);
+        defer aw.deinit();
+        try encode(&aw.writer, .{ .table = ok_tbl }); // must not error
+    }
+}
+
+test "encode nesting depth guard: deep table tree errors" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Nested tables become [header] sections via encodeTable recursion;
+    // a chain past max_encode_depth must error rather than overflow.
+    const over = max_encode_depth + 2;
+    var inner: Value.Table = .empty;
+    var d: usize = 0;
+    while (d < over) : (d += 1) {
+        var outer: Value.Table = .empty;
+        try outer.put(a, "t", .{ .table = inner });
+        inner = outer;
+    }
+    var aw: Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+    try testing.expectError(error.NestingTooDeep, encode(&aw.writer, .{ .table = inner }));
 }
