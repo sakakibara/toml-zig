@@ -463,8 +463,10 @@ fn writeFloat(w: *Io.Writer, f: f64) EncodeError!void {
     if (std.math.isNegativeInf(f)) return w.writeAll("-inf");
 
     // Force a fractional/exponent form so the parser sees a float, not int.
-    var buf: [64]u8 = undefined;
-    const s = std.fmt.bufPrint(&buf, "{d}", .{f}) catch unreachable;
+    // Decimal f64 needs up to 347 bytes (e.g. floatMin/subnormals); a smaller
+    // buffer would overflow and panic for large-magnitude or tiny values.
+    var buf: [std.fmt.float.bufferSize(.decimal, f64)]u8 = undefined;
+    const s = std.fmt.float.render(&buf, f, .{ .mode = .decimal }) catch unreachable;
     try w.writeAll(s);
     var has_marker = false;
     for (s) |c| {
@@ -572,6 +574,39 @@ test "encode special float forms" {
         \\a = inf
         \\b = -inf
     );
+}
+
+test "encode large-magnitude floats round-trip bit-exact" {
+    // Regression: writeFloat used a 64-byte buffer; decimal-mode f64 needs up
+    // to 347 bytes, so these would overflow bufPrint and panic before the fix.
+    const cases = [_]f64{
+        1e300,
+        -1e300,
+        1e-300,
+        std.math.floatMax(f64),
+        std.math.floatMin(f64),
+        std.math.floatTrueMin(f64), // smallest positive subnormal
+        1.0,
+    };
+    for (cases) |f| {
+        var doc: Value = undefined;
+        var tbl: Value.Table = .empty;
+        defer tbl.deinit(testing.allocator);
+        try tbl.put(testing.allocator, "x", .{ .float = f });
+        doc = .{ .table = tbl };
+
+        const encoded = try allocEncode(testing.allocator, doc);
+        defer testing.allocator.free(encoded);
+
+        var arena: ArenaAllocator = .init(testing.allocator);
+        defer arena.deinit();
+        const reparsed = try parser.parse(arena.allocator(), encoded, .{});
+        const got = reparsed.table.get("x").?;
+        // Must re-parse as a float, not an integer.
+        try testing.expect(got == .float);
+        // Bit-exact round-trip.
+        try testing.expectEqual(@as(u64, @bitCast(f)), @as(u64, @bitCast(got.float)));
+    }
 }
 
 test "encode datetime" {
