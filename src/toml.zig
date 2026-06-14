@@ -31,6 +31,7 @@ const decode_mod = @import("decode.zig");
 pub const Error = error{
     // From parser
     TomlParseError,
+    NestingTooDeep,
     OutOfMemory,
     // From decode
     TypeMismatch,

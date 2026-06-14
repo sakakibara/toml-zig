@@ -97,6 +97,7 @@ pub const Diagnostic = struct {
 
 pub const Error = error{
     TomlParseError,
+    NestingTooDeep,
     OutOfMemory,
 };
 
@@ -120,6 +121,13 @@ pub const ParseOptions = struct {
     /// Honored by parseInto / parseIntoReader / decode. Ignored by
     /// dynamic parse / parseReader.
     ignore_unknown_fields: bool = false,
+
+    /// Maximum array / inline-table nesting depth. Exceeding it returns
+    /// `error.NestingTooDeep`. The default 128 is safe on any supported
+    /// stack size. Raising it trades stack space for depth: each
+    /// additional level costs roughly 1-1.5 KB of stack, so values in
+    /// the thousands can exhaust the stack before this guard fires.
+    max_depth: usize = 128,
 };
 
 const MAX_RECOVERY_ERRORS: usize = 100;
@@ -183,6 +191,7 @@ pub fn parse(arena: Allocator, input: []const u8, options: ParseOptions) Error!V
     var p = Parser.init(arena, input);
     p.spans = options.spans;
     p.errors = options.errors;
+    p.max_depth = options.max_depth;
     return p.parseDocument();
 }
 
@@ -240,6 +249,14 @@ const Parser = struct {
     dotted_current: StringHashMap(void) = .empty,
     /// Names of arrays-of-tables (tracked so we know to append).
     array_tables: StringHashMap(void) = .empty,
+
+    /// Current array / inline-table nesting depth. Incremented on
+    /// entering `parseArray` / `parseInlineTable`; exceeding `max_depth`
+    /// bails with `error.NestingTooDeep` before recursing further, which
+    /// bounds stack growth on hostile deeply-nested input.
+    depth: usize = 0,
+    /// Nesting-depth ceiling. Set from `ParseOptions.max_depth` in `parse`.
+    max_depth: usize = 128,
 
     /// Multi-error sink. When set, each error append + recover; when null,
     /// first error bails. Set from ParseOptions.errors in `parse` / `parseReader`.
@@ -490,6 +507,22 @@ const Parser = struct {
             }) catch return error.OutOfMemory;
         }
         return error.TomlParseError;
+    }
+
+    /// Depth-guard failure: records a diagnostic (the guard still
+    /// promises line/col) but returns the distinct `error.NestingTooDeep`,
+    /// which the document recovery loop never swallows.
+    fn setDepthError(self: *Parser) Error {
+        if (self.errors) |list| {
+            const msg = std.fmt.allocPrint(self.arena, "nesting depth exceeds limit ({d})", .{self.max_depth}) catch return error.OutOfMemory;
+            list.append(self.arena, .{
+                .line = self.line,
+                .col = self.col,
+                .message = msg,
+                .range = .{ self.token_start, @intCast(self.pos) },
+            }) catch return error.OutOfMemory;
+        }
+        return error.NestingTooDeep;
     }
 
     fn setErrorFmt(self: *Parser, comptime fmt: []const u8, args: anytype) Error {
@@ -1409,6 +1442,9 @@ const Parser = struct {
 
     fn parseArray(self: *Parser) Error!Value {
         self.token_start = @intCast(self.pos);
+        if (self.depth >= self.max_depth) return self.setDepthError();
+        self.depth += 1;
+        defer self.depth -= 1;
         _ = self.match('[');
         var arr: ArrayList(Value) = .empty;
         try self.skipWsAndComments();
@@ -1437,6 +1473,9 @@ const Parser = struct {
 
     fn parseInlineTable(self: *Parser) Error!Value {
         self.token_start = @intCast(self.pos);
+        if (self.depth >= self.max_depth) return self.setDepthError();
+        self.depth += 1;
+        defer self.depth -= 1;
         _ = self.match('{');
         var tbl: StringArrayHashMap(Value) = .empty;
         // Local seal set: paths (as joined dotted keys) that have been
@@ -2324,4 +2363,68 @@ test "end-to-end: multi-error parse + rich rendering of each" {
         try d.formatRich(&aw, src);
         try testing.expect(aw.buffered().len > 0);
     }
+}
+
+test "nesting depth guard: array branch errors at max_depth+1, parses at max_depth" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const default_max: usize = (ParseOptions{}).max_depth;
+
+    // `x = ` + (max_depth+1) `[`: one bracket past the ceiling must error
+    // (not overflow the stack). The bracket count bounds the construction.
+    var over: ArrayList(u8) = .empty;
+    try over.appendSlice(a, "x = ");
+    try over.appendNTimes(a, '[', default_max + 1);
+    try testing.expectError(error.NestingTooDeep, parse(a, over.items, .{}));
+
+    // Exactly max_depth deep (balanced, innermost holds an integer) parses.
+    var ok: ArrayList(u8) = .empty;
+    try ok.appendSlice(a, "x = ");
+    try ok.appendNTimes(a, '[', default_max);
+    try ok.append(a, '0');
+    try ok.appendNTimes(a, ']', default_max);
+    const v_ok = try parse(a, ok.items, .{});
+    try testing.expect(v_ok.table.get("x").? == .array);
+}
+
+test "nesting depth guard: inline-table branch errors at max_depth+1" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const default_max: usize = (ParseOptions{}).max_depth;
+
+    // `x = ` + (max_depth+1) `{a=`: each `{` is one nesting level.
+    var over: ArrayList(u8) = .empty;
+    try over.appendSlice(a, "x = ");
+    var i: usize = 0;
+    while (i < default_max + 1) : (i += 1) try over.appendSlice(a, "{a=");
+    try testing.expectError(error.NestingTooDeep, parse(a, over.items, .{}));
+}
+
+test "nesting depth guard: records a diagnostic" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const default_max: usize = (ParseOptions{}).max_depth;
+
+    var over: ArrayList(u8) = .empty;
+    try over.appendSlice(a, "x = ");
+    try over.appendNTimes(a, '[', default_max + 1);
+    var errs: std.ArrayList(Diagnostic) = .empty;
+    defer errs.deinit(a);
+    try testing.expectError(error.NestingTooDeep, parse(a, over.items, .{ .errors = &errs }));
+    try testing.expectEqual(@as(usize, 1), errs.items.len);
+    try testing.expectEqualStrings("nesting depth exceeds limit (128)", errs.items[0].message);
+}
+
+test "nesting depth guard: custom max_depth honored" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var over: ArrayList(u8) = .empty;
+    try over.appendSlice(a, "x = ");
+    try over.appendNTimes(a, '[', 11);
+    try testing.expectError(error.NestingTooDeep, parse(a, over.items, .{ .max_depth = 10 }));
 }

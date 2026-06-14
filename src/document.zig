@@ -65,6 +65,7 @@ pub const Error = error{
     OutOfMemory,
     WriteFailed,
     TomlParseError,
+    NestingTooDeep,
 };
 
 /// One source-level construct in the document.
