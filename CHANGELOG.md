@@ -6,6 +6,30 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-06-21
+
+### Added
+
+- `ParseOptions.max_depth` (default 128) caps array and inline-table
+  nesting depth; exceeding it returns the new `error.NestingTooDeep`.
+
+### Fixed
+
+- Encoder: size the float-formatting buffer for full-precision decimal
+  `f64`, fixing a fixed-size buffer that could be too small for some
+  values.
+- Parser: remove the fixed-length cap on float literals, which had
+  rejected long but otherwise-valid float tokens.
+- `parseReader` / `parseIntoReader`: correct `ReaderError` to
+  `std.Io.Reader.LimitedAllocError`; the previous
+  `std.Io.Reader.AllocError` does not exist on Zig 0.16.
+
+### Security
+
+- Bound recursion depth in both the parser and the encoder so deeply
+  nested untrusted input fails with `error.NestingTooDeep` instead of
+  overflowing the stack.
+
 ## [0.1.0] - 2026-05-16
 
 Initial release. TOML 1.1 parser, encoder, lossless document model,
@@ -67,5 +91,6 @@ hand-rolled fast-path decimal integer parser (`parseDecFast`), and
 inlined parser primitives (`peek`, `peekAt`, `advance`, `match`,
 `eof`).
 
-[Unreleased]: https://github.com/sakakibara/toml-zig/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/sakakibara/toml-zig/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/sakakibara/toml-zig/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/sakakibara/toml-zig/releases/tag/v0.1.0
