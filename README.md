@@ -349,6 +349,16 @@ the parse tree is in use.
 The document model also takes an arena. It owns the source string, the
 item list, and any edits.
 
+## Limits
+
+Nesting depth is bounded to guard against stack overflow on deeply nested
+untrusted input. `ParseOptions.max_depth` (default 128) caps array and
+inline-table nesting; exceeding it returns `error.NestingTooDeep` rather
+than overflowing the stack. The encoder applies the same bound when
+writing a `Value` tree. Raising `max_depth` trades stack for depth - each
+level costs roughly 1-1.5 KB of stack, so values in the thousands can
+exhaust the stack before the guard fires.
+
 ## Examples
 
 See `examples/` for runnable samples:
