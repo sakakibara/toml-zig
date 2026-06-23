@@ -120,6 +120,13 @@ fn parseTimePrefix(s: []const u8) Error!TimePrefix {
 
 /// Parse an RFC 3339 offset (`Z`, `z`, `+HH:MM`, `-HH:MM`) covering
 /// the entirety of `s`. Returns minutes east of UTC.
+///
+/// Normalization: `Z`, `+00:00`, and `-00:00` all map to 0. RFC 3339
+/// distinguishes `-00:00` ("offset unknown") from `+00:00`/`Z` (UTC), but
+/// the TOML data model treats a zero offset as UTC and toml-test compares
+/// them as equal. Re-encoding (writeDateTime) emits `Z` for any zero offset.
+/// Callers that need lossless source preservation should use the document
+/// model, which retains the original TOML bytes.
 fn parseOffset(s: []const u8) Error!i16 {
     if (s.len == 1 and (s[0] == 'Z' or s[0] == 'z')) return 0;
     if (s.len != 6) return error.InvalidDateTime;
@@ -232,4 +239,15 @@ test "parse invalid" {
 test "truncate fractional beyond 9 digits" {
     const p = try parseAny("00:00:00.1234567890123");
     try std.testing.expectEqual(@as(u32, 123_456_789), p.time.nanos);
+}
+
+test "zero offset normalization: Z, +00:00, -00:00 all map to 0" {
+    // The TOML data model treats all zero offsets as UTC; -00:00 (RFC 3339
+    // "offset unknown") normalizes to the same 0 as Z and +00:00.
+    const z = try parseAny("1979-05-27T07:32:00Z");
+    const pos = try parseAny("1979-05-27T07:32:00+00:00");
+    const neg = try parseAny("1979-05-27T07:32:00-00:00");
+    try std.testing.expectEqual(@as(i16, 0), z.datetime.tz_offset_minutes.?);
+    try std.testing.expectEqual(@as(i16, 0), pos.datetime.tz_offset_minutes.?);
+    try std.testing.expectEqual(@as(i16, 0), neg.datetime.tz_offset_minutes.?);
 }

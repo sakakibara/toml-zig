@@ -62,7 +62,9 @@ pub const Time = struct {
 pub const DateTime = struct {
     date: Date,
     time: Time,
-    /// Minutes east of UTC. `null` = local datetime; `0` = `Z`/UTC.
+    /// Minutes east of UTC. `null` = local datetime; `0` = UTC.
+    /// `Z`, `+00:00`, and `-00:00` all normalize to 0 on parse and re-emit
+    /// as `Z`. The TOML data model treats all zero offsets as UTC.
     tz_offset_minutes: ?i16 = null,
 
     pub const ParseError = error{InvalidDateTime};

@@ -513,6 +513,8 @@ fn writeFloat(w: *Io.Writer, f: f64) EncodeError!void {
     if (!has_marker) try w.writeAll(".0");
 }
 
+/// Emit an offset datetime. A zero offset (parsed from `Z`, `+00:00`, or
+/// `-00:00`) is always re-encoded as `Z`; see parseOffset in datetime.zig.
 fn writeDateTime(w: *Io.Writer, d: v.DateTime) EncodeError!void {
     try w.print("{d:0>4}-{d:0>2}-{d:0>2}T", .{ d.date.year, d.date.month, d.date.day });
     try writeTime(w, d.time);
