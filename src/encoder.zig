@@ -321,7 +321,10 @@ fn writePath(w: *Io.Writer, parts: []const []const u8) EncodeError!void {
     }
 }
 
-fn writeKey(w: *Io.Writer, k: []const u8) EncodeError!void {
+/// Write a single key segment to `w`: bare when it is a valid bare key,
+/// otherwise as a basic-quoted string. The document model uses this when
+/// inserting a new key so a decoded special key re-emits as valid TOML.
+pub fn writeKey(w: *Io.Writer, k: []const u8) EncodeError!void {
     if (isBareKey(k)) {
         try w.writeAll(k);
         return;
@@ -665,9 +668,9 @@ test "scanQuotedStringPlain: matches byte-loop on every stop byte" {
         "hello\nworld",
         "hello\x01world",
         "hello\x7fworld",
-        "abcdefghijklmnopqrstuvwxyz",        // long plain
-        "abcdefghijklmnop\"rest",            // stop at lane boundary (idx 16)
-        "",                                  // empty
+        "abcdefghijklmnopqrstuvwxyz", // long plain
+        "abcdefghijklmnop\"rest", // stop at lane boundary (idx 16)
+        "", // empty
     };
     for (fixtures) |f| {
         const fast = scanQuotedStringPlain(f);

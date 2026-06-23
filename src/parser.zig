@@ -195,6 +195,29 @@ pub fn parse(arena: Allocator, input: []const u8, options: ParseOptions) Error!V
     return p.parseDocument();
 }
 
+/// Decode a TOML key (bare, basic-quoted, literal-quoted, or dotted) into
+/// its canonical decoded form: each segment decoded the same way the value
+/// tree decodes keys, joined by '.'. This is the identity used by
+/// `Value.get`, so the document model uses it to index editable kv lines
+/// under the same key `get` resolves. `raw` must be exactly the key bytes
+/// (no surrounding `=` or value). Returns InvalidValue on a malformed key.
+pub fn decodeKeyPath(arena: Allocator, raw: []const u8) Error![]const u8 {
+    var p = Parser.init(arena, raw);
+    var parts: ArrayList([]const u8) = .empty;
+    defer parts.deinit(arena);
+    p.parseKeyPath(&parts) catch return error.TomlParseError;
+    p.skipWs();
+    if (!p.eof()) return error.TomlParseError;
+    if (parts.items.len == 0) return error.TomlParseError;
+
+    var out: ArrayList(u8) = .empty;
+    for (parts.items, 0..) |part, i| {
+        if (i > 0) try out.append(arena, '.');
+        try out.appendSlice(arena, part);
+    }
+    return out.items;
+}
+
 pub const ReaderError = Error || std.Io.Reader.LimitedAllocError;
 
 /// Reader-input variant. Pulls the full input into arena memory first,
@@ -204,7 +227,6 @@ pub fn parseReader(arena: Allocator, reader: *std.Io.Reader, options: ParseOptio
     const input = try reader.allocRemaining(arena, .unlimited);
     return parse(arena, input, options);
 }
-
 
 const Parser = struct {
     arena: Allocator,
@@ -462,7 +484,7 @@ const Parser = struct {
     fn validateUtf8(self: *Parser) Error!void {
         const b0 = self.peek();
         const seq_len: usize = if (b0 < 0x80) 1 else if (b0 < 0xC2) 0 // 0x80..0xC1: invalid continuation or overlong
-        else if (b0 < 0xE0) 2 else if (b0 < 0xF0) 3 else if (b0 < 0xF5) 4 else 0;
+            else if (b0 < 0xE0) 2 else if (b0 < 0xF0) 3 else if (b0 < 0xF5) 4 else 0;
         if (seq_len == 0) return self.setError("invalid UTF-8 byte");
         if (self.pos + seq_len > self.input.len) return self.setError("truncated UTF-8 sequence");
         const bytes = self.input[self.pos .. self.pos + seq_len];
@@ -1735,7 +1757,6 @@ fn parseFloatRaw(arena: Allocator, s: []const u8) error{ InvalidFloat, OutOfMemo
 
 const testing = std.testing;
 
-
 test "parse empty document" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -2154,18 +2175,18 @@ test "parseDecFast: matches std.fmt.parseInt for common cases" {
 
 test "scanBasicStringFast: matches byte-loop on quote/backslash/control/high" {
     const fixtures = [_][]const u8{
-        "hello",                       // all plain
-        "hello\"world",                // quote at index 5
-        "hello\\world",                // backslash at 5
-        "hello\x01world",              // control at 5
-        "hello\x7fworld",              // DEL at 5
-        "hello\xc2\xa0world",          // high-bit at 5
-        "abcdefghijklmnopqrstuvwxyz",  // long plain (exercises SIMD lane)
-        "abcdefghijklmnop\"rest",      // quote exactly at lane boundary (idx 16)
-        "abcde\"fghijklmnop\"rest",    // quote inside first lane
-        "\"first",                     // quote at idx 0
-        "",                            // empty
-        "\t",                          // tab is OK (not a stop byte)
+        "hello", // all plain
+        "hello\"world", // quote at index 5
+        "hello\\world", // backslash at 5
+        "hello\x01world", // control at 5
+        "hello\x7fworld", // DEL at 5
+        "hello\xc2\xa0world", // high-bit at 5
+        "abcdefghijklmnopqrstuvwxyz", // long plain (exercises SIMD lane)
+        "abcdefghijklmnop\"rest", // quote exactly at lane boundary (idx 16)
+        "abcde\"fghijklmnop\"rest", // quote inside first lane
+        "\"first", // quote at idx 0
+        "", // empty
+        "\t", // tab is OK (not a stop byte)
     };
     for (fixtures) |f| {
         const fast = scanBasicStringFast(f);

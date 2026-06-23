@@ -122,11 +122,11 @@ const InlineEntry = struct {
     /// Raw bytes of the key: bare, basic-quoted, or literal-quoted.
     key_raw: []const u8,
 
-    /// Key name with outer quotes stripped for quoted keys. Bare and
-    /// literal-quoted keys are byte-exact; basic-quoted keys with escape
-    /// sequences (e.g., `"a\tb"`) retain the escape bytes uninterpreted.
-    /// For programmatic path lookup, callers using escape-bearing basic
-    /// keys must compare against the same escaped form.
+    /// Decoded key identity: quotes stripped and escape sequences
+    /// interpreted (e.g., `"a\tb"` decodes to `a<TAB>b`). This matches the
+    /// decoded dotted paths that callers pass to set/remove, so lookups
+    /// compare decoded-vs-decoded. `key_raw` keeps the source bytes for
+    /// lossless emit.
     key: []const u8,
 
     /// Bytes between key and value: `=` plus its surrounding spaces.
@@ -232,7 +232,8 @@ pub const Document = struct {
     }
 
     fn replaceValueAt(self: *Document, idx: usize, raw_value: []const u8) Error!void {
-        const old = self.items.items[idx].kv;
+        const old_item = self.items.items[idx];
+        const old = old_item.kv;
         const before = old.raw[0..old.value_offset];
         const after = old.raw[old.value_offset + old.value_len ..];
         const new_raw = try std.mem.concat(self.arena, u8, &.{ before, raw_value, after });
@@ -247,6 +248,13 @@ pub const Document = struct {
             .value_len = @intCast(raw_value.len),
             .inline_layout = inline_layout,
         } };
+        // Keep the cached value tree in sync so get/getT/has see the edit.
+        // On a reparse failure, roll the item back so a failed edit leaves
+        // the document unchanged.
+        self.refreshParsed() catch |e| {
+            self.items.items[idx] = old_item;
+            return e;
+        };
     }
 
     /// If `path` like `point.x` falls inside an existing inline-table
@@ -275,50 +283,82 @@ pub const Document = struct {
     }
 
     fn insertNewKey(self: *Document, path: []const u8, raw_value: []const u8) Error!void {
-        // Insert. Determine enclosing section.
-        const enclosing = enclosingSection(path);
-        {
-            if (self.section_end.get(enclosing)) |after_idx| {
-                // Ensure the preceding item ends with a newline so the
-                // new line starts cleanly.
-                try self.ensureItemEndsWithNewline(after_idx);
+        // Atomicity: snapshot the in-memory state mutated by the insert, do
+        // the (possibly multi-step, section-creating) mutation, then validate
+        // by reparsing exactly once. If anything fails, restore the snapshot
+        // so a failed insert leaves the document byte-identical to before.
+        const items_snapshot = try self.arena.dupe(Item, self.items.items);
+        const kv_snapshot = try self.kv_index.clone(self.arena);
+        const section_snapshot = try self.section_end.clone(self.arena);
+        const parsed_snapshot = self.parsed;
 
-                // Append new kv right after the section's last item.
-                const local_key = path[enclosing.len + (if (enclosing.len == 0) @as(usize, 0) else @as(usize, 1)) ..];
-                const line = try formatKvLine(self.arena, local_key, raw_value);
-                const value_offset: u32 = @intCast(local_key.len + " = ".len);
-                const new_item: Item = .{ .kv = .{
-                    .raw = line,
-                    .full_path = try self.arena.dupe(u8, path),
-                    .value_offset = value_offset,
-                    .value_len = @intCast(raw_value.len),
-                } };
-                try self.items.insert(self.arena, after_idx + 1, new_item);
-                self.shiftIndices(after_idx + 1, 1);
-                try self.kv_index.put(self.arena, new_item.kv.full_path, after_idx + 1);
-                try self.section_end.put(self.arena, enclosing, after_idx + 1);
-            } else {
-                // Section doesn't exist. Append a new header and the kv.
-                if (enclosing.len == 0) {
-                    // Root-level key but the document is empty  -  just append.
-                    const line = try formatKvLine(self.arena, path, raw_value);
-                    const value_offset: u32 = @intCast(path.len + " = ".len);
-                    const new_item: Item = .{ .kv = .{
-                        .raw = line,
-                        .full_path = try self.arena.dupe(u8, path),
-                        .value_offset = value_offset,
-                        .value_len = @intCast(raw_value.len),
-                    } };
-                    try self.items.append(self.arena, new_item);
-                    try self.kv_index.put(self.arena, new_item.kv.full_path, self.items.items.len - 1);
-                    try self.section_end.put(self.arena, "", self.items.items.len - 1);
-                } else {
-                    try self.appendNewSection(enclosing);
-                    try self.setLiteral(path, raw_value); // recurse now that section exists
-                }
-            }
-            // Refresh parsed view. Cheaper than tracking incrementally.
-            try self.refreshParsed();
+        self.insertNewKeyMutate(path, raw_value) catch |e| {
+            self.restoreSnapshot(items_snapshot, kv_snapshot, section_snapshot, parsed_snapshot);
+            return e;
+        };
+
+        // Validate the mutated document. On failure, roll everything back.
+        self.refreshParsed() catch |e| {
+            self.restoreSnapshot(items_snapshot, kv_snapshot, section_snapshot, parsed_snapshot);
+            return e;
+        };
+    }
+
+    fn restoreSnapshot(
+        self: *Document,
+        items: []const Item,
+        kv: StringArrayHashMap(usize),
+        section: StringArrayHashMap(usize),
+        parsed: Value,
+    ) void {
+        self.items.clearRetainingCapacity();
+        self.items.appendSliceAssumeCapacity(items);
+        self.kv_index = kv;
+        self.section_end = section;
+        self.parsed = parsed;
+    }
+
+    /// Perform the in-memory mutation for inserting a new key, without
+    /// reparsing. Recurses through appendNewSection for missing sections.
+    /// The caller (insertNewKey) validates via a single refreshParsed and
+    /// rolls back on failure.
+    fn insertNewKeyMutate(self: *Document, path: []const u8, raw_value: []const u8) Error!void {
+        const enclosing = enclosingSection(path);
+        if (self.section_end.get(enclosing)) |after_idx| {
+            // Ensure the preceding item ends with a newline so the
+            // new line starts cleanly.
+            try self.ensureItemEndsWithNewline(after_idx);
+
+            // Append new kv right after the section's last item.
+            const local_key = path[enclosing.len + (if (enclosing.len == 0) @as(usize, 0) else @as(usize, 1)) ..];
+            const fmt = try formatKvLine(self.arena, local_key, raw_value);
+            const new_item: Item = .{ .kv = .{
+                .raw = fmt.line,
+                .full_path = try self.arena.dupe(u8, path),
+                .value_offset = fmt.value_offset,
+                .value_len = @intCast(raw_value.len),
+            } };
+            try self.items.insert(self.arena, after_idx + 1, new_item);
+            self.shiftIndices(after_idx + 1, 1);
+            try self.kv_index.put(self.arena, new_item.kv.full_path, after_idx + 1);
+            try self.section_end.put(self.arena, enclosing, after_idx + 1);
+        } else if (enclosing.len == 0) {
+            // Root-level key but the document is empty  -  just append.
+            const fmt = try formatKvLine(self.arena, path, raw_value);
+            const new_item: Item = .{ .kv = .{
+                .raw = fmt.line,
+                .full_path = try self.arena.dupe(u8, path),
+                .value_offset = fmt.value_offset,
+                .value_len = @intCast(raw_value.len),
+            } };
+            try self.items.append(self.arena, new_item);
+            try self.kv_index.put(self.arena, new_item.kv.full_path, self.items.items.len - 1);
+            try self.section_end.put(self.arena, "", self.items.items.len - 1);
+        } else {
+            // Section doesn't exist: create the header, then recurse to add
+            // the key now that the section is present.
+            try self.appendNewSection(enclosing);
+            try self.insertNewKeyMutate(path, raw_value);
         }
     }
 
@@ -566,7 +606,12 @@ pub const Document = struct {
         if (needs_blank) {
             try self.items.append(self.arena, .{ .blank = "\n" });
         }
-        const raw = try std.fmt.allocPrint(self.arena, "[{s}]\n", .{header_path});
+        // header_path is the decoded dotted identity; re-encode each segment
+        // so a segment needing quotes (spaces, specials) emits valid TOML.
+        // The stored .path stays decoded so it shares identity with kv
+        // full_paths and `get`.
+        const rendered = try renderHeaderPath(self.arena, header_path);
+        const raw = try std.fmt.allocPrint(self.arena, "[{s}]\n", .{rendered});
         const header_item: Item = .{ .header = .{
             .raw = raw,
             .path = try self.arena.dupe(u8, header_path),
@@ -596,7 +641,10 @@ pub const Document = struct {
 
     fn refreshParsed(self: *Document) !void {
         var aw: Io.Writer.Allocating = .init(self.arena);
-        defer aw.deinit();
+        // Do NOT deinit aw: the parser is zero-copy and slices into the emit
+        // buffer. The arena reclaims the buffer at Document teardown.
+        // (deinit on an arena-backed allocator would rawFree the buffer,
+        // making the parsed keys/strings dangle.)
         try self.emit(&aw.writer);
         const new_src = aw.written();
         // Reparse for the next get(); this reuses the user's arena. The
@@ -634,8 +682,17 @@ fn enclosingSection(path: []const u8) []const u8 {
     return "";
 }
 
-fn formatKvLine(arena: Allocator, key: []const u8, value: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(arena, "{s} = {s}\n", .{ key, value });
+const FormattedKv = struct { line: []const u8, value_offset: u32 };
+
+/// Format a `key = value\n` line. The key is re-emitted via the encoder so
+/// a decoded special key (spaces, dots, etc.) is quoted into valid TOML.
+/// Returns the line and the byte offset where the value text begins, which
+/// depends on the emitted key length (it may differ from `key.len`).
+fn formatKvLine(arena: Allocator, key: []const u8, value: []const u8) !FormattedKv {
+    const key_raw = try encodeKey(arena, key);
+    const value_offset: u32 = @intCast(key_raw.len + " = ".len);
+    const line = try std.fmt.allocPrint(arena, "{s} = {s}\n", .{ key_raw, value });
+    return .{ .line = line, .value_offset = value_offset };
 }
 
 fn formatValue(arena: Allocator, value: Value) ![]const u8 {
@@ -689,6 +746,9 @@ fn setInLayout(arena: Allocator, layout: *InlineTableLayout, sub_path: []const u
 }
 
 fn appendInlineEntry(arena: Allocator, layout: *InlineTableLayout, key: []const u8, raw_value: []const u8) Error!void {
+    // `key` is the decoded identity; re-encode it to valid TOML key bytes
+    // (quoting spaces/specials) for the emitted `key_raw`.
+    const key_raw = try encodeKey(arena, key);
     if (layout.entries.items.len == 0) {
         // Empty inline table: `{}` -> `{ key = value }`.
         // Preserve any existing open/close content by checking if open already
@@ -698,7 +758,7 @@ fn appendInlineEntry(arena: Allocator, layout: *InlineTableLayout, key: []const 
             layout.open = try arena.dupe(u8, "{ ");
         }
         try layout.entries.append(arena, .{
-            .key_raw = try arena.dupe(u8, key),
+            .key_raw = key_raw,
             .key = try arena.dupe(u8, key),
             .sep = try arena.dupe(u8, " = "),
             .value = .{ .raw = try arena.dupe(u8, raw_value) },
@@ -743,12 +803,45 @@ fn appendInlineEntry(arena: Allocator, layout: *InlineTableLayout, key: []const 
     last.trailing = inter_pattern;
 
     try layout.entries.append(arena, .{
-        .key_raw = try arena.dupe(u8, key),
+        .key_raw = key_raw,
         .key = try arena.dupe(u8, key),
         .sep = try arena.dupe(u8, last.sep),
         .value = .{ .raw = try arena.dupe(u8, raw_value) },
         .trailing = new_entry_trailing,
     });
+}
+
+/// Render a decoded dotted path as a TOML header body, re-encoding each
+/// `.`-separated segment so segments needing quotes emit valid TOML
+/// (`my server` -> `"my server"`, `a.b` -> `a.b`). Mirrors the encoder's
+/// writePath segment-by-segment quoting.
+fn renderHeaderPath(arena: Allocator, path: []const u8) Error![]const u8 {
+    var aw: Io.Writer.Allocating = .init(arena);
+    defer aw.deinit();
+    var first = true;
+    var it = std.mem.splitScalar(u8, path, '.');
+    while (it.next()) |segment| {
+        if (!first) aw.writer.writeByte('.') catch return error.WriteFailed;
+        first = false;
+        encoder.writeKey(&aw.writer, segment) catch |e| switch (e) {
+            error.WriteFailed => return error.WriteFailed,
+            else => unreachable,
+        };
+    }
+    return arena.dupe(u8, aw.written());
+}
+
+/// Render a decoded key segment as valid TOML key bytes via the encoder
+/// (bare when possible, basic-quoted otherwise). Used wherever a decoded
+/// key identity must be emitted as TOML presentation.
+fn encodeKey(arena: Allocator, key: []const u8) Error![]const u8 {
+    var aw: Io.Writer.Allocating = .init(arena);
+    defer aw.deinit();
+    encoder.writeKey(&aw.writer, key) catch |e| switch (e) {
+        error.WriteFailed => return error.WriteFailed,
+        else => unreachable,
+    };
+    return arena.dupe(u8, aw.written());
 }
 
 /// Remove the entry matching sub_path from layout. Returns true when the
@@ -860,7 +953,10 @@ fn tokenize(doc: *Document, src: []const u8) !void {
                 break :blk i - (if (is_array) @as(usize, 2) else @as(usize, 1));
             };
             const header_path = std.mem.trim(u8, src[path_start..path_end], " \t");
-            const owned_path = try doc.arena.dupe(u8, header_path);
+            // Index headers by their decoded dotted path so kv full_paths,
+            // section lookups, and `get` all share one key identity.
+            const owned_path = parser_mod.decodeKeyPath(doc.arena, header_path) catch
+                try doc.arena.dupe(u8, header_path);
 
             const header_item: Item = .{ .header = .{
                 .raw = raw,
@@ -896,9 +992,14 @@ fn tokenize(doc: *Document, src: []const u8) !void {
 
         const raw = src[line_start..line_end];
         const key_raw = src[key_start..key_end];
+        // The editor index keys kv lines by their DECODED dotted path so a
+        // quoted/literal/escaped key resolves under the same identity as
+        // `get` (which reads the decoded value tree). `kv.raw` still holds
+        // the source bytes for lossless emit.
+        const key_decoded = parser_mod.decodeKeyPath(doc.arena, key_raw) catch key_raw;
         const full_path = blk: {
-            if (current_section.len == 0) break :blk try doc.arena.dupe(u8, key_raw);
-            break :blk try std.fmt.allocPrint(doc.arena, "{s}.{s}", .{ current_section, key_raw });
+            if (current_section.len == 0) break :blk try doc.arena.dupe(u8, key_decoded);
+            break :blk try std.fmt.allocPrint(doc.arena, "{s}.{s}", .{ current_section, key_decoded });
         };
         const value_offset: u32 = @intCast(value_start - line_start);
         const value_len: u32 = @intCast(value_end - value_start);
@@ -968,13 +1069,27 @@ fn scanHeader(src: []const u8, pos: usize) usize {
     return i;
 }
 
+/// Scan a (possibly dotted, possibly quoted) TOML key starting at `pos`.
+/// Returns the index of the byte ending the key span: the last non-blank
+/// byte of the key, plus one. Quote-aware so a quoted key may contain
+/// spaces, tabs, `=`, and dots without terminating the scan; dotted keys
+/// span across the dots (and any surrounding whitespace) too. Stops at the
+/// unquoted `=` separator, a newline, or end of input.
 fn scanKey(src: []const u8, pos: usize) usize {
     var i = pos;
+    var last_nonblank = pos;
     while (i < src.len) : (i += 1) {
         const c = src[i];
-        if (c == ' ' or c == '\t' or c == '=' or c == '\n') return i;
+        if (c == '"' or c == '\'') {
+            i = scanQuotedString(src, i, c, c == '"');
+            last_nonblank = i;
+            i -= 1; // loop's increment re-advances
+            continue;
+        }
+        if (c == '=' or c == '\n') break;
+        if (c != ' ' and c != '\t' and c != '\r') last_nonblank = i + 1;
     }
-    return i;
+    return last_nonblank;
 }
 
 /// Scan a TOML value starting at `pos`. Returns the byte index right
@@ -1108,21 +1223,21 @@ fn parseInlineLayout(arena: Allocator, value_bytes: []const u8) Error!*InlineTab
     while (true) {
         // Scan key.
         const key_start = pos;
-        var key_text: []const u8 = undefined;
         if (value_bytes[pos] == '"' or value_bytes[pos] == '\'') {
             const allow_escape = value_bytes[pos] == '"';
             const quote = value_bytes[pos];
             pos = scanQuotedString(value_bytes, pos, quote, allow_escape);
-            key_text = value_bytes[key_start + 1 .. pos - 1];
         } else {
             while (pos < value_bytes.len) : (pos += 1) {
                 const c = value_bytes[pos];
                 if (c == ' ' or c == '\t' or c == '=') break;
                 if (!(std.ascii.isAlphanumeric(c) or c == '_' or c == '-')) break;
             }
-            key_text = value_bytes[key_start..pos];
         }
         const key_raw = value_bytes[key_start..pos];
+        // Decoded identity for matching: quotes stripped, escapes interpreted,
+        // so it lines up with the decoded paths callers pass to set/remove.
+        const key_text = parser_mod.decodeKeyPath(arena, key_raw) catch key_raw;
 
         // Scan sep: optional ws + `=` + optional ws.
         const sep_start = pos;
@@ -1227,6 +1342,150 @@ test "document: setLiteral replaces existing value" {
     defer aw.deinit();
     try doc.emit(&aw.writer);
     try testing.expectEqualStrings("[server]\nport = 9999\n", aw.written());
+    // The cached value tree must reflect the edit, not the original.
+    try testing.expectEqual(@as(i64, 9999), doc.get("server.port").?.integer);
+    try testing.expectEqual(@as(i64, 9999), doc.getT(i64, "server.port").?);
+}
+
+test "document: get/getT see scalar edits via set/setValue/setLiteral" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var doc = try Document.parse(arena.allocator(),
+        \\name = "alpha"
+        \\
+        \\[server]
+        \\host = "localhost"
+        \\port = 8080
+        \\
+    , .{});
+
+    try doc.setLiteral("server.host", "\"h\"");
+    try testing.expectEqualStrings("h", doc.get("server.host").?.string);
+
+    try doc.set("server.port", @as(i64, 9999));
+    try testing.expectEqual(@as(i64, 9999), doc.get("server.port").?.integer);
+
+    try doc.setValue("name", .{ .string = "beta" });
+    try testing.expectEqualStrings("beta", doc.get("name").?.string);
+}
+
+test "document: quoted kv key is editable by decoded identity" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var doc = try Document.parse(arena.allocator(),
+        \\"weird key" = 1
+        \\
+    , .{});
+
+    try testing.expectEqual(@as(i64, 1), doc.get("weird key").?.integer);
+
+    try doc.setLiteral("weird key", "2");
+    try testing.expectEqual(@as(i64, 2), doc.get("weird key").?.integer);
+
+    var aw: Io.Writer.Allocating = .init(arena.allocator());
+    defer aw.deinit();
+    try doc.emit(&aw.writer);
+    try testing.expectEqualStrings("\"weird key\" = 2\n", aw.written());
+}
+
+test "document: quoted kv key supports remove and comment editors" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var doc = try Document.parse(arena.allocator(),
+        \\"weird key" = 1
+        \\
+    , .{});
+
+    try doc.setTrailingComment("weird key", "x");
+    try doc.addCommentBefore("weird key", "note");
+    {
+        var aw: Io.Writer.Allocating = .init(arena.allocator());
+        defer aw.deinit();
+        try doc.emit(&aw.writer);
+        try testing.expectEqualStrings("# note\n\"weird key\" = 1  # x\n", aw.written());
+    }
+
+    try doc.remove("weird key");
+    {
+        var aw: Io.Writer.Allocating = .init(arena.allocator());
+        defer aw.deinit();
+        try doc.emit(&aw.writer);
+        try testing.expectEqualStrings("# note\n", aw.written());
+    }
+}
+
+test "document: key with escape sequence editable by decoded form" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var doc = try Document.parse(arena.allocator(),
+        \\"a\tb" = 1
+        \\
+    , .{});
+
+    // Decoded key contains a literal tab.
+    try testing.expectEqual(@as(i64, 1), doc.get("a\tb").?.integer);
+    try doc.setLiteral("a\tb", "2");
+    try testing.expectEqual(@as(i64, 2), doc.get("a\tb").?.integer);
+
+    var aw: Io.Writer.Allocating = .init(arena.allocator());
+    defer aw.deinit();
+    try doc.emit(&aw.writer);
+    // Source bytes preserved verbatim for lossless emit.
+    try testing.expectEqualStrings("\"a\\tb\" = 2\n", aw.written());
+}
+
+test "document: failed scalar replace leaves document unchanged (atomic)" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var doc = try Document.parse(arena.allocator(),
+        \\x = 1
+        \\
+    , .{});
+
+    // A value the up-front validator rejects must leave the document
+    // untouched. (The reparse-rollback path -- where a literal passes
+    // up-front validation but yields an invalid document on reparse -- is
+    // exercised separately for replace and insert.)
+    try testing.expectError(error.InvalidValue, doc.setLiteral("x", "not toml here"));
+    try testing.expectEqual(@as(i64, 1), doc.get("x").?.integer);
+
+    var aw: Io.Writer.Allocating = .init(arena.allocator());
+    defer aw.deinit();
+    try doc.emit(&aw.writer);
+    try testing.expectEqualStrings("x = 1\n", aw.written());
+}
+
+test "document: quoted header path indexes kv by decoded identity" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var doc = try Document.parse(arena.allocator(),
+        \\["a b"]
+        \\k = 1
+        \\
+    , .{});
+
+    try testing.expectEqual(@as(i64, 1), doc.get("a b.k").?.integer);
+    try doc.setLiteral("a b.k", "2");
+    try testing.expectEqual(@as(i64, 2), doc.get("a b.k").?.integer);
+}
+
+test "document: set over a quoted-string value replaces the whole token" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var doc = try Document.parse(arena.allocator(),
+        \\port = "8080"
+        \\
+    , .{});
+
+    try doc.set("port", @as(i64, 9090));
+
+    var aw: Io.Writer.Allocating = .init(arena.allocator());
+    defer aw.deinit();
+    try doc.emit(&aw.writer);
+    // The whole value token (quotes included) is replaced, not spliced
+    // inside the quotes.
+    try testing.expectEqualStrings("port = 9090\n", aw.written());
+    try testing.expectEqual(@as(i64, 9090), doc.get("port").?.integer);
 }
 
 test "document: setLiteral appends to existing section" {
@@ -2030,4 +2289,136 @@ test "Document.set: u64 >= 2^63 returns IntegerOverflow" {
     defer aw.deinit();
     try doc.emit(&aw.writer);
     try testing.expect(std.mem.indexOf(u8, aw.written(), "9000") != null);
+}
+
+test "document: new section with a space in the name re-encodes the header" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var doc = try Document.parse(arena.allocator(),
+        \\[server]
+        \\port = 8080
+        \\
+    , .{});
+
+    // The section "my server" does not exist yet. Its decoded name has a
+    // space, so the emitted header must quote it: ["my server"].
+    try doc.setLiteral("my server.port", "80");
+
+    var aw: Io.Writer.Allocating = .init(arena.allocator());
+    defer aw.deinit();
+    try doc.emit(&aw.writer);
+    const out = aw.written();
+    try testing.expect(std.mem.indexOf(u8, out, "[\"my server\"]") != null);
+    // The bare, unquoted form would be invalid TOML and must not appear.
+    try testing.expect(std.mem.indexOf(u8, out, "[my server]") == null);
+    // The document round-trips and the value is reachable by decoded path.
+    try testing.expectEqual(@as(i64, 80), doc.get("my server.port").?.integer);
+}
+
+test "document: dotted new section re-encodes each segment" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var doc = try Document.parse(arena.allocator(), "", .{});
+
+    // First segment is a bare key, second needs quoting.
+    try doc.setLiteral("a.my key.v", "1");
+
+    var aw: Io.Writer.Allocating = .init(arena.allocator());
+    defer aw.deinit();
+    try doc.emit(&aw.writer);
+    const out = aw.written();
+    try testing.expect(std.mem.indexOf(u8, out, "[a.\"my key\"]") != null);
+    try testing.expectEqual(@as(i64, 1), doc.get("a.my key.v").?.integer);
+}
+
+test "document: new inline-table key with a space is quoted on emit" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var doc = try Document.parse(arena.allocator(),
+        \\point = { a = 1 }
+        \\
+    , .{});
+
+    try doc.setLiteral("point.my key", "2");
+
+    var aw: Io.Writer.Allocating = .init(arena.allocator());
+    defer aw.deinit();
+    try doc.emit(&aw.writer);
+    try testing.expectEqualStrings("point = { a = 1, \"my key\" = 2 }\n", aw.written());
+    try testing.expectEqual(@as(i64, 2), doc.get("point.my key").?.integer);
+}
+
+test "document: inline-table escape key updates in place, no duplicate" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var doc = try Document.parse(arena.allocator(),
+        \\point = { "a\tb" = 1 }
+        \\
+    , .{});
+
+    // Callers pass the DECODED path (literal tab); this must match the
+    // existing entry and update it, not append a duplicate.
+    try doc.setLiteral("point.a\tb", "2");
+
+    var aw: Io.Writer.Allocating = .init(arena.allocator());
+    defer aw.deinit();
+    try doc.emit(&aw.writer);
+    // Exactly one entry, source key bytes preserved, value updated.
+    try testing.expectEqualStrings("point = { \"a\\tb\" = 2 }\n", aw.written());
+    try testing.expectEqual(@as(i64, 2), doc.get("point.a\tb").?.integer);
+}
+
+test "document: failed insert (reparse rollback) leaves document unchanged" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var doc = try Document.parse(arena.allocator(),
+        \\[server]
+        \\port = 8080
+        \\
+    , .{});
+
+    // Inserting `server.port` again as a NEW key (the path is registered, so
+    // this would normally replace; instead use a sibling that collides on
+    // reparse). A duplicate dotted key surfaced via a fresh path that the
+    // strict reparse rejects must roll back, leaving items/index/source as
+    // they were and reporting the parse error -- not a corrupted document.
+    //
+    // `port` already lives under [server]; defining the same key as a bare
+    // top-level dotted key `server.port` collides on reparse.
+    const before_emit = blk: {
+        var aw: Io.Writer.Allocating = .init(arena.allocator());
+        defer aw.deinit();
+        try doc.emit(&aw.writer);
+        break :blk try arena.allocator().dupe(u8, aw.written());
+    };
+
+    try testing.expectError(error.TomlParseError, doc.setLiteral("server.port.deeper", "1"));
+
+    // Document is byte-identical to before the failed insert.
+    var aw: Io.Writer.Allocating = .init(arena.allocator());
+    defer aw.deinit();
+    try doc.emit(&aw.writer);
+    try testing.expectEqualStrings(before_emit, aw.written());
+
+    // And still fully functional afterwards: an unrelated valid insert works.
+    try doc.setLiteral("server.tls", "true");
+    try testing.expectEqual(true, doc.get("server.tls").?.boolean);
+    try testing.expectEqual(@as(i64, 8080), doc.get("server.port").?.integer);
+}
+
+test "document: simple bare-key new section still emits unquoted" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var doc = try Document.parse(arena.allocator(),
+        \\[server]
+        \\port = 8080
+        \\
+    , .{});
+
+    try doc.setLiteral("client.timeout", "30");
+
+    var aw: Io.Writer.Allocating = .init(arena.allocator());
+    defer aw.deinit();
+    try doc.emit(&aw.writer);
+    try testing.expectEqualStrings("[server]\nport = 8080\n\n[client]\ntimeout = 30\n", aw.written());
 }
