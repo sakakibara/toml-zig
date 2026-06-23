@@ -204,6 +204,114 @@ var stdin_reader = std.Io.File.stdin().readerStreaming(&stdin_buf);
 const v = try toml.parseReader(arena, &stdin_reader.interface, .{});
 ```
 
+### Reader-backed streaming (table-at-a-time)
+
+Parse a `std.Io.Reader` one statement-unit at a time without buffering the
+whole document. Memory is bounded to ONE unit plus a small pull buffer,
+regardless of total stream length.
+
+```zig
+// ValueStream shape .array_of_tables: one Value per [[x]] element.
+var r: std.Io.Reader = .fixed(src);
+var vs = toml.ValueStream.fromReader(gpa, &r, .{}, .array_of_tables);
+defer vs.deinit();
+
+var item_arena: std.heap.ArenaAllocator = .init(gpa);
+defer item_arena.deinit();
+
+while (try vs.next(item_arena.allocator())) |v| {
+    const name = v.getT([]const u8, "name") orelse "?";
+    std.debug.print("{s}\n", .{name});
+    _ = item_arena.reset(.retain_capacity); // free previous element, keep capacity
+}
+```
+
+Three shapes control what each `next(item_arena)` yields:
+
+- `.tables` - one `Value` per statement-unit in document order (leading
+  top-level key-values, each `[table]` section, each `[[array-of-tables]]`
+  element).
+- `.array_of_tables` - one `Value` per `[[x]]` element only; plain `[table]`
+  sections and leading root keys are skipped. The streaming analog of NDJSON.
+- `.whole` - exactly one `Value` holding the full reconstructed document tree,
+  then null. A convenience for "I want a normal `parse` but from a reader";
+  memory is NOT bounded to one unit with this shape.
+
+For event-level access, use `EventReader`:
+
+```zig
+// EventReader: one parser event at a time across the whole stream.
+var r: std.Io.Reader = .fixed(src);
+var er = toml.EventReader.fromReader(gpa, &r, .{});
+defer er.deinit();
+
+while (try er.next()) |ev| {
+    switch (ev.kind) {
+        .table_header => |path| std.debug.print("[{s}]\n", .{path}),
+        .key => |k| std.debug.print("  {s}\n", .{k}),
+        .value_string => |s| std.debug.print("  = {s}\n", .{s}),
+        else => {},
+    }
+}
+```
+
+To compose a unit into a `Value` at a header boundary without walking its
+individual key/value events, call `materialize()` immediately after `next()`
+returns a `table_header` or `array_of_tables_header` event:
+
+```zig
+while (try er.next()) |ev| {
+    if (ev.kind != .array_of_tables_header) continue;
+    const v = try er.materialize(item_arena.allocator());
+    // use v; then reset item_arena
+    _ = item_arena.reset(.retain_capacity);
+}
+```
+
+#### Event kinds
+
+| Kind | Meaning |
+| --- | --- |
+| `table_header` | `[a.b]` header; payload is the decoded dotted path. |
+| `array_of_tables_header` | `[[a.b]]` header; payload is the decoded dotted path. |
+| `key` | A key under the current unit; payload is the decoded name. |
+| `value_string` / `value_integer` / `value_float` / `value_bool` / `value_datetime` / `value_date` / `value_time` | A scalar value. |
+| `array_begin` / `array_end` | An inline array open/close. |
+| `inline_table_begin` / `inline_table_end` | An inline table open/close. |
+| `end_of_input` | Final event; `next()` returns null after. |
+
+#### Borrow contract
+
+Event payload slices (`table_header`, `key`, `value_string`, ...) borrow the
+internal unit buffer and are valid ONLY until the next unit boundary (the
+`next()` call that crosses into the following unit, or a call to
+`materialize()`). Copy any slice that must outlive the unit.
+
+#### Error / recovery policy
+
+The per-unit error recovery policy mirrors buffered `parse`:
+
+- `options.errors == null` (default): a parse error on one unit terminates
+  the stream. The error is returned from `next()` and subsequent calls return
+  null.
+- `options.errors != null`: a parse error on one unit is appended to the
+  errors sink, the bad unit is skipped, and the stream continues to the
+  following unit.
+
+#### Memory bound
+
+The internal buffer grows to hold at most ONE unit plus a small pull chunk
+(4 KiB). A 100 000-element array-of-tables stream uses the same peak buffer
+as a 10-element stream, provided each element fits in memory.
+
+**Honest caveat:** the `whole` shape retains the full reconstructed document
+tree in `item_arena` throughout the drain -- its memory scales with the whole
+document, not one unit. For bounded-memory streaming, use `.tables` or
+`.array_of_tables`.
+
+See `examples/event_stream.zig` for a runnable walk-through of all three
+entry points.
+
 ### Token stream (for tooling)
 
 For incremental syntax highlighters, format-preserving editors, or any
@@ -260,11 +368,25 @@ to 100 diagnostics per parse. Set it to `null` for single-error mode
 | `Date.parse(literal)` / `Time.parse(literal)` | Parse a date or time literal. |
 | `Tokenizer.init(src)` / `.next()` | Lexer-level token stream for tooling. |
 
+#### Streaming (reader-backed, table-at-a-time)
+
+| Type / method | Purpose |
+| --- | --- |
+| `EventReader.fromReader(gpa, reader, options)` | Create a reader-backed streaming event reader. |
+| `er.next()` | Return the next `Event`, or null at stream end. |
+| `er.materialize(arena)` | At a `table_header` / `array_of_tables_header`: compose the whole current unit into a `Value`. |
+| `er.diagnostic()` | Return the most recent per-unit error diagnostic, if any. |
+| `er.bufCapacity()` | Return the internal buffer's allocated capacity (bytes); for benchmarks and tests. |
+| `ValueStream.fromReader(gpa, reader, options, shape)` | Create a reader-backed value stream with the given `Shape`. |
+| `vs.next(item_arena)` | Compose and return the next `Value`, or null at stream end. |
+
 ### Types
 
 `Value`, `Date`, `Time`, `DateTime`, `Span`, `Spans`, `Diagnostic`,
 `ParseOptions`, `Error`, `ReaderError`, `EncodeError`, `Document`,
-`Document.Position`, `document.Error`, `Tokenizer`, `Token`, `TokenKind`.
+`Document.Position`, `document.Error`, `Tokenizer`, `Token`, `TokenKind`,
+`EventReader`, `ValueStream`, `ValueStream.Shape`, `Event`, `Event.Kind`,
+`StreamError`.
 
 Generated reference docs are published at
 **https://sakakibara.github.io/toml-zig/**.
@@ -286,7 +408,7 @@ zig build fuzz           # random-input fuzzer
 zig build bench          # microbenchmarks (ReleaseFast)
 zig build docs           # generate reference docs
 zig build examples       # build all examples
-zig build example-basic  # run a specific example (basic, typed, edit, spans)
+zig build example-basic  # run a specific example (basic, typed, edit, spans, event_stream)
 ```
 
 ## Spec conformance
@@ -367,3 +489,4 @@ See `examples/` for runnable samples:
 - `typed.zig` - decode straight into a Zig struct
 - `edit.zig` - lossless document edit + emit
 - `spans.zig` - source spans for tooling and validators
+- `event_stream.zig` - reader-backed streaming: EventReader, ValueStream, and materialize

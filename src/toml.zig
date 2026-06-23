@@ -69,6 +69,14 @@ pub const Spans = value_mod.Spans;
 
 pub const Diagnostic = parser_mod.Diagnostic;
 
+/// Reader-backed, table-at-a-time streaming event reader. See `src/stream.zig`.
+pub const stream = @import("stream.zig");
+pub const EventReader = stream.EventReader;
+pub const Event = stream.Event;
+pub const StreamError = stream.StreamError;
+/// Reader-backed, table-at-a-time value stream. Shape controls what each `next()` yields.
+pub const ValueStream = stream.ValueStream;
+
 /// Parse a TOML document from a byte slice. See `ParseOptions` for the
 /// option fields.
 pub fn parse(arena: std.mem.Allocator, src: []const u8, options: ParseOptions) Error!Value {
@@ -112,6 +120,7 @@ test {
     _ = @import("tokenizer.zig");
     _ = @import("conformance.zig");
     _ = @import("levenshtein.zig");
+    _ = @import("stream.zig");
 }
 
 test "parseReader matches parse for the same document" {

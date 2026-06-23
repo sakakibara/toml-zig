@@ -60,6 +60,14 @@ pub fn main(init: std.process.Init) !void {
         try w.writeByte('\n');
     }
 
+    // Bounded-memory streaming bench: 100 000 small [[record]] elements in one
+    // buffer, streamed via ValueStream with a per-item arena reset. The
+    // EventReader's peak bufCapacity() must stay proportional to ONE element,
+    // not to the total stream length -- that is the bounded-memory guarantee.
+    // The bench prints peak capacity alongside throughput so regressions are
+    // visible.
+    try benchValueStreamBounded(w, gpa, io);
+
     try printFooter(w);
     try w.flush();
 }
@@ -194,6 +202,107 @@ fn benchParse(gpa: std.mem.Allocator, io: Io, fixture: []const u8, iters: usize)
     }
     std.mem.doNotOptimizeAway(&sink);
     return @intCast(@max(t0.untilNow(io).raw.toNanoseconds(), 0));
+}
+
+/// Bounded-memory streaming bench. Builds a large synthetic N-element TOML
+/// stream of [[record]] array-of-tables entries (100 000 elements, each ~30
+/// bytes), then streams it via ValueStream with a per-item arena reset between
+/// elements.
+///
+/// The key property under test: the EventReader's internal doc_buf grows to
+/// roughly ONE element's size and stays there, regardless of how many elements
+/// the stream contains. The reported peak capacity is the regression guard: it
+/// must not grow with N.
+fn benchValueStreamBounded(w: *Io.Writer, gpa: std.mem.Allocator, io: Io) !void {
+    const n_elems = 100_000;
+
+    // Build the synthetic stream: N [[record]] elements.
+    // Each element: "[[record]]\nname = \"elem-NNNNN\"\nseq = NNNNN\n" (~35 bytes).
+    var buf: Io.Writer.Allocating = .init(gpa);
+    defer buf.deinit();
+    for (0..n_elems) |i| {
+        try buf.writer.print("[[record]]\nname = \"elem-{d}\"\nseq = {d}\n", .{ i, i });
+    }
+    const stream_src = buf.written();
+    const stream_bytes = stream_src.len;
+
+    // Single element's byte length (rough reference for the cap assertion).
+    const one_elem_approx: usize = stream_bytes / n_elems + 8;
+
+    const samples = try gpa.alloc(u64, 11);
+    defer gpa.free(samples);
+    var peak_cap: usize = 0;
+
+    // One untimed warmup pass.
+    {
+        var item_arena = std.heap.ArenaAllocator.init(gpa);
+        defer item_arena.deinit();
+        var r: std.Io.Reader = .fixed(stream_src);
+        var vs = toml.ValueStream.fromReader(gpa, &r, .{}, .array_of_tables);
+        defer vs.deinit();
+        while (try vs.next(item_arena.allocator())) |v| {
+            std.mem.doNotOptimizeAway(&v);
+            _ = item_arena.reset(.retain_capacity);
+        }
+    }
+
+    for (samples) |*s| {
+        var item_arena = std.heap.ArenaAllocator.init(gpa);
+        defer item_arena.deinit();
+
+        var r: std.Io.Reader = .fixed(stream_src);
+        var vs = toml.ValueStream.fromReader(gpa, &r, .{}, .array_of_tables);
+        defer vs.deinit();
+
+        const t0 = Io.Clock.Timestamp.now(io, .awake);
+        var count: usize = 0;
+        while (try vs.next(item_arena.allocator())) |v| {
+            std.mem.doNotOptimizeAway(&v);
+            count += 1;
+            _ = item_arena.reset(.retain_capacity);
+        }
+        s.* = @intCast(@max(t0.untilNow(io).raw.toNanoseconds(), 0));
+
+        const cap = vs.er.bufCapacity();
+        if (cap > peak_cap) peak_cap = cap;
+    }
+
+    const stats = computeStats(samples, 1);
+    try w.print(
+        "\n== ValueStream bounded-memory  ({d} [[record]] elements, {d} bytes) ==\n",
+        .{ n_elems, stream_bytes },
+    );
+    try w.print(
+        "  stream   min {d:>9} ns  p50 {d:>9} ns  p99 {d:>9} ns  max {d:>9} ns  stddev {d:>7.0} ns  ({d:>6.1} MB/s)\n",
+        .{
+            stats.min_per_op,
+            stats.p50_per_op,
+            stats.p99_per_op,
+            stats.max_per_op,
+            stats.stddev,
+            mbPerSec(stream_bytes, stats.p50_per_op),
+        },
+    );
+
+    // The peak doc_buf capacity must stay bounded to roughly one element's
+    // size plus a pull chunk (4 KiB). We set the limit at 64 KiB -- 16x the
+    // pull chunk -- as a generous regression guard. A capacity near the full
+    // stream size (3+ MB) would indicate the bounded-memory guarantee has
+    // regressed.
+    const cap_limit = 64 * 1024;
+    if (peak_cap > cap_limit) {
+        try w.print(
+            "BOUNDED-MEMORY FAIL: peak bufCapacity {d} B exceeds limit {d} B (one_elem_approx={d} B)\n",
+            .{ peak_cap, cap_limit, one_elem_approx },
+        );
+        try w.flush();
+        std.process.exit(1);
+    }
+
+    try w.print(
+        "  bounded-memory: peak bufCapacity = {d} B  (one_elem_approx = {d} B, n_elems = {d})\n",
+        .{ peak_cap, one_elem_approx, n_elems },
+    );
 }
 
 fn benchEncode(gpa: std.mem.Allocator, io: Io, fixture: []const u8, iters: usize) !u64 {

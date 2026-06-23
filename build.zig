@@ -98,7 +98,7 @@ pub fn build(b: *std.Build) void {
 
         // Runnable examples. `zig build example-NAME` runs each.
         const examples_step = b.step("examples", "Build all examples");
-        inline for (.{ "basic", "typed", "edit", "spans" }) |name| {
+        inline for (.{ "basic", "typed", "edit", "spans", "event_stream" }) |name| {
             const exe = b.addExecutable(.{
                 .name = "example-" ++ name,
                 .root_module = b.createModule(.{
