@@ -66,10 +66,6 @@ fn encodeTaggedUnion(
     arena: std.mem.Allocator,
     is_root: bool,
 ) EncodeError!void {
-    _ = path;
-    _ = path_alloc;
-    _ = is_root;
-
     const tag_field = T.toml_tag;
     const active_tag = std.meta.activeTag(value);
 
@@ -84,12 +80,17 @@ fn encodeTaggedUnion(
             try writeQuotedString(w, effective_name);
             try w.writeByte('\n');
 
-            // Emit the payload's fields (if any) inline at this level.
+            // Pass 1: flat scalars from the payload.
+            // Pass 2: sub-tables from the payload.
             const PayloadType = union_field.type;
             if (PayloadType != void) {
                 const payload = @field(value, variant_name);
+                // true because the discriminator key was already emitted
+                // above, so emitStructSubTables must insert a blank line
+                // before any sub-table section header.
                 var has: bool = true;
                 try emitFlatScalars(PayloadType, payload, w, arena, &has);
+                try emitStructSubTables(PayloadType, payload, w, path, path_alloc, arena, is_root, &has);
             }
             return;
         }
@@ -111,18 +112,40 @@ fn encodeTypedTable(
     // Pass 1: scalars (recursively expanding flattened fields).
     try emitFlatScalars(T, value, w, arena, &has_any_kv);
 
-    // Pass 2: sub-tables (skipping flattened and skipped fields).
+    // Pass 2: sub-tables (descending into flattened fields, skipping skipped fields).
+    try emitStructSubTables(T, value, w, path, path_alloc, arena, is_root, &has_any_kv);
+}
+
+// emitStructSubTables is the shared pass-2 body: walks `T`'s fields and
+// emits sub-table sections. For flattened fields it descends into the inner
+// type without pushing the field's own key (flattening means "merge at this
+// level"). For tagged-union fields it delegates to encodeTaggedUnion.
+fn emitStructSubTables(
+    comptime T: type,
+    value: T,
+    w: *std.Io.Writer,
+    path: *ArrayList([]const u8),
+    path_alloc: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    is_root: bool,
+    has_any_kv: *bool,
+) EncodeError!void {
     const s = @typeInfo(T).@"struct";
     inline for (s.fields) |field| {
         if (comptime isSkipped(T, field.name)) continue;
-        if (comptime isFlattened(T, field.name)) continue;
         const fv = @field(value, field.name);
+        if (comptime isFlattened(T, field.name)) {
+            // Descend into the flattened struct's sub-tables at the current
+            // path level (do NOT push the flattened field's own key).
+            try emitStructSubTables(field.type, fv, w, path, path_alloc, arena, is_root, has_any_kv);
+            continue;
+        }
         if (comptime fieldHasSubTable(field.type)) {
             const eff_key = comptime renamedKey(T, field.name);
             try path.append(path_alloc, eff_key);
             defer _ = path.pop();
-            if (has_any_kv or !is_root) try w.writeByte('\n');
-            has_any_kv = true;
+            if (has_any_kv.* or !is_root) try w.writeByte('\n');
+            has_any_kv.* = true;
             try w.writeByte('[');
             try writePath(w, path.items);
             try w.writeAll("]\n");
@@ -873,4 +896,182 @@ test "encode nesting depth guard: deep table tree errors" {
     var aw: Io.Writer.Allocating = .init(a);
     defer aw.deinit();
     try testing.expectError(error.NestingTooDeep, encode(&aw.writer, .{ .table = inner }));
+}
+
+test "encodeTyped: toml_flatten with nested sub-table round-trips" {
+    // A flattened field that itself contains a sub-table (nested struct) must
+    // produce a [section] header for that sub-table, not silently drop it.
+    const Sub = struct { z: u32 };
+    const Inner = struct {
+        x: u32,
+        sub: Sub,
+    };
+    const Outer = struct {
+        pub const toml_flatten = .{"inner"};
+        name: []const u8,
+        inner: Inner,
+    };
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cfg = Outer{
+        .name = "flat-sub",
+        .inner = .{ .x = 10, .sub = .{ .z = 99 } },
+    };
+
+    var buf: [512]u8 = undefined;
+    var aw: std.Io.Writer = .fixed(&buf);
+    try encodeTyped(Outer, cfg, &aw, a);
+    const out = aw.buffered();
+
+    // Flat scalars from inner must appear at the root level.
+    try testing.expect(std.mem.indexOf(u8, out, "name = \"flat-sub\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "x = 10") != null);
+    // inner's [sub] section must appear (not be silently dropped).
+    try testing.expect(std.mem.indexOf(u8, out, "[sub]") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "z = 99") != null);
+    // The flattened field's own key must not appear as a section header.
+    try testing.expect(std.mem.indexOf(u8, out, "[inner]") == null);
+
+    // Full round-trip: encode then decode must recover all fields.
+    const decode_mod = @import("decode.zig");
+    const v1 = try parser.parse(a, out, .{});
+    const cfg2 = try decode_mod.decode(Outer, a, v1, .{});
+    try testing.expectEqualStrings("flat-sub", cfg2.name);
+    try testing.expectEqual(@as(u32, 10), cfg2.inner.x);
+    try testing.expectEqual(@as(u32, 99), cfg2.inner.sub.z);
+}
+
+test "encodeTyped: toml_flatten scalars-only still works after refactor" {
+    // Regression: flatten with only scalar fields must still produce flat output.
+    const Inner = struct { x: u32, y: u32 };
+    const Outer = struct {
+        pub const toml_flatten = .{"inner"};
+        name: []const u8,
+        inner: Inner,
+    };
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const cfg = Outer{ .name = "foo", .inner = .{ .x = 42, .y = 99 } };
+
+    var buf: [256]u8 = undefined;
+    var aw: std.Io.Writer = .fixed(&buf);
+    try encodeTyped(Outer, cfg, &aw, arena.allocator());
+    const out = aw.buffered();
+
+    try testing.expect(std.mem.indexOf(u8, out, "name = \"foo\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "x = 42") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "y = 99") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "[inner]") == null);
+}
+
+test "encodeTyped: tagged union payload with nested sub-table round-trips" {
+    // A tagged-union variant whose payload contains a nested struct (sub-table)
+    // must emit a [section] header for that sub-table, not silently drop it.
+    const Backend = struct { address: []const u8, timeout: u32 };
+    const Http = struct {
+        host: []const u8,
+        backend: Backend,
+    };
+    const Grpc = struct { endpoint: []const u8 };
+    const Plugin = union(enum) {
+        pub const toml_tag = "kind";
+        http: Http,
+        grpc: Grpc,
+    };
+    const Wrapper = struct { p: Plugin };
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cfg = Wrapper{ .p = .{ .http = .{
+        .host = "localhost",
+        .backend = .{ .address = "10.0.0.1", .timeout = 30 },
+    } } };
+
+    var buf: [512]u8 = undefined;
+    var aw: std.Io.Writer = .fixed(&buf);
+    try encodeTyped(Wrapper, cfg, &aw, a);
+    const out = aw.buffered();
+
+    // Discriminator and flat scalar from the union payload.
+    try testing.expect(std.mem.indexOf(u8, out, "kind = \"http\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "host = \"localhost\"") != null);
+    // The nested sub-table inside the union payload must appear.
+    try testing.expect(std.mem.indexOf(u8, out, "[p.backend]") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "address = \"10.0.0.1\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "timeout = 30") != null);
+
+    // Full round-trip via decode.
+    const decode_mod = @import("decode.zig");
+    const v1 = try parser.parse(a, out, .{});
+    const cfg2 = try decode_mod.decode(Wrapper, a, v1, .{});
+    try testing.expect(cfg2.p == .http);
+    try testing.expectEqualStrings("localhost", cfg2.p.http.host);
+    try testing.expectEqualStrings("10.0.0.1", cfg2.p.http.backend.address);
+    try testing.expectEqual(@as(u32, 30), cfg2.p.http.backend.timeout);
+}
+
+test "encodeTyped: tagged union scalars-only still works after refactor" {
+    // Regression: tagged union variants with only scalar payload fields must
+    // still produce correct output.
+    const Http = struct { host: []const u8, port: u16 };
+    const Grpc = struct { endpoint: []const u8 };
+    const Plugin = union(enum) {
+        pub const toml_tag = "kind";
+        http: Http,
+        grpc: Grpc,
+    };
+    const Wrapper = struct { p: Plugin };
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const cfg = Wrapper{ .p = .{ .http = .{ .host = "localhost", .port = 8080 } } };
+
+    var buf: [512]u8 = undefined;
+    var aw: std.Io.Writer = .fixed(&buf);
+    try encodeTyped(Wrapper, cfg, &aw, arena.allocator());
+    const out = aw.buffered();
+
+    try testing.expect(std.mem.indexOf(u8, out, "kind = \"http\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "host = \"localhost\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "port = 8080") != null);
+}
+
+test "encodeTyped: toml_flatten two levels deep merges all scalars at root" {
+    // flatten-inside-flatten: both emitFlatScalars and emitStructSubTables
+    // recurse through every flattened layer, so all scalar fields from all
+    // levels land in the root table (no [section] headers for flattened types).
+    const Deep = struct { a: u32, b: u32 };
+    const Inner = struct {
+        pub const toml_flatten = .{"deep"};
+        x: u32,
+        deep: Deep,
+    };
+    const Outer = struct {
+        pub const toml_flatten = .{"inner"};
+        name: []const u8,
+        inner: Inner,
+    };
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const cfg = Outer{ .name = "test", .inner = .{ .x = 10, .deep = .{ .a = 1, .b = 2 } } };
+
+    var buf: [256]u8 = undefined;
+    var aw: std.Io.Writer = .fixed(&buf);
+    try encodeTyped(Outer, cfg, &aw, arena.allocator());
+    const out = aw.buffered();
+
+    // All scalars from all three struct types must appear at the root level.
+    try testing.expect(std.mem.indexOf(u8, out, "name = \"test\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "x = 10") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "a = 1") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "b = 2") != null);
+    // Neither intermediate type may appear as a section header.
+    try testing.expect(std.mem.indexOf(u8, out, "[inner]") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "[deep]") == null);
 }
