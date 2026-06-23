@@ -62,6 +62,8 @@ pub const Error = error{
     PathNotFound,
     PathExists,
     InvalidValue,
+    IntegerOverflow,
+    PathTooDeep,
     OutOfMemory,
     WriteFailed,
     TomlParseError,
@@ -334,7 +336,9 @@ pub const Document = struct {
     ///   - `Value`               -> setValue passthrough
     ///   - `Date` / `Time` / `DateTime` -> wrapped into the matching variant
     ///   - `bool`                -> .boolean
-    ///   - integer types         -> .integer (overflow checked at comptime)
+    ///   - integer types         -> .integer (runtime i64 range check;
+    ///                             returns IntegerOverflow for values that
+    ///                             do not fit in i64)
     ///   - float types           -> .float
     ///   - `[]const u8` or string literal (`*const [N:0]u8`) -> .string (arena-duped)
     /// Other types raise a compile error.
@@ -804,7 +808,7 @@ fn writeLayout(layout: *const InlineTableLayout, w: *std.Io.Writer) std.Io.Write
     try w.writeAll(layout.close);
 }
 
-fn valueFromAny(arena: Allocator, comptime T: type, value: T) Error!Value {
+fn valueFromAny(arena: Allocator, comptime T: type, value: T) (Allocator.Error || error{IntegerOverflow})!Value {
     return value_mod.fromAny(arena, T, value);
 }
 
@@ -2011,4 +2015,19 @@ test "round-trip: trailing comma preserved on append" {
     defer aw.deinit();
     try doc.emit(&aw.writer);
     try testing.expectEqualStrings("t = { a = 1, b = 2, z = 3, }\n", aw.written());
+}
+
+test "Document.set: u64 >= 2^63 returns IntegerOverflow" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    // Out-of-range value must return an error, not panic.
+    var doc = try Document.parse(arena.allocator(), "port = 8080", .{});
+    const big: u64 = @as(u64, std.math.maxInt(i64)) + 1;
+    try testing.expectError(error.IntegerOverflow, doc.set("port", big));
+    // In-range u64 must succeed and the emitted source must reflect it.
+    try doc.set("port", @as(u64, 9000));
+    var aw: std.Io.Writer.Allocating = .init(arena.allocator());
+    defer aw.deinit();
+    try doc.emit(&aw.writer);
+    try testing.expect(std.mem.indexOf(u8, aw.written(), "9000") != null);
 }

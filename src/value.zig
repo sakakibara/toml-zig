@@ -256,6 +256,8 @@ pub const Value = union(enum) {
     pub const SetError = error{
         NotATable,
         InvalidPath,
+        IntegerOverflow,
+        PathTooDeep,
         OutOfMemory,
     };
 
@@ -271,15 +273,16 @@ pub const Value = union(enum) {
     /// (The error name is kept for API compatibility.)
     ///
     /// `value` is comptime-dispatched the same way as `Document.set`:
-    /// Value passthrough, Date/Time/DateTime, bool, integer, float,
-    /// []const u8 / string literals.
+    /// Value passthrough, Date/Time/DateTime, bool, integer (runtime i64
+    /// range check; returns IntegerOverflow for out-of-range unsigned or
+    /// wide integer values), float, []const u8 / string literals.
     pub fn set(self: *Value, arena: Allocator, path: []const u8, value: anytype) SetError!void {
         switch (self.*) {
             .table, .array => {},
             else => return error.NotATable,
         }
         const v = try fromAny(arena, @TypeOf(value), value);
-        return setAtPath(arena, self, path, v);
+        return setAtPath(arena, self, path, v, 0);
     }
 
     /// Canonical type name used in error messages.
@@ -338,16 +341,17 @@ pub const Value = union(enum) {
 /// Convert a native Zig value into a `Value`, comptime-dispatched on
 /// `@TypeOf(value)`. Used by `Value.set` and `Document.set`.
 /// Supported: Value passthrough, Date/Time/DateTime, bool, integer
-/// (with overflow check), float, []const u8, string literal pointers
+/// (runtime i64 range check; returns IntegerOverflow for values that do
+/// not fit), float, []const u8, string literal pointers
 /// (`*const [N:0]u8` and `*const [N]u8`). Unsupported types compile-error.
-pub fn fromAny(arena: Allocator, comptime T: type, value: T) Allocator.Error!Value {
+pub fn fromAny(arena: Allocator, comptime T: type, value: T) (Allocator.Error || error{IntegerOverflow})!Value {
     if (T == Value) return value;
     if (T == Date) return .{ .date = value };
     if (T == Time) return .{ .time = value };
     if (T == DateTime) return .{ .datetime = value };
     return switch (@typeInfo(T)) {
         .bool => .{ .boolean = value },
-        .int, .comptime_int => .{ .integer = @intCast(value) },
+        .int, .comptime_int => .{ .integer = std.math.cast(i64, value) orelse return error.IntegerOverflow },
         .float, .comptime_float => .{ .float = @floatCast(value) },
         .pointer => |p| blk: {
             if (p.size == .slice and p.child == u8 and p.is_const) {
@@ -366,7 +370,13 @@ pub fn fromAny(arena: Allocator, comptime T: type, value: T) Allocator.Error!Val
     };
 }
 
-fn setAtPath(arena: Allocator, root: *Value, path: []const u8, new: Value) Value.SetError!void {
+/// Maximum path depth accepted by setAtPath, mirroring the parser's
+/// max_depth = 128 to give consistent nesting limits across parse and set.
+const set_max_depth: usize = 128;
+
+fn setAtPath(arena: Allocator, root: *Value, path: []const u8, new: Value, depth: usize) Value.SetError!void {
+    if (depth >= set_max_depth) return error.PathTooDeep;
+
     if (path.len == 0) {
         root.* = new;
         return;
@@ -385,7 +395,7 @@ fn setAtPath(arena: Allocator, root: *Value, path: []const u8, new: Value) Value
                 root.array.items[idx] = new;
                 return;
             }
-            return setAtPath(arena, &root.array.items[idx], rest, new);
+            return setAtPath(arena, &root.array.items[idx], rest, new, depth + 1);
         } else if (idx == root.array.items.len) {
             // One-past-end: append (extends array by one).
             if (rest.len == 0) {
@@ -396,7 +406,7 @@ fn setAtPath(arena: Allocator, root: *Value, path: []const u8, new: Value) Value
                 .{ .array = .empty }
             else
                 .{ .table = .empty };
-            try setAtPath(arena, &sub, rest, new);
+            try setAtPath(arena, &sub, rest, new, depth + 1);
             try root.array.append(arena, sub);
             return;
         } else {
@@ -420,7 +430,7 @@ fn setAtPath(arena: Allocator, root: *Value, path: []const u8, new: Value) Value
             existing.* = new;
             return;
         }
-        return setAtPath(arena, existing, rest, new);
+        return setAtPath(arena, existing, rest, new, depth + 1);
     } else {
         if (rest.len == 0) {
             const k = try arena.dupe(u8, segment);
@@ -432,7 +442,7 @@ fn setAtPath(arena: Allocator, root: *Value, path: []const u8, new: Value) Value
             .{ .array = .empty }
         else
             .{ .table = .empty };
-        try setAtPath(arena, &sub, rest, new);
+        try setAtPath(arena, &sub, rest, new, depth + 1);
         const k = try arena.dupe(u8, segment);
         try root.table.put(arena, k, sub);
         return;
@@ -874,5 +884,39 @@ test "Value.set: nested table inside array" {
     try testing.expectEqualStrings("alice", root.get("users[0].name").?.string);
     try testing.expectEqual(@as(i64, 30), root.get("users[0].age").?.integer);
     try testing.expectEqualStrings("bob", root.get("users[1].name").?.string);
+}
+
+test "Value.set: u64 >= 2^63 returns IntegerOverflow, not panic" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var root: Value = .{ .table = .empty };
+    const big: u64 = @as(u64, std.math.maxInt(i64)) + 1;
+    try testing.expectError(error.IntegerOverflow, root.set(a, "k", big));
+    // In-range values must still work.
+    try root.set(a, "k", @as(u64, std.math.maxInt(i64)));
+    try testing.expectEqual(@as(i64, std.math.maxInt(i64)), root.get("k").?.integer);
+}
+
+test "Value.set: setAtPath depth limit returns PathTooDeep, not segfault" {
+    // Build a dotted path of ~200 segments, well above the 128-segment
+    // limit. The guard must return an error before exhausting stack space.
+    // 200 segments * 2 bytes each ("a.") = 400 bytes -- trivially cheap to
+    // allocate and fast to reject.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const seg_count = 200;
+    // "a.a.a..." with seg_count segments = seg_count * 2 - 1 bytes.
+    var path_buf = try a.alloc(u8, seg_count * 2 - 1);
+    for (0..seg_count) |i| {
+        path_buf[i * 2] = 'a';
+        if (i + 1 < seg_count) path_buf[i * 2 + 1] = '.';
+    }
+    const path = path_buf[0 .. seg_count * 2 - 1];
+
+    var root: Value = .{ .table = .empty };
+    try testing.expectError(error.PathTooDeep, root.set(a, path, @as(i64, 42)));
 }
 
