@@ -1114,9 +1114,15 @@ const Parser = struct {
         _ = self.match('"');
         _ = self.match('"');
         _ = self.match('"');
-        // Optional immediate newline after opening delimiter is trimmed.
-        if (!self.eof() and self.peek() == '\r') self.advance();
-        if (!self.eof() and self.peek() == '\n') self.advance();
+        // Trim at most one newline (LF or CRLF pair) immediately after the
+        // opening delimiter. A lone CR is NOT a newline per TOML ABNF and
+        // must fall through to the body loop where it is rejected.
+        if (!self.eof() and self.peek() == '\r' and self.peekAt(1) == '\n') {
+            self.advance();
+            self.advance();
+        } else if (!self.eof() and self.peek() == '\n') {
+            self.advance();
+        }
 
         var buf: ArrayList(u8) = .empty;
 
@@ -1175,8 +1181,15 @@ const Parser = struct {
         _ = self.match('\'');
         _ = self.match('\'');
         _ = self.match('\'');
-        if (!self.eof() and self.peek() == '\r') self.advance();
-        if (!self.eof() and self.peek() == '\n') self.advance();
+        // Trim at most one newline (LF or CRLF pair) immediately after the
+        // opening delimiter. A lone CR is NOT a newline per TOML ABNF and
+        // must fall through to the body loop where it is rejected.
+        if (!self.eof() and self.peek() == '\r' and self.peekAt(1) == '\n') {
+            self.advance();
+            self.advance();
+        } else if (!self.eof() and self.peek() == '\n') {
+            self.advance();
+        }
 
         // Try zero-copy: scan for ''' without any special processing.
         const start = self.pos;
@@ -1849,6 +1862,38 @@ test "parse multiline literal string" {
     ;
     const val = try parse(arena.allocator(), src, .{});
     try testing.expectEqualStrings("I [dw]on't need \\d{2} apples", val.table.get("s").?.string);
+}
+
+test "multiline basic string: lone leading CR is rejected" {
+    // A bare CR (not part of CRLF) immediately after """ is invalid.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const src = "a = \"\"\"\rx\"\"\"";
+    try testing.expectError(error.TomlParseError, parse(arena.allocator(), src, .{}));
+}
+
+test "multiline literal string: lone leading CR is rejected" {
+    // A bare CR (not part of CRLF) immediately after ''' is invalid.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const src = "a = '''\rx'''";
+    try testing.expectError(error.TomlParseError, parse(arena.allocator(), src, .{}));
+}
+
+test "multiline basic string: leading CRLF is trimmed (valid)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const src = "a = \"\"\"\r\nx\"\"\"";
+    const val = try parse(arena.allocator(), src, .{});
+    try testing.expectEqualStrings("x", val.table.get("a").?.string);
+}
+
+test "multiline basic string: leading LF is trimmed (valid)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const src = "a = \"\"\"\nx\"\"\"";
+    const val = try parse(arena.allocator(), src, .{});
+    try testing.expectEqualStrings("x", val.table.get("a").?.string);
 }
 
 test "parse integers all radixes" {
