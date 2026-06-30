@@ -18,7 +18,7 @@ const v = @import("value.zig");
 
 pub const Value = v.Value;
 
-pub const EncodeError = std.Io.Writer.Error || error{ ExpectedTable, NestingTooDeep, OutOfMemory, IntegerOverflow };
+pub const EncodeError = std.Io.Writer.Error || error{ ExpectedTable, NestingTooDeep, OutOfMemory, IntegerOverflow, UnsupportedType };
 
 const max_path_depth = 256;
 
@@ -174,12 +174,20 @@ fn emitFlatScalars(
             continue;
         }
         if (!comptime fieldHasSubTable(field.type)) {
-            const eff_key = comptime renamedKey(T, field.name);
-            try writeKey(w, eff_key);
-            try w.writeAll(" = ");
-            try writeTypedValue(field.type, fv, w, arena);
-            try w.writeByte('\n');
-            has_any_kv.* = true;
+            // Null optional fields are omitted entirely; decode treats an
+            // absent key as null for optional fields, so this round-trips.
+            const emit: bool = if (comptime @typeInfo(field.type) == .optional)
+                fv != null
+            else
+                true;
+            if (emit) {
+                const eff_key = comptime renamedKey(T, field.name);
+                try writeKey(w, eff_key);
+                try w.writeAll(" = ");
+                try writeTypedValue(field.type, fv, w, arena);
+                try w.writeByte('\n');
+                has_any_kv.* = true;
+            }
         }
     }
 }
@@ -243,8 +251,32 @@ fn writeTypedValue(comptime T: type, value: T, w: *std.Io.Writer, arena: std.mem
         .float, .comptime_float => writeFloat(w, @floatCast(value)),
         .pointer => |p| if (p.size == .slice and p.child == u8 and p.is_const)
             writeQuotedString(w, value)
-        else
+        else if (p.size == .slice) blk: {
+            try w.writeByte('[');
+            for (value, 0..) |item, i| {
+                if (i > 0) try w.writeAll(", ");
+                try writeTypedValue(p.child, item, w, arena);
+            }
+            break :blk w.writeByte(']');
+        } else
             @compileError("encodeTyped: unsupported pointer type " ++ @typeName(T)),
+        .array => |a| blk: {
+            try w.writeByte('[');
+            // Guard avoids a compile error for [0]T: Zig rejects indexing
+            // into zero-length arrays even in unreachable loop bodies.
+            if (comptime a.len > 0) {
+                for (value, 0..) |item, i| {
+                    if (i > 0) try w.writeAll(", ");
+                    try writeTypedValue(a.child, item, w, arena);
+                }
+            }
+            break :blk w.writeByte(']');
+        },
+        .optional => |o| if (value) |inner|
+            writeTypedValue(o.child, inner, w, arena)
+        else
+            error.UnsupportedType,
+        .@"enum" => writeQuotedString(w, @tagName(value)),
         else => @compileError("encodeTyped: unsupported value type " ++ @typeName(T)),
     };
 }
@@ -1106,4 +1138,169 @@ test "encodeTyped: u64 within i64 range round-trips" {
     try encodeTyped(Config, cfg, &aw, arena.allocator());
     const out = aw.buffered();
     try testing.expect(std.mem.indexOf(u8, out, "n = 100") != null);
+}
+
+test "encodeTyped: []const i64 emits TOML array and round-trips" {
+    const Config = struct { nums: []const i64 };
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const nums: []const i64 = &.{ 1, 2, 3 };
+    const cfg = Config{ .nums = nums };
+    var buf: [128]u8 = undefined;
+    var aw: std.Io.Writer = .fixed(&buf);
+    try encodeTyped(Config, cfg, &aw, a);
+    const out = aw.buffered();
+    try testing.expect(std.mem.indexOf(u8, out, "nums = [1, 2, 3]") != null);
+    const decode_mod = @import("decode.zig");
+    const v1 = try parser.parse(a, out, .{});
+    const cfg2 = try decode_mod.decode(Config, a, v1, .{});
+    try testing.expectEqualSlices(i64, cfg.nums, cfg2.nums);
+}
+
+test "encodeTyped: []const f64 emits TOML array and round-trips" {
+    const Config = struct { vals: []const f64 };
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const vals: []const f64 = &.{ 1.5, 2.5, 3.5 };
+    const cfg = Config{ .vals = vals };
+    var buf: [256]u8 = undefined;
+    var aw: std.Io.Writer = .fixed(&buf);
+    try encodeTyped(Config, cfg, &aw, a);
+    const out = aw.buffered();
+    const decode_mod = @import("decode.zig");
+    const v1 = try parser.parse(a, out, .{});
+    const cfg2 = try decode_mod.decode(Config, a, v1, .{});
+    try testing.expectEqual(@as(usize, 3), cfg2.vals.len);
+    try testing.expectEqual(@as(f64, 1.5), cfg2.vals[0]);
+    try testing.expectEqual(@as(f64, 3.5), cfg2.vals[2]);
+}
+
+test "encodeTyped: [3]u8 fixed array is array of ints (not string)" {
+    // [N]u8 is NOT a string in TOML; both encode and decode treat it as an
+    // array of integers. Only []const u8 (slice) maps to a TOML string.
+    const Config = struct { bytes: [3]u8 };
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cfg = Config{ .bytes = .{ 1, 2, 3 } };
+    var buf: [128]u8 = undefined;
+    var aw: std.Io.Writer = .fixed(&buf);
+    try encodeTyped(Config, cfg, &aw, a);
+    const out = aw.buffered();
+    try testing.expect(std.mem.indexOf(u8, out, "bytes = [1, 2, 3]") != null);
+    const decode_mod = @import("decode.zig");
+    const v1 = try parser.parse(a, out, .{});
+    const cfg2 = try decode_mod.decode(Config, a, v1, .{});
+    try testing.expectEqual(cfg.bytes, cfg2.bytes);
+}
+
+test "encodeTyped: [3]i64 fixed array round-trips" {
+    const Config = struct { vals: [3]i64 };
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cfg = Config{ .vals = .{ 10, 20, 30 } };
+    var buf: [128]u8 = undefined;
+    var aw: std.Io.Writer = .fixed(&buf);
+    try encodeTyped(Config, cfg, &aw, a);
+    const out = aw.buffered();
+    try testing.expect(std.mem.indexOf(u8, out, "vals = [10, 20, 30]") != null);
+    const decode_mod = @import("decode.zig");
+    const v1 = try parser.parse(a, out, .{});
+    const cfg2 = try decode_mod.decode(Config, a, v1, .{});
+    try testing.expectEqual(cfg.vals, cfg2.vals);
+}
+
+test "encodeTyped: [0]i64 emits empty TOML array and round-trips" {
+    const Config = struct { empty: [0]i64 };
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cfg = Config{ .empty = .{} };
+    var buf: [64]u8 = undefined;
+    var aw: std.Io.Writer = .fixed(&buf);
+    try encodeTyped(Config, cfg, &aw, a);
+    const out = aw.buffered();
+    try testing.expect(std.mem.indexOf(u8, out, "empty = []") != null);
+    const decode_mod = @import("decode.zig");
+    const v1 = try parser.parse(a, out, .{});
+    const cfg2 = try decode_mod.decode(Config, a, v1, .{});
+    try testing.expectEqual([0]i64{}, cfg2.empty);
+}
+
+test "encodeTyped: ?i64 non-null emits key and round-trips" {
+    const Config = struct { x: ?i64 };
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cfg = Config{ .x = 5 };
+    var buf: [64]u8 = undefined;
+    var aw: std.Io.Writer = .fixed(&buf);
+    try encodeTyped(Config, cfg, &aw, a);
+    const out = aw.buffered();
+    try testing.expect(std.mem.indexOf(u8, out, "x = 5") != null);
+    const decode_mod = @import("decode.zig");
+    const v1 = try parser.parse(a, out, .{});
+    const cfg2 = try decode_mod.decode(Config, a, v1, .{});
+    try testing.expectEqual(@as(?i64, 5), cfg2.x);
+}
+
+test "encodeTyped: ?i64 null omits key entirely; decode yields null" {
+    const Config = struct { x: ?i64, y: i64 };
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cfg = Config{ .x = null, .y = 7 };
+    var buf: [64]u8 = undefined;
+    var aw: std.Io.Writer = .fixed(&buf);
+    try encodeTyped(Config, cfg, &aw, a);
+    const out = aw.buffered();
+    // x must be absent from the TOML output.
+    try testing.expect(std.mem.indexOf(u8, out, "x") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "y = 7") != null);
+    const decode_mod = @import("decode.zig");
+    const v1 = try parser.parse(a, out, .{});
+    const cfg2 = try decode_mod.decode(Config, a, v1, .{});
+    try testing.expectEqual(@as(?i64, null), cfg2.x);
+    try testing.expectEqual(@as(i64, 7), cfg2.y);
+}
+
+test "encodeTyped: enum field emits tag name as string and round-trips" {
+    const Color = enum { red, green, blue };
+    const Config = struct { color: Color };
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cfg = Config{ .color = .red };
+    var buf: [64]u8 = undefined;
+    var aw: std.Io.Writer = .fixed(&buf);
+    try encodeTyped(Config, cfg, &aw, a);
+    const out = aw.buffered();
+    try testing.expect(std.mem.indexOf(u8, out, "color = \"red\"") != null);
+    const decode_mod = @import("decode.zig");
+    const v1 = try parser.parse(a, out, .{});
+    const cfg2 = try decode_mod.decode(Config, a, v1, .{});
+    try testing.expectEqual(Color.red, cfg2.color);
+}
+
+test "encodeTyped: []const []const u8 emits array of strings and round-trips" {
+    const Config = struct { tags: []const []const u8 };
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tags: []const []const u8 = &.{ "foo", "bar", "baz" };
+    const cfg = Config{ .tags = tags };
+    var buf: [128]u8 = undefined;
+    var aw: std.Io.Writer = .fixed(&buf);
+    try encodeTyped(Config, cfg, &aw, a);
+    const out = aw.buffered();
+    try testing.expect(std.mem.indexOf(u8, out, "tags = [\"foo\", \"bar\", \"baz\"]") != null);
+    const decode_mod = @import("decode.zig");
+    const v1 = try parser.parse(a, out, .{});
+    const cfg2 = try decode_mod.decode(Config, a, v1, .{});
+    try testing.expectEqual(@as(usize, 3), cfg2.tags.len);
+    try testing.expectEqualStrings("foo", cfg2.tags[0]);
+    try testing.expectEqualStrings("baz", cfg2.tags[2]);
 }

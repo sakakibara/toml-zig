@@ -759,6 +759,7 @@ fn writeInlineValue(w: *Io.Writer, value: Value) Io.Writer.Error!void {
         error.OutOfMemory,
         error.NestingTooDeep,
         error.IntegerOverflow,
+        error.UnsupportedType,
         => unreachable,
         else => |e| return e,
     };
