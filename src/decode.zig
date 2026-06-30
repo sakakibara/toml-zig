@@ -223,8 +223,18 @@ fn decodeInt(comptime T: type, value: Value, arena: Allocator, options: parser_m
 
 fn decodeFloat(comptime T: type, value: Value, arena: Allocator, options: parser_mod.ParseOptions, path: *PathBuilder) DecodeError!T {
     return switch (value) {
-        .float => |f| @floatCast(f),
-        .integer => |n| @floatFromInt(n),
+        .float => |f| blk: {
+            const r: T = @floatCast(f);
+            // Finite source -> inf result means the value overflowed the narrower type.
+            if (!std.math.isInf(f) and std.math.isInf(r)) return error.Overflow;
+            break :blk r;
+        },
+        .integer => |n| blk: {
+            const r: T = @floatFromInt(n);
+            // Integer -> inf means the value exceeded the float type's finite range.
+            if (std.math.isInf(r)) return error.Overflow;
+            break :blk r;
+        },
         else => {
             if (options.errors) |list| {
                 const msg = try std.fmt.allocPrint(arena, "expected float, got {s}", .{@tagName(value)});
@@ -285,10 +295,14 @@ fn decodeArray(comptime T: type, comptime a: std.builtin.Type.Array, arena: Allo
         return error.TypeMismatch;
     }
     var out: T = undefined;
-    for (value.array.items, 0..) |item, i| {
-        const prev = try path.pushIndex(arena, i);
-        defer path.restore(prev);
-        out[i] = try decodeInner(a.child, arena, item, options, path);
+    // Guard prevents a compile error when T is [0]Child: Zig rejects
+    // out[i] on a zero-length array even when the loop body is unreachable.
+    if (comptime a.len > 0) {
+        for (value.array.items, 0..) |item, i| {
+            const prev = try path.pushIndex(arena, i);
+            defer path.restore(prev);
+            out[i] = try decodeInner(a.child, arena, item, options, path);
+        }
     }
     return out;
 }
@@ -985,6 +999,66 @@ test "decode: tagged union unknown discriminator -> InvalidEnumValue" {
         \\host = "localhost"
     , .{});
     try testing.expectError(error.InvalidEnumValue, decode(Plugin, arena.allocator(), v, .{}));
+}
+
+test "decode float: large f64 into f32 -> error.Overflow" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const v = try parse(arena.allocator(), "x = 1e40", .{});
+    const Config = struct { x: f32 };
+    try testing.expectError(error.Overflow, decode(Config, arena.allocator(), v, .{}));
+}
+
+test "decode float: integer 70000 into f16 -> error.Overflow" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const v = try parse(arena.allocator(), "x = 70000", .{});
+    const Config = struct { x: f16 };
+    try testing.expectError(error.Overflow, decode(Config, arena.allocator(), v, .{}));
+}
+
+test "decode float: in-range value into f32 succeeds" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const v = try parse(arena.allocator(), "x = 1.5", .{});
+    const Config = struct { x: f32 };
+    const cfg = try decode(Config, arena.allocator(), v, .{});
+    try testing.expectEqual(@as(f32, 1.5), cfg.x);
+}
+
+test "decode float: f64 field with 1e40 ok (no narrowing)" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const v = try parse(arena.allocator(), "x = 1e40", .{});
+    const Config = struct { x: f64 };
+    const cfg = try decode(Config, arena.allocator(), v, .{});
+    try testing.expect(cfg.x == 1e40);
+}
+
+test "decode float: .inf source passes through to f32" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const v = try parse(arena.allocator(), "x = inf", .{});
+    const Config = struct { x: f32 };
+    const cfg = try decode(Config, arena.allocator(), v, .{});
+    try testing.expect(std.math.isPositiveInf(cfg.x));
+}
+
+test "decode array: [0]u8 field with empty TOML array compiles and yields empty" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const v = try parse(arena.allocator(), "a = []", .{});
+    const Config = struct { a: [0]u8 };
+    const cfg = try decode(Config, arena.allocator(), v, .{});
+    try testing.expectEqual(@as(usize, 0), cfg.a.len);
+}
+
+test "decode array: [0]u8 field with non-empty TOML array -> error.TypeMismatch" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const v = try parse(arena.allocator(), "a = [1, 2]", .{});
+    const Config = struct { a: [0]u8 };
+    try testing.expectError(error.TypeMismatch, decode(Config, arena.allocator(), v, .{}));
 }
 
 test "round-trip: annotated config decode + encode" {

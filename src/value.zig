@@ -232,8 +232,18 @@ pub const Value = union(enum) {
             .bool => if (v == .boolean) v.boolean else null,
             .int => if (v == .integer) std.math.cast(T, v.integer) else null,
             .float => switch (v) {
-                .float => |f| @floatCast(f),
-                .integer => |n| @floatFromInt(n),
+                .float => |f| blk: {
+                    const r: T = @floatCast(f);
+                    // Finite source -> inf result means the value overflowed the narrower type.
+                    if (!std.math.isInf(f) and std.math.isInf(r)) break :blk null;
+                    break :blk r;
+                },
+                .integer => |n| blk: {
+                    const r: T = @floatFromInt(n);
+                    // Integer -> inf means the value exceeded the float type's finite range.
+                    if (std.math.isInf(r)) break :blk null;
+                    break :blk r;
+                },
                 else => null,
             },
             .pointer => |p| if (p.size == .slice and p.child == u8 and p.is_const)
@@ -952,6 +962,22 @@ test "Value.set: u64 >= 2^63 returns IntegerOverflow, not panic" {
     // In-range values must still work.
     try root.set(a, "k", @as(u64, std.math.maxInt(i64)));
     try testing.expectEqual(@as(i64, std.math.maxInt(i64)), root.get("k").?.integer);
+}
+
+test "Value.getT: f32 overflow from large float -> null" {
+    const parse = @import("parser.zig").parse;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const v = try parse(arena.allocator(), "x = 1e40", .{});
+    try testing.expect(v.getT(f32, "x") == null);
+}
+
+test "Value.getT: in-range f32 from float value succeeds" {
+    const parse = @import("parser.zig").parse;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const v = try parse(arena.allocator(), "x = 1.5", .{});
+    try testing.expectEqual(@as(?f32, 1.5), v.getT(f32, "x"));
 }
 
 test "Value.set: setAtPath depth limit returns PathTooDeep, not segfault" {

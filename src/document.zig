@@ -751,11 +751,15 @@ fn formatValue(arena: Allocator, value: Value) ![]const u8 {
 
 fn writeInlineValue(w: *Io.Writer, value: Value) Io.Writer.Error!void {
     encoder.writeInlineValue(w, value) catch |err| switch (err) {
-        // encoder.writeInlineValue delegates to writeValue, which never
-        // allocates, never rejects on type, and only encodes values that
-        // were depth-bounded by the parser at document-parse time - these
-        // branches are unreachable.
-        error.ExpectedTable, error.OutOfMemory, error.NestingTooDeep => unreachable,
+        // encoder.writeInlineValue delegates to writeValue, which encodes
+        // Value.integer (always i64) and never calls writeTypedValue, so
+        // IntegerOverflow cannot arise here. The other branches are
+        // unreachable for the same reason as before.
+        error.ExpectedTable,
+        error.OutOfMemory,
+        error.NestingTooDeep,
+        error.IntegerOverflow,
+        => unreachable,
         else => |e| return e,
     };
 }

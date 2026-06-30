@@ -18,7 +18,7 @@ const v = @import("value.zig");
 
 pub const Value = v.Value;
 
-pub const EncodeError = std.Io.Writer.Error || error{ ExpectedTable, NestingTooDeep, OutOfMemory };
+pub const EncodeError = std.Io.Writer.Error || error{ ExpectedTable, NestingTooDeep, OutOfMemory, IntegerOverflow };
 
 const max_path_depth = 256;
 
@@ -234,7 +234,12 @@ fn writeTypedValue(comptime T: type, value: T, w: *std.Io.Writer, arena: std.mem
     }
     return switch (@typeInfo(T)) {
         .bool => w.writeAll(if (value) "true" else "false"),
-        .int, .comptime_int => w.print("{d}", .{value}),
+        .int, .comptime_int => blk: {
+            // TOML integers are i64 by spec; values outside i64 range cannot
+            // be represented and would produce output that re-parse fails on.
+            const i = std.math.cast(i64, value) orelse return error.IntegerOverflow;
+            break :blk w.print("{d}", .{i});
+        },
         .float, .comptime_float => writeFloat(w, @floatCast(value)),
         .pointer => |p| if (p.size == .slice and p.child == u8 and p.is_const)
             writeQuotedString(w, value)
@@ -1079,4 +1084,26 @@ test "encodeTyped: toml_flatten two levels deep merges all scalars at root" {
     // Neither intermediate type may appear as a section header.
     try testing.expect(std.mem.indexOf(u8, out, "[inner]") == null);
     try testing.expect(std.mem.indexOf(u8, out, "[deep]") == null);
+}
+
+test "encodeTyped: u64 field exceeding i64 max -> IntegerOverflow" {
+    const Config = struct { n: u64 };
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const cfg = Config{ .n = @as(u64, std.math.maxInt(i64)) + 1 };
+    var buf: [64]u8 = undefined;
+    var aw: std.Io.Writer = .fixed(&buf);
+    try testing.expectError(error.IntegerOverflow, encodeTyped(Config, cfg, &aw, arena.allocator()));
+}
+
+test "encodeTyped: u64 within i64 range round-trips" {
+    const Config = struct { n: u64 };
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const cfg = Config{ .n = 100 };
+    var buf: [64]u8 = undefined;
+    var aw: std.Io.Writer = .fixed(&buf);
+    try encodeTyped(Config, cfg, &aw, arena.allocator());
+    const out = aw.buffered();
+    try testing.expect(std.mem.indexOf(u8, out, "n = 100") != null);
 }
