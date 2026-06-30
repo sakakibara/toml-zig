@@ -753,6 +753,12 @@ const Parser = struct {
         defer indexed_key.deinit(self.arena);
 
         for (key_parts.items, 0..) |part, i| {
+            // Bound header nesting by max_depth: a long dotted header
+            // (`[a.a.a...]`) otherwise re-dupes a growing full_key into
+            // seen_arena at every segment (O(N^2) memory) and builds a Value
+            // tree deep enough to overflow the recursive Value.clone /
+            // Value.eql. Mirrors the dotted-key and bracketed-nesting guards.
+            if (i >= self.max_depth) return self.setDepthError();
             if (i > 0) try full_key.append(self.arena, '.');
             try full_key.appendSlice(self.arena, part);
 
@@ -974,9 +980,15 @@ const Parser = struct {
         defer full_key.deinit(self.arena);
         try full_key.appendSlice(self.arena, self.current_prefix.items);
 
-        // Descend intermediate tables for dotted keys.
+        // Descend intermediate tables for dotted keys. Bound the descent by
+        // max_depth: without this, a long dotted key (`a.a.a...=1`) builds an
+        // arbitrarily deep Value tree, which both re-dupes a growing full_key
+        // into seen_arena at every level (O(N^2) memory) and later overflows
+        // the recursive Value.clone / Value.eql. parseArray / parseInlineTable
+        // already enforce the same ceiling on bracketed nesting.
         var t = target;
         for (parts.items[0 .. parts.items.len - 1], 0..) |part, i| {
+            if (i >= self.max_depth) return self.setDepthError();
             // Always emit a separator for joins  -  empty keys are valid
             // in TOML (e.g. `""."x" = 1`) and would otherwise collapse.
             if (self.current_prefix.items.len > 0 or i > 0) try full_key.append(self.arena, '.');
@@ -2717,6 +2729,37 @@ test "nesting depth guard: inline-table branch errors at max_depth+1" {
     try over.appendSlice(a, "x = ");
     var i: usize = 0;
     while (i < default_max + 1) : (i += 1) try over.appendSlice(a, "{a=");
+    try testing.expectError(error.NestingTooDeep, parse(a, over.items, .{}));
+}
+
+test "nesting depth guard: deep dotted key errors instead of O(N^2)/overflow" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // `a.a.a...a = 1` with far more than max_depth segments. Each segment
+    // would otherwise descend a table level (deepening the Value tree past the
+    // clone/eql-safe ceiling) and re-dupe a growing full_key into seen_arena.
+    // The segment count bounds the construction; the guard must fire first.
+    var over: ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i < 4000) : (i += 1) try over.appendSlice(a, "a.");
+    try over.appendSlice(a, "a = 1");
+    try testing.expectError(error.NestingTooDeep, parse(a, over.items, .{}));
+}
+
+test "nesting depth guard: deep dotted header errors instead of O(N^2)/overflow" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // `[a.a.a...a]` with far more than max_depth segments. Same failure mode
+    // as the dotted-key case, via parseHeader's descent loop.
+    var over: ArrayList(u8) = .empty;
+    try over.append(a, '[');
+    var i: usize = 0;
+    while (i < 4000) : (i += 1) try over.appendSlice(a, "a.");
+    try over.appendSlice(a, "a]");
     try testing.expectError(error.NestingTooDeep, parse(a, over.items, .{}));
 }
 

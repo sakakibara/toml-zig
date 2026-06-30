@@ -244,7 +244,7 @@ pub const Document = struct {
         const after = old.raw[old.value_offset + old.value_len ..];
         const new_raw = try std.mem.concat(self.arena, u8, &.{ before, raw_value, after });
         const inline_layout: ?*InlineTableLayout = if (raw_value.len > 0 and raw_value[0] == '{')
-            try parseInlineLayout(self.arena, raw_value)
+            try parseInlineLayout(self.arena, raw_value, 0)
         else
             null;
         self.items.items[idx] = .{ .kv = .{
@@ -1096,7 +1096,7 @@ fn tokenize(doc: *Document, src: []const u8) !void {
 
         const value_text = src[value_start..value_end];
         const inline_layout: ?*InlineTableLayout = if (value_text.len > 0 and value_text[0] == '{')
-            try parseInlineLayout(doc.arena, value_text)
+            try parseInlineLayout(doc.arena, value_text, 0)
         else
             null;
 
@@ -1280,10 +1280,20 @@ fn scanBalanced(src: []const u8, pos: usize, open: u8, close: u8) usize {
     return i;
 }
 
+/// Nesting ceiling for the document-model inline-table layout parser,
+/// mirroring the strict parser's max_depth so both reject the same
+/// adversarial inputs. tokenize() runs this BEFORE the strict parser, so
+/// without an own bound a deeply nested `{a={a=...}}` would overflow the
+/// stack here first.
+const max_layout_depth: usize = (parser_mod.ParseOptions{}).max_depth;
+
 /// Parse inline-table value bytes (exactly `{` ... `}`) into a
 /// structured layout. Allocates the layout struct, entry list, and
-/// any recursive nested layouts in `arena`.
-fn parseInlineLayout(arena: Allocator, value_bytes: []const u8) Error!*InlineTableLayout {
+/// any recursive nested layouts in `arena`. `depth` is the current
+/// nesting level; recursion past `max_layout_depth` returns
+/// `error.NestingTooDeep` rather than overflowing the stack.
+fn parseInlineLayout(arena: Allocator, value_bytes: []const u8, depth: usize) Error!*InlineTableLayout {
+    if (depth >= max_layout_depth) return error.NestingTooDeep;
     if (value_bytes.len < 2 or value_bytes[0] != '{') return error.InvalidValue;
 
     var layout = try arena.create(InlineTableLayout);
@@ -1344,7 +1354,7 @@ fn parseInlineLayout(arena: Allocator, value_bytes: []const u8) Error!*InlineTab
             const inner_start = pos;
             const inner_end = scanBalanced(value_bytes, pos, '{', '}');
             const inner_bytes = value_bytes[inner_start..inner_end];
-            const inner_layout = try parseInlineLayout(arena, inner_bytes);
+            const inner_layout = try parseInlineLayout(arena, inner_bytes, depth + 1);
             value = .{ .inline_table = inner_layout };
             pos = inner_end;
         } else {
@@ -1944,10 +1954,29 @@ test "InlineTableLayout: types exist and are usable" {
     try testing.expectEqualStrings("x", entry.key);
 }
 
+test "Document.parse: deeply nested inline table errors instead of overflowing" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // `x = ` + 12000 `{a=` ... : the document model tokenizes inline-table
+    // layout recursively, BEFORE the strict parser's depth guard runs. Without
+    // its own bound this overflows the stack; it must return NestingTooDeep.
+    // The brace count bounds the construction.
+    var src: std.ArrayList(u8) = .empty;
+    try src.appendSlice(a, "x = ");
+    var i: usize = 0;
+    while (i < 12000) : (i += 1) try src.appendSlice(a, "{a=");
+    try src.append(a, '1');
+    i = 0;
+    while (i < 12000) : (i += 1) try src.append(a, '}');
+    try testing.expectError(error.NestingTooDeep, Document.parse(a, src.items, .{}));
+}
+
 test "parseInlineLayout: empty table" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const layout = try parseInlineLayout(arena.allocator(), "{}");
+    const layout = try parseInlineLayout(arena.allocator(), "{}", 0);
     try testing.expectEqual(@as(usize, 0), layout.entries.items.len);
     try testing.expectEqualStrings("{", layout.open);
     try testing.expectEqualStrings("}", layout.close);
@@ -1956,7 +1985,7 @@ test "parseInlineLayout: empty table" {
 test "parseInlineLayout: single key tight spacing" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const layout = try parseInlineLayout(arena.allocator(), "{x=1}");
+    const layout = try parseInlineLayout(arena.allocator(), "{x=1}", 0);
     try testing.expectEqual(@as(usize, 1), layout.entries.items.len);
     const e = layout.entries.items[0];
     try testing.expectEqualStrings("x", e.key);
@@ -1969,7 +1998,7 @@ test "parseInlineLayout: single key tight spacing" {
 test "parseInlineLayout: loose spacing" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const layout = try parseInlineLayout(arena.allocator(), "{ x = 1, y = 2 }");
+    const layout = try parseInlineLayout(arena.allocator(), "{ x = 1, y = 2 }", 0);
     try testing.expectEqual(@as(usize, 2), layout.entries.items.len);
     try testing.expectEqualStrings("{ ", layout.open);
     const e0 = layout.entries.items[0];
@@ -1987,7 +2016,7 @@ test "parseInlineLayout: loose spacing" {
 test "parseInlineLayout: nested inline table" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const layout = try parseInlineLayout(arena.allocator(), "{ a = 1, inner = { x = 9 }, b = 2 }");
+    const layout = try parseInlineLayout(arena.allocator(), "{ a = 1, inner = { x = 9 }, b = 2 }", 0);
     try testing.expectEqual(@as(usize, 3), layout.entries.items.len);
     const inner_entry = layout.entries.items[1];
     try testing.expectEqualStrings("inner", inner_entry.key);
@@ -2001,7 +2030,7 @@ test "parseInlineLayout: nested inline table" {
 test "parseInlineLayout: quoted key" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const layout = try parseInlineLayout(arena.allocator(), "{ \"weird key\" = 1 }");
+    const layout = try parseInlineLayout(arena.allocator(), "{ \"weird key\" = 1 }", 0);
     try testing.expectEqual(@as(usize, 1), layout.entries.items.len);
     const e = layout.entries.items[0];
     try testing.expectEqualStrings("weird key", e.key);
@@ -2011,7 +2040,7 @@ test "parseInlineLayout: quoted key" {
 test "parseInlineLayout: string value with braces inside" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const layout = try parseInlineLayout(arena.allocator(), "{ msg = \"a, b { c\", n = 1 }");
+    const layout = try parseInlineLayout(arena.allocator(), "{ msg = \"a, b { c\", n = 1 }", 0);
     try testing.expectEqual(@as(usize, 2), layout.entries.items.len);
     try testing.expectEqualStrings("\"a, b { c\"", layout.entries.items[0].value.raw);
     try testing.expectEqualStrings("1", layout.entries.items[1].value.raw);
@@ -2020,7 +2049,7 @@ test "parseInlineLayout: string value with braces inside" {
 test "parseInlineLayout: trailing comma (TOML 1.1)" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const layout = try parseInlineLayout(arena.allocator(), "{ a = 1, b = 2, }");
+    const layout = try parseInlineLayout(arena.allocator(), "{ a = 1, b = 2, }", 0);
     try testing.expectEqual(@as(usize, 2), layout.entries.items.len);
     try testing.expectEqualStrings("1", layout.entries.items[0].value.raw);
     try testing.expectEqualStrings("2", layout.entries.items[1].value.raw);
@@ -2032,7 +2061,7 @@ test "parseInlineLayout: trailing comma (TOML 1.1)" {
 test "parseInlineLayout: trailing comma with no space" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const layout = try parseInlineLayout(arena.allocator(), "{a=1,}");
+    const layout = try parseInlineLayout(arena.allocator(), "{a=1,}", 0);
     try testing.expectEqual(@as(usize, 1), layout.entries.items.len);
     try testing.expectEqualStrings("1", layout.entries.items[0].value.raw);
     try testing.expectEqualStrings(",", layout.entries.items[0].trailing);
