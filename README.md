@@ -184,13 +184,17 @@ point = { x = 99, y = 2 }
 
 ### Source spans
 
+A `Span` stores u64 byte offsets (`start`, `end`); line and column are
+derived on demand with `span.lineCol(src)`.
+
 ```zig
 var spans: toml.Spans = .empty;
 const v = try toml.parse(arena, src, .{ .spans = &spans });
 
 if (v.locate(spans, "server.port")) |port| {
+    const lc = port.span.lineCol(src);
     std.debug.print("port {d} at line {d} col {d}\n",
-        .{ port.value.integer, port.span.line, port.span.col });
+        .{ port.value.integer, lc.line, lc.col });
 }
 ```
 

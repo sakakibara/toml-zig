@@ -132,7 +132,7 @@ fn decodeInner(comptime T: type, arena: Allocator, value: Value, options: parser
             if (options.errors) |list| {
                 const msg = try std.fmt.allocPrint(arena, "expected date, got {s}", .{@tagName(value)});
                 const path_owned: ?[]const u8 = if (path.slice().len > 0) try arena.dupe(u8, path.slice()) else null;
-                try list.append(arena, .{ .line = 0, .col = 0, .message = msg, .path = path_owned });
+                try list.append(arena, .{ .message = msg, .path = path_owned });
             }
             return error.TypeMismatch;
         }
@@ -143,7 +143,7 @@ fn decodeInner(comptime T: type, arena: Allocator, value: Value, options: parser
             if (options.errors) |list| {
                 const msg = try std.fmt.allocPrint(arena, "expected time, got {s}", .{@tagName(value)});
                 const path_owned: ?[]const u8 = if (path.slice().len > 0) try arena.dupe(u8, path.slice()) else null;
-                try list.append(arena, .{ .line = 0, .col = 0, .message = msg, .path = path_owned });
+                try list.append(arena, .{ .message = msg, .path = path_owned });
             }
             return error.TypeMismatch;
         }
@@ -154,7 +154,7 @@ fn decodeInner(comptime T: type, arena: Allocator, value: Value, options: parser
             if (options.errors) |list| {
                 const msg = try std.fmt.allocPrint(arena, "expected datetime, got {s}", .{@tagName(value)});
                 const path_owned: ?[]const u8 = if (path.slice().len > 0) try arena.dupe(u8, path.slice()) else null;
-                try list.append(arena, .{ .line = 0, .col = 0, .message = msg, .path = path_owned });
+                try list.append(arena, .{ .message = msg, .path = path_owned });
             }
             return error.TypeMismatch;
         }
@@ -196,7 +196,7 @@ fn decodeBool(value: Value, arena: Allocator, options: parser_mod.ParseOptions, 
         if (options.errors) |list| {
             const msg = try std.fmt.allocPrint(arena, "expected boolean, got {s}", .{@tagName(value)});
             const path_owned: ?[]const u8 = if (path.slice().len > 0) try arena.dupe(u8, path.slice()) else null;
-            try list.append(arena, .{ .line = 0, .col = 0, .message = msg, .path = path_owned });
+            try list.append(arena, .{ .message = msg, .path = path_owned });
         }
         return error.TypeMismatch;
     }
@@ -208,7 +208,7 @@ fn decodeInt(comptime T: type, value: Value, arena: Allocator, options: parser_m
         if (options.errors) |list| {
             const msg = try std.fmt.allocPrint(arena, "expected integer, got {s}", .{@tagName(value)});
             const path_owned: ?[]const u8 = if (path.slice().len > 0) try arena.dupe(u8, path.slice()) else null;
-            try list.append(arena, .{ .line = 0, .col = 0, .message = msg, .path = path_owned });
+            try list.append(arena, .{ .message = msg, .path = path_owned });
         }
         return error.TypeMismatch;
     }
@@ -216,7 +216,7 @@ fn decodeInt(comptime T: type, value: Value, arena: Allocator, options: parser_m
     if (options.errors) |list| {
         const msg = try std.fmt.allocPrint(arena, "integer {d} out of range for {s}", .{ value.integer, @typeName(T) });
         const path_owned: ?[]const u8 = if (path.slice().len > 0) try arena.dupe(u8, path.slice()) else null;
-        try list.append(arena, .{ .line = 0, .col = 0, .message = msg, .path = path_owned });
+        try list.append(arena, .{ .message = msg, .path = path_owned });
     }
     return error.Overflow;
 }
@@ -229,7 +229,7 @@ fn decodeFloat(comptime T: type, value: Value, arena: Allocator, options: parser
             if (options.errors) |list| {
                 const msg = try std.fmt.allocPrint(arena, "expected float, got {s}", .{@tagName(value)});
                 const path_owned: ?[]const u8 = if (path.slice().len > 0) try arena.dupe(u8, path.slice()) else null;
-                try list.append(arena, .{ .line = 0, .col = 0, .message = msg, .path = path_owned });
+                try list.append(arena, .{ .message = msg, .path = path_owned });
             }
             return error.TypeMismatch;
         },
@@ -243,7 +243,7 @@ fn decodePointer(comptime T: type, comptime p: std.builtin.Type.Pointer, arena: 
             if (options.errors) |list| {
                 const msg = try std.fmt.allocPrint(arena, "expected string, got {s}", .{@tagName(value)});
                 const path_owned: ?[]const u8 = if (path.slice().len > 0) try arena.dupe(u8, path.slice()) else null;
-                try list.append(arena, .{ .line = 0, .col = 0, .message = msg, .path = path_owned });
+                try list.append(arena, .{ .message = msg, .path = path_owned });
             }
             return error.TypeMismatch;
         }
@@ -253,7 +253,7 @@ fn decodePointer(comptime T: type, comptime p: std.builtin.Type.Pointer, arena: 
         if (options.errors) |list| {
             const msg = try std.fmt.allocPrint(arena, "expected array, got {s}", .{@tagName(value)});
             const path_owned: ?[]const u8 = if (path.slice().len > 0) try arena.dupe(u8, path.slice()) else null;
-            try list.append(arena, .{ .line = 0, .col = 0, .message = msg, .path = path_owned });
+            try list.append(arena, .{ .message = msg, .path = path_owned });
         }
         return error.TypeMismatch;
     }
@@ -272,7 +272,7 @@ fn decodeArray(comptime T: type, comptime a: std.builtin.Type.Array, arena: Allo
         if (options.errors) |list| {
             const msg = try std.fmt.allocPrint(arena, "expected array, got {s}", .{@tagName(value)});
             const path_owned: ?[]const u8 = if (path.slice().len > 0) try arena.dupe(u8, path.slice()) else null;
-            try list.append(arena, .{ .line = 0, .col = 0, .message = msg, .path = path_owned });
+            try list.append(arena, .{ .message = msg, .path = path_owned });
         }
         return error.TypeMismatch;
     }
@@ -280,7 +280,7 @@ fn decodeArray(comptime T: type, comptime a: std.builtin.Type.Array, arena: Allo
         if (options.errors) |list| {
             const msg = try std.fmt.allocPrint(arena, "array length mismatch: expected {d}, got {d}", .{ a.len, value.array.items.len });
             const path_owned: ?[]const u8 = if (path.slice().len > 0) try arena.dupe(u8, path.slice()) else null;
-            try list.append(arena, .{ .line = 0, .col = 0, .message = msg, .path = path_owned });
+            try list.append(arena, .{ .message = msg, .path = path_owned });
         }
         return error.TypeMismatch;
     }
@@ -302,7 +302,7 @@ fn decodeStruct(comptime T: type, comptime s: std.builtin.Type.Struct, arena: Al
         if (options.errors) |list| {
             const msg = try std.fmt.allocPrint(arena, "expected table, got {s}", .{@tagName(value)});
             const path_owned: ?[]const u8 = if (path.slice().len > 0) try arena.dupe(u8, path.slice()) else null;
-            try list.append(arena, .{ .line = 0, .col = 0, .message = msg, .path = path_owned });
+            try list.append(arena, .{ .message = msg, .path = path_owned });
         }
         return error.TypeMismatch;
     }
@@ -325,8 +325,6 @@ fn decodeStruct(comptime T: type, comptime s: std.builtin.Type.Struct, arena: Al
                 const msg = try std.fmt.allocPrint(arena, "unknown field `{s}`", .{key});
                 const path_owned: ?[]const u8 = if (path.slice().len > 0) try arena.dupe(u8, path.slice()) else null;
                 try list.append(arena, .{
-                    .line = 0,
-                    .col = 0,
                     .message = msg,
                     .path = path_owned,
                     .suggestion = if (suggestion) |s_str| try arena.dupe(u8, s_str) else null,
@@ -382,7 +380,7 @@ fn decodeStruct(comptime T: type, comptime s: std.builtin.Type.Struct, arena: Al
             if (options.errors) |list| {
                 const msg = try std.fmt.allocPrint(arena, "missing required field `{s}`", .{field.name});
                 const path_owned: ?[]const u8 = if (path.slice().len > 0) try arena.dupe(u8, path.slice()) else null;
-                try list.append(arena, .{ .line = 0, .col = 0, .message = msg, .path = path_owned });
+                try list.append(arena, .{ .message = msg, .path = path_owned });
             }
             return error.MissingField;
         }
@@ -431,7 +429,7 @@ fn decodeEnum(comptime T: type, value: Value, arena: Allocator, options: parser_
             if (options.errors) |list| {
                 const msg = try std.fmt.allocPrint(arena, "invalid enum value `{s}` for {s}", .{ s, @typeName(T) });
                 const path_owned: ?[]const u8 = if (path.slice().len > 0) try arena.dupe(u8, path.slice()) else null;
-                try list.append(arena, .{ .line = 0, .col = 0, .message = msg, .path = path_owned });
+                try list.append(arena, .{ .message = msg, .path = path_owned });
             }
             return error.InvalidEnumValue;
         },
@@ -440,7 +438,7 @@ fn decodeEnum(comptime T: type, value: Value, arena: Allocator, options: parser_
             if (options.errors) |list| {
                 const msg = try std.fmt.allocPrint(arena, "integer {d} is not a valid value of {s}", .{ n, @typeName(T) });
                 const path_owned: ?[]const u8 = if (path.slice().len > 0) try arena.dupe(u8, path.slice()) else null;
-                try list.append(arena, .{ .line = 0, .col = 0, .message = msg, .path = path_owned });
+                try list.append(arena, .{ .message = msg, .path = path_owned });
             }
             return error.InvalidEnumValue;
         },
@@ -448,7 +446,7 @@ fn decodeEnum(comptime T: type, value: Value, arena: Allocator, options: parser_
             if (options.errors) |list| {
                 const msg = try std.fmt.allocPrint(arena, "expected string or integer for enum {s}, got {s}", .{ @typeName(T), @tagName(value) });
                 const path_owned: ?[]const u8 = if (path.slice().len > 0) try arena.dupe(u8, path.slice()) else null;
-                try list.append(arena, .{ .line = 0, .col = 0, .message = msg, .path = path_owned });
+                try list.append(arena, .{ .message = msg, .path = path_owned });
             }
             return error.TypeMismatch;
         },

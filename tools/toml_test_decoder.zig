@@ -25,7 +25,8 @@ pub fn main(init: std.process.Init) !u8 {
         const w = &stderr_writer.interface;
         if (errs.items.len > 0) {
             const e = errs.items[0];
-            try w.print("toml: line {d} col {d}: {s}\n", .{ e.line, e.col, e.message });
+            const lc = e.span.lineCol(src);
+            try w.print("toml: line {d} col {d}: {s}\n", .{ lc.line, lc.col, e.message });
         } else {
             try w.writeAll("toml: parse failed\n");
         }

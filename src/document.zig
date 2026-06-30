@@ -157,9 +157,9 @@ pub const KeyValue = struct {
     /// Full path resolved against the enclosing header.
     full_path: []const u8,
     /// Byte offset within `raw` where the value text starts.
-    value_offset: u32,
+    value_offset: usize,
     /// Length of the value text inside `raw`.
-    value_len: u32,
+    value_len: usize,
     /// Structured layout when the value at value_offset is an inline
     /// table. Null otherwise. Owned by the document's arena.
     inline_layout: ?*InlineTableLayout = null,
@@ -245,7 +245,7 @@ pub const Document = struct {
             .raw = new_raw,
             .full_path = old.full_path,
             .value_offset = old.value_offset,
-            .value_len = @intCast(raw_value.len),
+            .value_len = raw_value.len,
             .inline_layout = inline_layout,
         } };
         // Keep the cached value tree in sync so get/getT/has see the edit.
@@ -336,7 +336,7 @@ pub const Document = struct {
                 .raw = fmt.line,
                 .full_path = try self.arena.dupe(u8, path),
                 .value_offset = fmt.value_offset,
-                .value_len = @intCast(raw_value.len),
+                .value_len = raw_value.len,
             } };
             try self.items.insert(self.arena, after_idx + 1, new_item);
             self.shiftIndices(after_idx + 1, 1);
@@ -349,7 +349,7 @@ pub const Document = struct {
                 .raw = fmt.line,
                 .full_path = try self.arena.dupe(u8, path),
                 .value_offset = fmt.value_offset,
-                .value_len = @intCast(raw_value.len),
+                .value_len = raw_value.len,
             } };
             try self.items.append(self.arena, new_item);
             try self.kv_index.put(self.arena, new_item.kv.full_path, self.items.items.len - 1);
@@ -635,7 +635,7 @@ pub const Document = struct {
         const new_raw = try std.mem.concat(self.arena, u8, &.{ before, new_value_bytes, after });
 
         self.items.items[idx].kv.raw = new_raw;
-        self.items.items[idx].kv.value_len = @intCast(new_value_bytes.len);
+        self.items.items[idx].kv.value_len = new_value_bytes.len;
         // inline_layout pointer stays the same -- it was mutated in place.
     }
 
@@ -682,7 +682,7 @@ fn enclosingSection(path: []const u8) []const u8 {
     return "";
 }
 
-const FormattedKv = struct { line: []const u8, value_offset: u32 };
+const FormattedKv = struct { line: []const u8, value_offset: usize };
 
 /// Format a `key = value\n` line. The key is re-emitted via the encoder so
 /// a decoded special key (spaces, dots, etc.) is quoted into valid TOML.
@@ -690,7 +690,7 @@ const FormattedKv = struct { line: []const u8, value_offset: u32 };
 /// depends on the emitted key length (it may differ from `key.len`).
 fn formatKvLine(arena: Allocator, key: []const u8, value: []const u8) !FormattedKv {
     const key_raw = try encodeKey(arena, key);
-    const value_offset: u32 = @intCast(key_raw.len + " = ".len);
+    const value_offset: usize = key_raw.len + " = ".len;
     const line = try std.fmt.allocPrint(arena, "{s} = {s}\n", .{ key_raw, value });
     return .{ .line = line, .value_offset = value_offset };
 }
@@ -1001,8 +1001,8 @@ fn tokenize(doc: *Document, src: []const u8) !void {
             if (current_section.len == 0) break :blk try doc.arena.dupe(u8, key_decoded);
             break :blk try std.fmt.allocPrint(doc.arena, "{s}.{s}", .{ current_section, key_decoded });
         };
-        const value_offset: u32 = @intCast(value_start - line_start);
-        const value_len: u32 = @intCast(value_end - value_start);
+        const value_offset: usize = value_start - line_start;
+        const value_len: usize = value_end - value_start;
 
         const value_text = src[value_start..value_end];
         const inline_layout: ?*InlineTableLayout = if (value_text.len > 0 and value_text[0] == '{')
@@ -2289,6 +2289,13 @@ test "Document.set: u64 >= 2^63 returns IntegerOverflow" {
     defer aw.deinit();
     try doc.emit(&aw.writer);
     try testing.expect(std.mem.indexOf(u8, aw.written(), "9000") != null);
+}
+
+test "Document.parse accepts a normal small input (guard no false positive)" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    var doc = try Document.parse(ar.allocator(), "title = \"toml\"\n", .{});
+    try testing.expectEqualStrings("toml", doc.get("title").?.string);
 }
 
 test "document: new section with a space in the name re-encodes the header" {

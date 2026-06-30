@@ -79,6 +79,10 @@ pub const ValueStream = stream.ValueStream;
 
 /// Parse a TOML document from a byte slice. See `ParseOptions` for the
 /// option fields.
+///
+/// Inputs of any in-memory size parse fine: tokenizer/parser offsets and
+/// `Span` byte offsets are u64, so there is no 4 GiB cap on plain parses,
+/// the opt-in spans map (`ParseOptions.spans`), or the document model.
 pub fn parse(arena: std.mem.Allocator, src: []const u8, options: ParseOptions) Error!Value {
     return parser_mod.parse(arena, src, options);
 }

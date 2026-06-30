@@ -37,10 +37,6 @@ pub const Date = value.Date;
 pub const Time = value.Time;
 pub const Diagnostic = parser.Diagnostic;
 
-fn satU32(x: usize) u32 {
-    return std.math.lossyCast(u32, x);
-}
-
 /// Errors a streaming parse can surface: the parser's grammar / nesting
 /// errors, plus reader and allocator failures. A unit truncated
 /// mid-construct at reader EOF (unterminated string, open inline construct)
@@ -120,11 +116,14 @@ pub fn frameNextUnit(bytes: []const u8, ended: bool) FrameResult {
     var saw_any_content = false;
 
     while (t.next()) |tok| {
+        // Span offsets are u64; the framing buffer is small, so narrowing to
+        // usize for buffer indexing is safe here.
+        const tok_start: usize = @intCast(tok.span.start);
         switch (tok.kind) {
             .blank, .comment, .eol => continue,
             .header_open, .header_array_open => {
                 // Only a line-leading header is a real top-level boundary.
-                if (!isLineLeading(bytes, tok.span.start)) {
+                if (!isLineLeading(bytes, tok_start)) {
                     saw_any_content = true;
                     continue;
                 }
@@ -136,7 +135,7 @@ pub fn frameNextUnit(bytes: []const u8, ended: bool) FrameResult {
                 }
                 // A later line-leading header: the boundary. The unit is the
                 // bytes before it.
-                return .{ .complete = tok.span.start };
+                return .{ .complete = tok_start };
             },
             else => saw_any_content = true,
         }
@@ -521,21 +520,18 @@ pub const EventReader = struct {
 
     fn rebaseSpan(self: *const EventReader, sp: Span) Span {
         return .{
-            .start = satU32(self.base + sp.start),
-            .end = satU32(self.base + sp.end),
-            .line = sp.line,
-            .col = sp.col,
+            .start = self.base + sp.start,
+            .end = self.base + sp.end,
         };
     }
 
     fn zeroSpan(self: *const EventReader) Span {
-        const off = satU32(self.base);
-        return .{ .start = off, .end = off, .line = 1, .col = 1 };
+        return .{ .start = self.base, .end = self.base };
     }
 
     fn zeroSpanLocal(self: *const EventReader) Span {
         _ = self;
-        return .{ .start = 0, .end = 0, .line = 1, .col = 1 };
+        return .{ .start = 0, .end = 0 };
     }
 
     /// Dup a slice into the per-unit arena (event payloads, valid until the
@@ -558,9 +554,7 @@ pub const EventReader = struct {
     fn rebaseDiag(self: *EventReader, src: Diagnostic) Diagnostic {
         var d = src;
         d.message = self.seen_arena.allocator().dupe(u8, d.message) catch d.message;
-        if (d.range) |r| {
-            d.range = .{ satU32(self.base + r[0]), satU32(self.base + r[1]) };
-        }
+        d.span = .{ .start = self.base + src.span.start, .end = self.base + src.span.end };
         return d;
     }
 };

@@ -33,8 +33,9 @@ pub fn main() !void {
     const port_at = v.locate(spans, "server.port").?;
     const port = port_at.value.integer;
     if (port < 1024 or port > 65535) {
+        const lc = port_at.span.lineCol(src);
         std.debug.print("error at line {d} col {d}: port {d} out of range\n", .{
-            port_at.span.line, port_at.span.col, port,
+            lc.line, lc.col, port,
         });
         std.debug.print("  bytes [{d}..{d}]: {s}\n", .{
             port_at.span.start, port_at.span.end, src[port_at.span.start..port_at.span.end],
@@ -44,8 +45,9 @@ pub fn main() !void {
 
     // Walk the second user.
     if (v.locate(spans, "users[1].name")) |loc| {
+        const lc = loc.span.lineCol(src);
         std.debug.print("users[1].name = {s} at line {d}, col {d}\n", .{
-            loc.value.string, loc.span.line, loc.span.col,
+            loc.value.string, lc.line, lc.col,
         });
     }
 }

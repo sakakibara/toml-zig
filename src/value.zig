@@ -15,19 +15,48 @@ const StringArrayHashMap = std.array_hash_map.String;
 const StringHashMapUnmanaged = std.StringHashMapUnmanaged;
 const testing = std.testing;
 
-/// Source location of a parsed value. Byte offsets are relative to the
-/// start of the input buffer; `line`/`col` are 1-indexed and refer to
-/// the value's starting position.
-pub const Span = struct {
-    start: u32,
-    end: u32,
+/// 1-indexed line/column derived from a byte offset. Produced by `Span.lineCol`.
+pub const LineCol = struct {
     line: u32,
     col: u32,
+};
+
+/// Source byte range of a parsed value, as offsets into the input buffer.
+/// Offsets are u64, so a span addresses any in-memory `[]const u8` without a
+/// 4 GiB cap. Line/column are not stored; derive them on demand with `lineCol`.
+pub const Span = struct {
+    start: u64,
+    end: u64,
+
+    /// 1-indexed line and column of `start` within `src`. O(start): scans
+    /// `src[0..start]` counting newlines. Intended for occasional human-facing
+    /// location display (diagnostics, tooling), not bulk per-value use. Column
+    /// is the byte count since the last newline, plus one. Both saturate at
+    /// `maxInt(u32)` for absurdly large inputs.
+    pub fn lineCol(self: Span, src: []const u8) LineCol {
+        const limit = @min(self.start, src.len);
+        var line: u64 = 1;
+        var line_start: u64 = 0;
+        var i: u64 = 0;
+        while (i < limit) : (i += 1) {
+            if (src[i] == '\n') {
+                line += 1;
+                line_start = i + 1;
+            }
+        }
+        return .{
+            .line = std.math.cast(u32, line) orelse std.math.maxInt(u32),
+            .col = std.math.cast(u32, limit - line_start + 1) orelse std.math.maxInt(u32),
+        };
+    }
 };
 
 /// Path -> source span map, populated when `options.spans` is set on a
 /// `parse` call. Array elements use `[N]` index segments (e.g.,
 /// `users[0].name`).
+///
+/// Stores u64 offsets, so a value at any byte offset of an in-memory buffer
+/// can be recorded -- no 4 GiB cap.
 pub const Spans = StringHashMapUnmanaged(Span);
 
 pub const Date = struct {
@@ -740,12 +769,37 @@ test "Value.locate: paired value + span lookup" {
         \\port = 8080
     , .{ .spans = &spans });
 
+    const src =
+        \\title = "x"
+        \\[server]
+        \\port = 8080
+    ;
     const located = v.locate(spans, "server.port").?;
     try testing.expectEqual(@as(i64, 8080), located.value.integer);
     try testing.expect(located.span.end > located.span.start);
-    try testing.expectEqual(@as(u32, 3), located.span.line); // line 3 (1-indexed)
+    try testing.expectEqual(@as(u32, 3), located.span.lineCol(src).line); // line 3 (1-indexed)
 
     try testing.expect(v.locate(spans, "missing") == null);
+}
+
+test "Span is 16 bytes (u64 offsets, no line/col)" {
+    try testing.expectEqual(@as(usize, 16), @sizeOf(Span));
+}
+
+test "lineCol derives 1-indexed line/col from a byte offset" {
+    const src = "ab\ncde\nf";
+    // First byte.
+    try testing.expectEqual(LineCol{ .line = 1, .col = 1 }, (Span{ .start = 0, .end = 0 }).lineCol(src));
+    // Mid first line.
+    try testing.expectEqual(LineCol{ .line = 1, .col = 2 }, (Span{ .start = 1, .end = 2 }).lineCol(src));
+    // First byte after a newline.
+    try testing.expectEqual(LineCol{ .line = 2, .col = 1 }, (Span{ .start = 3, .end = 4 }).lineCol(src));
+    // Mid second line.
+    try testing.expectEqual(LineCol{ .line = 2, .col = 3 }, (Span{ .start = 5, .end = 6 }).lineCol(src));
+    // Start of third line.
+    try testing.expectEqual(LineCol{ .line = 3, .col = 1 }, (Span{ .start = 7, .end = 8 }).lineCol(src));
+    // Offset past end clamps to src length.
+    try testing.expectEqual(LineCol{ .line = 3, .col = 2 }, (Span{ .start = 100, .end = 100 }).lineCol(src));
 }
 
 test "Value.locate: returns null when spans wasn't tracked" {

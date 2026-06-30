@@ -74,8 +74,6 @@ pub const Token = struct {
 pub const Tokenizer = struct {
     input: []const u8,
     pos: usize = 0,
-    line: u32 = 1,
-    col: u32 = 1,
     state: State = .top,
 
     const State = enum {
@@ -90,6 +88,8 @@ pub const Tokenizer = struct {
         return .{ .input = input };
     }
 
+    /// Yield the next token. Span byte offsets are u64, exact for any
+    /// in-memory input.
     pub fn next(self: *Tokenizer) ?Token {
         if (self.pos >= self.input.len) return null;
 
@@ -103,7 +103,7 @@ pub const Tokenizer = struct {
         }
         if (self.pos >= self.input.len) return null;
 
-        const start = self.snap();
+        const start = self.mark();
         const c = self.input[self.pos];
 
         // Newline: always EOL.
@@ -134,7 +134,7 @@ pub const Tokenizer = struct {
         };
     }
 
-    fn tokTopOrKey(self: *Tokenizer, start: Span) Token {
+    fn tokTopOrKey(self: *Tokenizer, start: usize) Token {
         const c = self.input[self.pos];
         if (c == '[') {
             self.advance();
@@ -164,7 +164,7 @@ pub const Tokenizer = struct {
         return self.tokKeyOrSegment(start);
     }
 
-    fn tokKeyOrSegment(self: *Tokenizer, start: Span) Token {
+    fn tokKeyOrSegment(self: *Tokenizer, start: usize) Token {
         // Bare or quoted key.
         if (self.input[self.pos] == '"' or self.input[self.pos] == '\'') {
             return self.tokQuotedKey(start);
@@ -178,19 +178,19 @@ pub const Tokenizer = struct {
             if (!ok) break;
             self.advance();
         }
-        if (self.pos == start.start) {
+        if (self.pos == start) {
             self.advance();
             return self.token(.err, start);
         }
         return self.token(.key_segment, start);
     }
 
-    fn tokQuotedKey(self: *Tokenizer, start: Span) Token {
+    fn tokQuotedKey(self: *Tokenizer, start: usize) Token {
         self.consumeQuotedString();
         return self.token(.key_segment, start);
     }
 
-    fn tokValue(self: *Tokenizer, start: Span) Token {
+    fn tokValue(self: *Tokenizer, start: usize) Token {
         const c = self.input[self.pos];
         if (c == '[') {
             self.advance();
@@ -205,7 +205,7 @@ pub const Tokenizer = struct {
         return self.tokScalar(start);
     }
 
-    fn tokInArray(self: *Tokenizer, start: Span) Token {
+    fn tokInArray(self: *Tokenizer, start: usize) Token {
         const c = self.input[self.pos];
         if (c == ']') {
             self.advance();
@@ -230,7 +230,7 @@ pub const Tokenizer = struct {
         return self.tokScalar(start);
     }
 
-    fn tokInInlineTable(self: *Tokenizer, start: Span) Token {
+    fn tokInInlineTable(self: *Tokenizer, start: usize) Token {
         const c = self.input[self.pos];
         if (c == '}') {
             self.advance();
@@ -252,13 +252,13 @@ pub const Tokenizer = struct {
         return self.tokKeyOrSegment(start);
     }
 
-    fn tokAfterValue(self: *Tokenizer, start: Span) Token {
+    fn tokAfterValue(self: *Tokenizer, start: usize) Token {
         // Same as top-level - expect comment, EOL, or next statement.
         self.state = .top;
         return self.tokTopOrKey(start);
     }
 
-    fn tokScalar(self: *Tokenizer, start: Span) Token {
+    fn tokScalar(self: *Tokenizer, start: usize) Token {
         const c = self.input[self.pos];
         if (c == '"' or c == '\'') {
             self.consumeQuotedString();
@@ -358,34 +358,17 @@ pub const Tokenizer = struct {
     }
 
     fn advance(self: *Tokenizer) void {
-        const c = self.input[self.pos];
         self.pos += 1;
-        if (c == '\n') {
-            self.line += 1;
-            self.col = 1;
-        } else {
-            self.col += 1;
-        }
     }
 
-    fn snap(self: *const Tokenizer) Span {
-        return .{
-            .start = @intCast(self.pos),
-            .end = @intCast(self.pos),
-            .line = self.line,
-            .col = self.col,
-        };
+    fn mark(self: *const Tokenizer) usize {
+        return self.pos;
     }
 
-    fn token(self: *const Tokenizer, kind: Kind, start: Span) Token {
+    fn token(self: *const Tokenizer, kind: Kind, start: usize) Token {
         return .{
             .kind = kind,
-            .span = .{
-                .start = start.start,
-                .end = @intCast(self.pos),
-                .line = start.line,
-                .col = start.col,
-            },
+            .span = .{ .start = start, .end = self.pos },
         };
     }
 };
@@ -467,4 +450,26 @@ test "tokenizer: datetime" {
     _ = t.next(); // ts
     _ = t.next(); // =
     try testing.expectEqual(Kind.value_datetime, t.next().?.kind);
+}
+
+test "tokenizer: Token.span carries exact u64 byte offsets" {
+    const src = "title = \"hello\"\n";
+    var t: Tokenizer = .init(src);
+    const k0 = t.next().?;
+    try testing.expectEqual(Span, @TypeOf(k0.span));
+    try testing.expectEqual(u64, @TypeOf(k0.span.start));
+    try testing.expectEqual(@as(u64, 0), k0.span.start);
+    try testing.expectEqual(@as(u64, 5), k0.span.end);
+    // Line/col are derived on demand from the source, not stored.
+    try testing.expectEqual(@as(u32, 1), k0.span.lineCol(src).line);
+    try testing.expectEqual(@as(u32, 1), k0.span.lineCol(src).col);
+}
+
+test "tokenizer: span offsets stay byte-precise across lines" {
+    const src = "[a.b]\nk = [1, 2]\n";
+    var t: Tokenizer = .init(src);
+    while (t.next()) |tok| {
+        try testing.expect(tok.span.end >= tok.span.start);
+        try testing.expect(tok.span.end <= src.len);
+    }
 }

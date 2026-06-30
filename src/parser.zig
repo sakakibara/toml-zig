@@ -18,35 +18,36 @@ pub const Value = v.Value;
 pub const Date = v.Date;
 pub const Time = v.Time;
 pub const DateTime = v.DateTime;
+pub const Span = v.Span;
 
 pub const Diagnostic = struct {
-    /// 1-based line of the error's primary span.
-    line: u32,
-    /// 1-based column of the error's primary span start.
-    col: u32,
     /// Arena-allocated. Lifetime: the parse arena.
     message: []const u8,
-    /// Byte range of the offending token within the original source.
-    /// `null` only when the error site has no associated token (e.g.,
-    /// unexpected EOF -- there is no byte to underline).
-    range: ?[2]u32 = null,
+    /// Byte range of the offending token within the original source. A
+    /// zero-width span (`start == end`) marks a locationless error (e.g. a
+    /// decode type mismatch with no underlying token); line/col then resolve
+    /// to the start of `src` and no source excerpt is rendered. Line and
+    /// column are derived on demand via `Span.lineCol(src)`.
+    span: Span = .{ .start = 0, .end = 0 },
     /// Path context for decode errors (e.g., "users[2].name"). Empty
     /// for parser-side errors.
     path: ?[]const u8 = null,
     /// "Did you mean X?" suggestion. Set when a typo'd key or value
     /// is rejected. Arena-allocated.
     suggestion: ?[]const u8 = null,
-    /// Secondary annotations (e.g., "previously declared here at 5:1").
+    /// Secondary annotations (e.g., "previously declared here").
     notes: []const Note = &.{},
 
     pub const Note = struct {
-        line: u32,
-        col: u32,
+        span: Span,
         message: []const u8,
     };
 
-    pub fn format(self: Diagnostic, writer: *std.Io.Writer) !void {
-        try writer.print("TOML parse error at {d}:{d}: {s}", .{ self.line, self.col, self.message });
+    /// Single-line summary. Line/col are computed from `span` against `src`
+    /// (the same slice passed to `parse`).
+    pub fn format(self: Diagnostic, writer: *std.Io.Writer, src: []const u8) !void {
+        const lc = self.span.lineCol(src);
+        try writer.print("TOML parse error at {d}:{d}: {s}", .{ lc.line, lc.col, self.message });
     }
 
     /// Multi-line rich form. Emits a rustc-style block: header,
@@ -54,30 +55,32 @@ pub const Diagnostic = struct {
     /// Caller provides the original source bytes (the same slice passed
     /// to `parse`). ASCII only -- no terminal color escapes.
     pub fn formatRich(self: Diagnostic, w: *std.Io.Writer, source: []const u8) !void {
-        try w.print("error at {d}:{d}: {s}\n", .{ self.line, self.col, self.message });
+        const lc = self.span.lineCol(source);
+        try w.print("error at {d}:{d}: {s}\n", .{ lc.line, lc.col, self.message });
         if (self.path) |p| try w.print("  at {s}\n", .{p});
 
-        // Source snippet (only if we have line/col and source bounds match).
-        if (self.line > 0 and self.range != null) blk: {
+        // Source excerpt, only for a real (non-zero-width) span whose line
+        // falls within the source bounds.
+        if (self.span.end > self.span.start) blk: {
             var line_start: usize = 0;
             var lineno: u32 = 1;
             var i: usize = 0;
-            while (i < source.len and lineno < self.line) : (i += 1) {
+            while (i < source.len and lineno < lc.line) : (i += 1) {
                 if (source[i] == '\n') {
                     lineno += 1;
                     line_start = i + 1;
                 }
             }
-            if (lineno != self.line) break :blk;
+            if (lineno != lc.line) break :blk;
             var line_end = line_start;
             while (line_end < source.len and source[line_end] != '\n') line_end += 1;
 
             const line_text = source[line_start..line_end];
-            try w.print("  |\n{d:>3} | {s}\n  | ", .{ self.line, line_text });
+            try w.print("  |\n{d:>3} | {s}\n  | ", .{ lc.line, line_text });
 
-            const r = self.range.?;
-            const col0 = if (r[0] >= line_start) r[0] - line_start else 0;
-            const carets = if (r[1] > r[0]) r[1] - r[0] else 1;
+            // col is 1-indexed; subtract 1 for the zero-based offset into the line.
+            const col0: usize = if (lc.col > 0) lc.col - 1 else 0;
+            const carets: usize = @intCast(self.span.end - self.span.start);
             var c: usize = 0;
             while (c < col0) : (c += 1) try w.writeByte(' ');
             var k: usize = 0;
@@ -86,7 +89,8 @@ pub const Diagnostic = struct {
         }
 
         for (self.notes) |n| {
-            try w.print("  = note: at {d}:{d}: {s}\n", .{ n.line, n.col, n.message });
+            const nlc = n.span.lineCol(source);
+            try w.print("  = note: at {d}:{d}: {s}\n", .{ nlc.line, nlc.col, n.message });
         }
 
         if (self.suggestion) |s| {
@@ -113,7 +117,8 @@ pub const ParseOptions = struct {
     errors: ?*std.ArrayList(Diagnostic) = null,
 
     /// If non-null, populated with one Span per emitted Value, keyed by
-    /// dotted path. Array elements use `[N]` index segments.
+    /// dotted path. Array elements use `[N]` index segments. Spans store
+    /// u64 byte offsets, so any in-memory buffer can be recorded.
     spans: ?*v.Spans = null,
 
     /// Decode-only. When true, TOML keys absent from the target struct
@@ -348,11 +353,11 @@ const Parser = struct {
     arena: Allocator,
     input: []const u8,
     pos: usize = 0,
-    line: u32 = 1,
-    col: u32 = 1,
     /// Byte position of the current token attempt's start. Captured at the
-    /// top of parse* helpers that may error; used to populate Diagnostic.range.
-    token_start: u32 = 0,
+    /// top of parse* helpers that may error; used to populate the offending
+    /// span on a Diagnostic. Line/col are not tracked during scanning -- they
+    /// are derived from the span at render time (see `Span.lineCol`).
+    token_start: usize = 0,
 
     /// Top-level (root) table. Injected: the buffered path points it at a
     /// fresh local map; the streaming path points it at the accumulating
@@ -449,26 +454,10 @@ const Parser = struct {
         };
     }
 
-    /// Snapshot the current source position. Used at value start.
-    fn here(self: *const Parser) v.Span {
-        return .{
-            .start = @intCast(self.pos),
-            .end = @intCast(self.pos),
-            .line = self.line,
-            .col = self.col,
-        };
-    }
-
-    /// Record a span for a value at `path`. No-op if span tracking is off.
-    fn recordSpan(self: *Parser, path: []const u8, start: v.Span) Error!void {
-        const sm = self.spans orelse return;
-        const dup = try self.arena.dupe(u8, path);
-        try sm.put(self.arena, dup, .{
-            .start = start.start,
-            .end = @intCast(self.pos),
-            .line = start.line,
-            .col = start.col,
-        });
+    /// The offending span for a diagnostic: `[token_start, pos]` as u64 byte
+    /// offsets. Line/col are derived from it at render time.
+    fn diagSpan(self: *const Parser) Span {
+        return .{ .start = self.token_start, .end = self.pos };
     }
 
     /// Append a child path segment, returning the previous length so the
@@ -552,14 +541,7 @@ const Parser = struct {
     }
 
     inline fn advance(self: *Parser) void {
-        const c = self.input[self.pos];
         self.pos += 1;
-        if (c == '\n') {
-            self.line += 1;
-            self.col = 1;
-        } else {
-            self.col += 1;
-        }
     }
 
     inline fn match(self: *Parser, c: u8) bool {
@@ -684,26 +666,21 @@ const Parser = struct {
         if (self.errors) |list| {
             const owned_msg = self.arena.dupe(u8, msg) catch return error.OutOfMemory;
             list.append(self.arena, .{
-                .line = self.line,
-                .col = self.col,
                 .message = owned_msg,
-                .range = .{ self.token_start, @intCast(self.pos) },
+                .span = self.diagSpan(),
             }) catch return error.OutOfMemory;
         }
         return error.TomlParseError;
     }
 
-    /// Depth-guard failure: records a diagnostic (the guard still
-    /// promises line/col) but returns the distinct `error.NestingTooDeep`,
-    /// which the document recovery loop never swallows.
+    /// Depth-guard failure: records a diagnostic but returns the distinct
+    /// `error.NestingTooDeep`, which the document recovery loop never swallows.
     fn setDepthError(self: *Parser) Error {
         if (self.errors) |list| {
             const msg = std.fmt.allocPrint(self.arena, "nesting depth exceeds limit ({d})", .{self.max_depth}) catch return error.OutOfMemory;
             list.append(self.arena, .{
-                .line = self.line,
-                .col = self.col,
                 .message = msg,
-                .range = .{ self.token_start, @intCast(self.pos) },
+                .span = self.diagSpan(),
             }) catch return error.OutOfMemory;
         }
         return error.NestingTooDeep;
@@ -713,10 +690,8 @@ const Parser = struct {
         if (self.errors) |list| {
             const msg = std.fmt.allocPrint(self.arena, fmt, args) catch return error.OutOfMemory;
             list.append(self.arena, .{
-                .line = self.line,
-                .col = self.col,
                 .message = msg,
-                .range = .{ self.token_start, @intCast(self.pos) },
+                .span = self.diagSpan(),
             }) catch return error.OutOfMemory;
         }
         return error.TomlParseError;
@@ -727,10 +702,8 @@ const Parser = struct {
             const owned_msg = self.arena.dupe(u8, msg) catch return error.OutOfMemory;
             const owned_sug = if (suggestion) |s| self.arena.dupe(u8, s) catch return error.OutOfMemory else null;
             list.append(self.arena, .{
-                .line = self.line,
-                .col = self.col,
                 .message = owned_msg,
-                .range = .{ self.token_start, @intCast(self.pos) },
+                .span = self.diagSpan(),
                 .suggestion = owned_sug,
             }) catch return error.OutOfMemory;
         }
@@ -745,7 +718,7 @@ const Parser = struct {
         const is_array = self.match('[');
 
         self.skipWs();
-        self.token_start = @intCast(self.pos);
+        self.token_start = self.pos;
         var key_parts: ArrayList([]const u8) = .empty;
         defer key_parts.deinit(self.arena);
 
@@ -987,7 +960,7 @@ const Parser = struct {
 
     fn parseKeyValue(self: *Parser, target: *StringArrayHashMap(Value)) Error!void {
         self.skipWs();
-        self.token_start = @intCast(self.pos);
+        self.token_start = self.pos;
         var parts: ArrayList([]const u8) = .empty;
         defer parts.deinit(self.arena);
         try self.parseKeyPath(&parts);
@@ -1158,11 +1131,11 @@ const Parser = struct {
     fn parseValue(self: *Parser) Error!Value {
         if (self.eof()) return self.setError("expected value");
 
-        self.token_start = @intCast(self.pos);
+        self.token_start = self.pos;
         // Snapshot the value's byte-precise start so any nested parser
         // (parseArray, parseInlineTable) can record spans against this
         // exact position regardless of how deep we recurse.
-        const start = self.here();
+        const start = self.pos;
         const value = try self.parseValueInner();
         try self.recordSpanAtCurrentPath(start);
         return value;
@@ -1195,22 +1168,20 @@ const Parser = struct {
     }
 
     /// Record a span for the value currently being parsed at the current
-    /// path. No-op when spans are disabled.
-    fn recordSpanAtCurrentPath(self: *Parser, start: v.Span) Error!void {
+    /// path. No-op when spans are disabled. `start` is the value's byte offset.
+    fn recordSpanAtCurrentPath(self: *Parser, start: usize) Error!void {
         const sm = self.spans orelse return;
         const dup = try self.arena.dupe(u8, self.current_path.items);
         try sm.put(self.arena, dup, .{
-            .start = start.start,
-            .end = @intCast(self.pos),
-            .line = start.line,
-            .col = start.col,
+            .start = start,
+            .end = self.pos,
         });
     }
 
     // ----- strings -----
 
     fn parseBasicString(self: *Parser) Error![]const u8 {
-        self.token_start = @intCast(self.pos);
+        self.token_start = self.pos;
         if (!self.match('"')) return self.setError("expected '\"'");
 
         // Zero-copy fast-path: scan for end-of-string without building a buffer.
@@ -1221,7 +1192,6 @@ const Parser = struct {
         while (!self.eof()) {
             // Bulk-advance past plain ASCII before touching individual bytes.
             const skip = scanBasicStringFast(self.input[self.pos..]);
-            self.col += @intCast(skip);
             self.pos += skip;
             if (self.eof()) break;
 
@@ -1254,7 +1224,6 @@ const Parser = struct {
             const skip = scanBasicStringFast(self.input[self.pos..]);
             if (skip > 0) {
                 try buf.appendSlice(self.arena, self.input[self.pos .. self.pos + skip]);
-                self.col += @intCast(skip);
                 self.pos += skip;
                 if (self.eof()) break;
             }
@@ -1386,7 +1355,7 @@ const Parser = struct {
     }
 
     fn parseLiteralString(self: *Parser) Error![]const u8 {
-        self.token_start = @intCast(self.pos);
+        self.token_start = self.pos;
         if (!self.match('\'')) return self.setError("expected '\\''");
         const start = self.pos;
         while (!self.eof()) {
@@ -1409,7 +1378,7 @@ const Parser = struct {
     }
 
     fn parseMultilineBasicString(self: *Parser) Error![]const u8 {
-        self.token_start = @intCast(self.pos);
+        self.token_start = self.pos;
         // consume opening """
         _ = self.match('"');
         _ = self.match('"');
@@ -1477,7 +1446,7 @@ const Parser = struct {
     }
 
     fn parseMultilineLiteralString(self: *Parser) Error![]const u8 {
-        self.token_start = @intCast(self.pos);
+        self.token_start = self.pos;
         _ = self.match('\'');
         _ = self.match('\'');
         _ = self.match('\'');
@@ -1582,7 +1551,7 @@ const Parser = struct {
     // ----- booleans -----
 
     fn parseBoolean(self: *Parser) Error!Value {
-        self.token_start = @intCast(self.pos);
+        self.token_start = self.pos;
         if (self.matchStr("true")) return .{ .boolean = true };
         if (self.matchStr("false")) return .{ .boolean = false };
         // Scan the bareword so we can give a suggestion.
@@ -1591,7 +1560,6 @@ const Parser = struct {
             const c = self.input[self.pos];
             if (std.ascii.isAlphanumeric(c) or c == '_') {
                 self.pos += 1;
-                self.col += 1;
             } else break;
         }
         const word = self.input[word_start..self.pos];
@@ -1607,7 +1575,7 @@ const Parser = struct {
     /// and datetimes. Needs lookahead because `1979-05-27` looks like a
     /// subtraction in integer context.
     fn parseNumberOrDateTime(self: *Parser) Error!Value {
-        self.token_start = @intCast(self.pos);
+        self.token_start = self.pos;
         // Scan the token.
         const start = self.pos;
         // Allow a leading sign for numbers only.
@@ -1776,7 +1744,7 @@ const Parser = struct {
     }
 
     fn parseArray(self: *Parser) Error!Value {
-        self.token_start = @intCast(self.pos);
+        self.token_start = self.pos;
         if (self.depth >= self.max_depth) return self.setDepthError();
         self.depth += 1;
         defer self.depth -= 1;
@@ -1807,7 +1775,7 @@ const Parser = struct {
     }
 
     fn parseInlineTable(self: *Parser) Error!Value {
-        self.token_start = @intCast(self.pos);
+        self.token_start = self.pos;
         if (self.depth >= self.max_depth) return self.setDepthError();
         self.depth += 1;
         defer self.depth -= 1;
@@ -2387,55 +2355,48 @@ test "spans: top-level scalar" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var spans: v.Spans = .empty;
-    _ = try parse(arena.allocator(),
-        \\title = "toml"
-    , .{ .spans = &spans });
+    const src = "title = \"toml\"";
+    _ = try parse(arena.allocator(), src, .{ .spans = &spans });
     const s = spans.get("title").?;
-    try testing.expectEqual(@as(u32, 8), s.start); // after `title = `
-    try testing.expectEqual(@as(u32, 14), s.end); // after closing quote of "toml"
-    try testing.expectEqual(@as(u32, 1), s.line);
-    try testing.expectEqual(@as(u32, 9), s.col);
+    try testing.expectEqual(@as(u64, 8), s.start); // after `title = `
+    try testing.expectEqual(@as(u64, 14), s.end); // after closing quote of "toml"
+    const lc = s.lineCol(src);
+    try testing.expectEqual(@as(u32, 1), lc.line);
+    try testing.expectEqual(@as(u32, 9), lc.col);
 }
 
 test "spans: nested table value" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var spans: v.Spans = .empty;
-    _ = try parse(arena.allocator(),
-        \\[server]
-        \\port = 8080
-    , .{ .spans = &spans });
+    const src = "[server]\nport = 8080";
+    _ = try parse(arena.allocator(), src, .{ .spans = &spans });
     const s = spans.get("server.port").?;
-    try testing.expectEqual(@as(u32, 2), s.line);
-    try testing.expectEqual(@as(u32, 8), s.col);
+    const lc = s.lineCol(src);
+    try testing.expectEqual(@as(u32, 2), lc.line);
+    try testing.expectEqual(@as(u32, 8), lc.col);
 }
 
 test "spans: array of tables uses bracket index" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var spans: v.Spans = .empty;
-    _ = try parse(arena.allocator(),
-        \\[[users]]
-        \\name = "alice"
-        \\
-        \\[[users]]
-        \\name = "bob"
-    , .{ .spans = &spans });
+    const src = "[[users]]\nname = \"alice\"\n\n[[users]]\nname = \"bob\"";
+    _ = try parse(arena.allocator(), src, .{ .spans = &spans });
     const s0 = spans.get("users[0].name").?;
     const s1 = spans.get("users[1].name").?;
-    try testing.expectEqual(@as(u32, 2), s0.line);
-    try testing.expectEqual(@as(u32, 5), s1.line);
+    try testing.expectEqual(@as(u32, 2), s0.lineCol(src).line);
+    try testing.expectEqual(@as(u32, 5), s1.lineCol(src).line);
 }
 
 test "spans: dotted-key path" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var spans: v.Spans = .empty;
-    _ = try parse(arena.allocator(),
-        \\physical.color = "red"
-    , .{ .spans = &spans });
+    const src = "physical.color = \"red\"";
+    _ = try parse(arena.allocator(), src, .{ .spans = &spans });
     const s = spans.get("physical.color").?;
-    try testing.expectEqual(@as(u32, 1), s.line);
+    try testing.expectEqual(@as(u32, 1), s.lineCol(src).line);
 }
 
 test "spans: missing path returns null" {
@@ -2547,11 +2508,10 @@ test "scanBasicStringFast: matches byte-loop on quote/backslash/control/high" {
 
 test "Diagnostic: extended struct supports default-null new fields" {
     const d: Diagnostic = .{
-        .line = 3,
-        .col = 12,
         .message = "expected u16, got string",
     };
-    try testing.expect(d.range == null);
+    try testing.expectEqual(@as(u64, 0), d.span.start);
+    try testing.expectEqual(@as(u64, 0), d.span.end);
     try testing.expect(d.path == null);
     try testing.expect(d.suggestion == null);
     try testing.expectEqual(@as(usize, 0), d.notes.len);
@@ -2559,29 +2519,27 @@ test "Diagnostic: extended struct supports default-null new fields" {
 
 test "Diagnostic.Note: shape" {
     const n: Diagnostic.Note = .{
-        .line = 5,
-        .col = 1,
+        .span = .{ .start = 30, .end = 36 },
         .message = "previously declared here",
     };
-    try testing.expectEqual(@as(u32, 5), n.line);
+    try testing.expectEqual(@as(u64, 30), n.span.start);
 }
 
-test "Diagnostic.range covers the offending token" {
+test "Diagnostic.span covers the offending token" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var errs: std.ArrayList(Diagnostic) = .empty;
     defer errs.deinit(arena.allocator());
 
     // `port = "\q"` -- \q is an invalid escape inside a basic string.
-    // The opening `"` is at byte 7 (after "port = "), so range[0] must be 7.
+    // The opening `"` is at byte 7 (after "port = "), so span.start must be 7.
     // The error fires after consuming the `\`, with pos pointing at `q`
     // (byte 9), giving a non-zero-width span.
     _ = parse(arena.allocator(), "port = \"\\q\"\n", .{ .errors = &errs }) catch {};
     try testing.expect(errs.items.len == 1);
     const d = errs.items[0];
-    try testing.expect(d.range != null);
-    try testing.expectEqual(@as(u32, 7), d.range.?[0]);
-    try testing.expect(d.range.?[1] > d.range.?[0]);
+    try testing.expectEqual(@as(u64, 7), d.span.start);
+    try testing.expect(d.span.end > d.span.start);
 }
 
 test "multi-error mode collects all errors in one parse" {
@@ -2603,9 +2561,9 @@ test "multi-error mode collects all errors in one parse" {
     _ = parse(arena.allocator(), src, .{ .errors = &errs }) catch {};
 
     try testing.expect(errs.items.len == 3);
-    try testing.expectEqual(@as(u32, 1), errs.items[0].line);
-    try testing.expectEqual(@as(u32, 3), errs.items[1].line);
-    try testing.expectEqual(@as(u32, 5), errs.items[2].line);
+    try testing.expectEqual(@as(u32, 1), errs.items[0].span.lineCol(src).line);
+    try testing.expectEqual(@as(u32, 3), errs.items[1].span.lineCol(src).line);
+    try testing.expectEqual(@as(u32, 5), errs.items[2].span.lineCol(src).line);
 }
 
 test "multi-error mode bounded by MAX_RECOVERY_ERRORS" {
@@ -2646,10 +2604,8 @@ test "Diagnostic.formatRich: basic shape" {
         \\name = "ef"
     ;
     const d: Diagnostic = .{
-        .line = 2,
-        .col = 8,
         .message = "expected integer, got string",
-        .range = .{ 19, 25 }, // covers "8080"
+        .span = .{ .start = 19, .end = 25 }, // covers "8080"
     };
 
     var buf: [1024]u8 = undefined;
@@ -2666,8 +2622,6 @@ test "Diagnostic.formatRich: basic shape" {
 test "Diagnostic.formatRich: includes path and suggestion" {
     const src = "prt = 8080\n";
     const d: Diagnostic = .{
-        .line = 0,
-        .col = 0,
         .message = "unknown field `prt`",
         .path = "config.prt",
         .suggestion = "port",
@@ -2685,12 +2639,10 @@ test "Diagnostic.formatRich: includes path and suggestion" {
 test "Diagnostic.formatRich: emits notes" {
     const src = "[server]\n[server]\n";
     const d: Diagnostic = .{
-        .line = 2,
-        .col = 1,
         .message = "redefinition of section [server]",
-        .range = .{ 9, 17 },
+        .span = .{ .start = 9, .end = 17 },
         .notes = &.{
-            .{ .line = 1, .col = 1, .message = "previously declared here" },
+            .{ .span = .{ .start = 0, .end = 8 }, .message = "previously declared here" },
         },
     };
 
@@ -2793,6 +2745,25 @@ test "nesting depth guard: custom max_depth honored" {
     try over.appendSlice(a, "x = ");
     try over.appendNTimes(a, '[', 11);
     try testing.expectError(error.NestingTooDeep, parse(a, over.items, .{ .max_depth = 10 }));
+}
+
+test "spans map: byte offsets past 4 GiB record without a cap (boundary injected)" {
+    // Span offsets are u64. recordSpanAtCurrentPath must store an offset past
+    // maxInt(u32) verbatim rather than rejecting or truncating it. Inject the
+    // boundary by setting pos directly so no 4 GiB buffer is allocated.
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    var spans: v.Spans = .empty;
+    var p = Parser.init(ar.allocator(), "x");
+    p.spans = &spans;
+
+    const over: usize = @as(usize, std.math.maxInt(u32)) + 1;
+    p.pos = over + 5;
+    try p.recordSpanAtCurrentPath(over);
+
+    const s = spans.get("").?;
+    try testing.expectEqual(@as(u64, over), s.start);
+    try testing.expectEqual(@as(u64, over + 5), s.end);
 }
 
 // ----- statement-by-statement (shared SeenState) equivalence -----
@@ -2982,4 +2953,30 @@ test "streaming seam: 1000-line gap before redefinition still errors" {
 
     try testing.expectError(error.TomlParseError, parse(buf_arena.allocator(), src.items, .{}));
     try testing.expectError(error.TomlParseError, parseStatementByStatement(stm_arena.allocator(), src.items));
+}
+
+test "diagnostics: span records byte offsets past 4 GiB without clamping" {
+    // Offsets are u64; a diagnostic span past 4 GiB is stored verbatim.
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    var p = Parser.init(ar.allocator(), "x");
+    p.token_start = @as(usize, std.math.maxInt(u32)) + 100;
+    p.pos = @as(usize, std.math.maxInt(u32)) + 200;
+    const s = p.diagSpan();
+    try testing.expectEqual(@as(u64, @as(usize, std.math.maxInt(u32)) + 100), s.start);
+    try testing.expectEqual(@as(u64, @as(usize, std.math.maxInt(u32)) + 200), s.end);
+}
+
+test "plain parse with spans under 4 GiB is byte-identical (no regression)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var spans: v.Spans = .empty;
+    const src = "title = \"toml\"";
+    _ = try parse(arena.allocator(), src, .{ .spans = &spans });
+    const s = spans.get("title").?;
+    try testing.expectEqual(@as(u64, 8), s.start);
+    try testing.expectEqual(@as(u64, 14), s.end);
+    const lc = s.lineCol(src);
+    try testing.expectEqual(@as(u32, 1), lc.line);
+    try testing.expectEqual(@as(u32, 9), lc.col);
 }
