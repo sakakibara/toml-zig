@@ -18,6 +18,17 @@
 //! seal sets, etc.). It is purely lexical. For a strict spec-conformant
 //! parse use `parse` or `Document.parse`. The token stream classifies
 //! the bytes into syntactic categories.
+//!
+//! Resumable mode (`resumable = true`) lets a caller lex a growing buffer
+//! without mis-reading a token that is truncated at the current buffer end.
+//! When a string / comment / scalar / bare-key body runs to the end of
+//! `input` mid-token, `next()` returns null with `incomplete` set instead of
+//! force-terminating the token; the caller appends more bytes, refreshes
+//! `input`, and calls `next()` again, which RESUMES the same token scan from
+//! where it paused (never re-scanning consumed bytes, so streaming stays
+//! O(N)). With `resumable = false` (the default) the tokenizer is one-shot:
+//! a token running to buffer end is terminated there, as for an in-memory
+//! whole-input lex.
 
 const std = @import("std");
 const v = @import("value.zig");
@@ -75,6 +86,18 @@ pub const Tokenizer = struct {
     input: []const u8,
     pos: usize = 0,
     state: State = .top,
+    /// When true, a token whose body runs to the end of `input` pauses
+    /// (next() returns null with `incomplete` set) so the caller can extend
+    /// `input` and resume the SAME token. When false the tokenizer is
+    /// one-shot and terminates such a token at the buffer end.
+    resumable: bool = false,
+    /// Set by next() when a resumable scan paused at buffer end; cleared at
+    /// the top of every next() call. Only meaningful when next() returned
+    /// null: distinguishes a mid-token pause from genuine end-of-input.
+    incomplete: bool = false,
+    /// The in-progress token scan to resume on the next next() call, or
+    /// `.none` when the tokenizer is between tokens.
+    pending: Pending = .none,
 
     const State = enum {
         top,           // statement start
@@ -84,13 +107,51 @@ pub const Tokenizer = struct {
         after_value,   // expecting `,`, `]`, `}`, or EOL
     };
 
+    /// A paused token scan, carrying just enough state to resume mid-token
+    /// after `input` grows. `string_open` is the ambiguous `"` / `""` / `"""`
+    /// classification phase (needs up to 3 bytes to pick single vs multi-line).
+    const Pending = union(enum) {
+        none,
+        string_open: StringScan,
+        string_body: StringScan,
+        comment: usize,
+        scalar: ScalarScan,
+        bare_key: usize,
+    };
+
+    const StringScan = struct {
+        start: usize,
+        q: u8,
+        multiline: bool,
+        /// The kind to emit on completion: `value_string` or `key_segment`.
+        emit: Kind,
+        /// State to enter after the string, or null to leave `state` as-is
+        /// (quoted keys do not change state; values move to `after_value`).
+        set_state: ?State,
+    };
+
+    const ScalarScan = struct { start: usize, num_start: usize };
+
     pub fn init(input: []const u8) Tokenizer {
         return .{ .input = input };
     }
 
     /// Yield the next token. Span byte offsets are u64, exact for any
-    /// in-memory input.
+    /// in-memory input. In resumable mode a mid-token buffer end yields null
+    /// with `incomplete` set (see the module doc).
     pub fn next(self: *Tokenizer) ?Token {
+        self.incomplete = false;
+
+        // Resume a paused token before touching a fresh statement.
+        switch (self.pending) {
+            .none => {},
+            .string_open => |s| return self.classifyString(s),
+            .string_body => |s| return self.scanString(s),
+            .comment => |start| return self.scanComment(start),
+            .scalar => |s| return self.scanScalar(s.start, s.num_start),
+            .bare_key => |start| return self.scanBareKey(start),
+        }
+
         if (self.pos >= self.input.len) return null;
 
         // Skip non-newline whitespace, but not in places where it would
@@ -113,6 +174,13 @@ pub const Tokenizer = struct {
             return self.token(.eol, start);
         }
         if (c == '\r') {
+            // In resumable mode a \r at the last buffered byte cannot yet see
+            // whether \n follows; pause so the resume sees both bytes and emits
+            // one combined EOL, matching whole-input behavior.
+            if (self.resumable and self.pos + 1 >= self.input.len) {
+                self.incomplete = true;
+                return null;
+            }
             self.advance();
             if (self.pos < self.input.len and self.input[self.pos] == '\n') self.advance();
             self.state = .top;
@@ -121,8 +189,7 @@ pub const Tokenizer = struct {
 
         // Comment.
         if (c == '#') {
-            while (self.pos < self.input.len and self.input[self.pos] != '\n') self.advance();
-            return self.token(.comment, start);
+            return self.scanComment(start);
         }
 
         return switch (self.state) {
@@ -134,7 +201,7 @@ pub const Tokenizer = struct {
         };
     }
 
-    fn tokTopOrKey(self: *Tokenizer, start: usize) Token {
+    fn tokTopOrKey(self: *Tokenizer, start: usize) ?Token {
         const c = self.input[self.pos];
         if (c == '[') {
             self.advance();
@@ -164,11 +231,15 @@ pub const Tokenizer = struct {
         return self.tokKeyOrSegment(start);
     }
 
-    fn tokKeyOrSegment(self: *Tokenizer, start: usize) Token {
+    fn tokKeyOrSegment(self: *Tokenizer, start: usize) ?Token {
         // Bare or quoted key.
         if (self.input[self.pos] == '"' or self.input[self.pos] == '\'') {
-            return self.tokQuotedKey(start);
+            return self.tokStringStart(start, .key_segment, null);
         }
+        return self.scanBareKey(start);
+    }
+
+    fn scanBareKey(self: *Tokenizer, start: usize) ?Token {
         while (self.pos < self.input.len) {
             const c = self.input[self.pos];
             const ok = (c >= 'A' and c <= 'Z') or
@@ -178,6 +249,13 @@ pub const Tokenizer = struct {
             if (!ok) break;
             self.advance();
         }
+        // A bare key that runs to buffer end may continue in the next chunk.
+        if (self.pos >= self.input.len and self.resumable) {
+            self.pending = .{ .bare_key = start };
+            self.incomplete = true;
+            return null;
+        }
+        self.pending = .none;
         if (self.pos == start) {
             self.advance();
             return self.token(.err, start);
@@ -185,12 +263,7 @@ pub const Tokenizer = struct {
         return self.token(.key_segment, start);
     }
 
-    fn tokQuotedKey(self: *Tokenizer, start: usize) Token {
-        self.consumeQuotedString();
-        return self.token(.key_segment, start);
-    }
-
-    fn tokValue(self: *Tokenizer, start: usize) Token {
+    fn tokValue(self: *Tokenizer, start: usize) ?Token {
         const c = self.input[self.pos];
         if (c == '[') {
             self.advance();
@@ -205,7 +278,7 @@ pub const Tokenizer = struct {
         return self.tokScalar(start);
     }
 
-    fn tokInArray(self: *Tokenizer, start: usize) Token {
+    fn tokInArray(self: *Tokenizer, start: usize) ?Token {
         const c = self.input[self.pos];
         if (c == ']') {
             self.advance();
@@ -230,7 +303,7 @@ pub const Tokenizer = struct {
         return self.tokScalar(start);
     }
 
-    fn tokInInlineTable(self: *Tokenizer, start: usize) Token {
+    fn tokInInlineTable(self: *Tokenizer, start: usize) ?Token {
         const c = self.input[self.pos];
         if (c == '}') {
             self.advance();
@@ -252,18 +325,16 @@ pub const Tokenizer = struct {
         return self.tokKeyOrSegment(start);
     }
 
-    fn tokAfterValue(self: *Tokenizer, start: usize) Token {
+    fn tokAfterValue(self: *Tokenizer, start: usize) ?Token {
         // Same as top-level - expect comment, EOL, or next statement.
         self.state = .top;
         return self.tokTopOrKey(start);
     }
 
-    fn tokScalar(self: *Tokenizer, start: usize) Token {
+    fn tokScalar(self: *Tokenizer, start: usize) ?Token {
         const c = self.input[self.pos];
         if (c == '"' or c == '\'') {
-            self.consumeQuotedString();
-            self.state = .after_value;
-            return self.token(.value_string, start);
+            return self.tokStringStart(start, .value_string, .after_value);
         }
         if (c == 't' or c == 'f') {
             const remaining = self.input[self.pos..];
@@ -278,9 +349,14 @@ pub const Tokenizer = struct {
                 return self.token(.value_bool, start);
             }
         }
-        // Numeric / datetime: scan until terminator. Decide which by
-        // looking for `-` or `:` past the first byte.
-        const num_start = self.pos;
+        return self.scanScalar(start, self.pos);
+    }
+
+    /// Scan a numeric / datetime / bare value body until a terminator, then
+    /// classify it. `num_start` is where the number body began (past any
+    /// leading skip), preserved across a resume so the date/time heuristic
+    /// still measures from the true start.
+    fn scanScalar(self: *Tokenizer, start: usize, num_start: usize) ?Token {
         while (self.pos < self.input.len) {
             const k = self.input[self.pos];
             if (k == ',' or k == ']' or k == '}' or k == '#' or k == '\n' or k == '\r') break;
@@ -298,6 +374,13 @@ pub const Tokenizer = struct {
             }
             self.advance();
         }
+        // A value that runs to buffer end may extend in the next chunk.
+        if (self.pos >= self.input.len and self.resumable) {
+            self.pending = .{ .scalar = .{ .start = start, .num_start = num_start } };
+            self.incomplete = true;
+            return null;
+        }
+        self.pending = .none;
         const slice = self.input[num_start..self.pos];
         const kind: Kind = if (looksLikeDateOrTime(slice))
             .value_datetime
@@ -313,15 +396,52 @@ pub const Tokenizer = struct {
         return self.token(kind, start);
     }
 
-    fn consumeQuotedString(self: *Tokenizer) void {
-        const q = self.input[self.pos];
-        if (self.pos + 2 < self.input.len and
-            self.input[self.pos + 1] == q and self.input[self.pos + 2] == q)
+    /// Begin a quoted string / quoted key. `pos` is at the opening quote.
+    fn tokStringStart(self: *Tokenizer, start: usize, emit: Kind, set_state: ?State) ?Token {
+        const s: StringScan = .{
+            .start = start,
+            .q = self.input[self.pos],
+            .multiline = false,
+            .emit = emit,
+            .set_state = set_state,
+        };
+        return self.classifyString(s);
+    }
+
+    /// Decide single- vs multi-line and enter the body scan. `pos` is at the
+    /// opening quote. Deciding needs up to three bytes (`"` / `""` / `"""`),
+    /// so in resumable mode too few bytes pauses in `string_open` until the
+    /// buffer grows.
+    fn classifyString(self: *Tokenizer, s: StringScan) ?Token {
+        const q = s.q;
+        // Ambiguous only while a hidden `qq` could still turn `"` into `"""`.
+        if (self.resumable and self.pos + 2 >= self.input.len and
+            (self.pos + 1 >= self.input.len or self.input[self.pos + 1] == q))
         {
-            // Multi-line string.
+            self.pending = .{ .string_open = s };
+            self.incomplete = true;
+            return null;
+        }
+        const multiline = self.pos + 2 < self.input.len and
+            self.input[self.pos + 1] == q and self.input[self.pos + 2] == q;
+        var body = s;
+        body.multiline = multiline;
+        if (multiline) {
             for (0..3) |_| self.advance();
+        } else {
+            self.advance();
+        }
+        return self.scanString(body);
+    }
+
+    /// Scan a string body from `pos` to its terminator, resuming across
+    /// buffer ends in resumable mode. Handles basic-string escapes so an
+    /// escaped quote never closes the string early.
+    fn scanString(self: *Tokenizer, s: StringScan) ?Token {
+        const q = s.q;
+        if (s.multiline) {
             while (self.pos + 2 < self.input.len) {
-                if (q == '"' and self.input[self.pos] == '\\' and self.pos + 1 < self.input.len) {
+                if (q == '"' and self.input[self.pos] == '\\') {
                     self.advance();
                     self.advance();
                     continue;
@@ -331,30 +451,66 @@ pub const Tokenizer = struct {
                     self.input[self.pos + 2] == q)
                 {
                     for (0..3) |_| self.advance();
-                    return;
+                    return self.finishString(s);
                 }
                 self.advance();
             }
-            // Unterminated: consume rest.
+            // Fewer than three bytes remain: a closing `"""` could straddle
+            // the buffer end, so pause rather than guess.
+            if (self.resumable) {
+                self.pending = .{ .string_body = s };
+                self.incomplete = true;
+                return null;
+            }
             while (self.pos < self.input.len) self.advance();
-            return;
+            return self.finishString(s);
         }
-        // Single-line string.
-        self.advance();
+
         while (self.pos < self.input.len) {
             const c = self.input[self.pos];
-            if (c == '\n') return;
-            if (q == '"' and c == '\\' and self.pos + 1 < self.input.len) {
+            if (c == '\n') return self.finishString(s);
+            if (q == '"' and c == '\\') {
+                // An escape needs its escaped byte; if it is past the buffer
+                // end, pause at the backslash so the resume re-reads it.
+                if (self.pos + 1 >= self.input.len) break;
                 self.advance();
                 self.advance();
                 continue;
             }
             if (c == q) {
                 self.advance();
-                return;
+                return self.finishString(s);
             }
             self.advance();
         }
+        if (self.resumable) {
+            self.pending = .{ .string_body = s };
+            self.incomplete = true;
+            return null;
+        }
+        // Finalize an unterminated single-line string (consume a trailing
+        // lone backslash, matching the whole-input lex).
+        while (self.pos < self.input.len) self.advance();
+        return self.finishString(s);
+    }
+
+    fn finishString(self: *Tokenizer, s: StringScan) Token {
+        self.pending = .none;
+        if (s.set_state) |st| self.state = st;
+        return self.token(s.emit, s.start);
+    }
+
+    /// Scan a `# ...` comment to end-of-line. In resumable mode a comment that
+    /// runs to buffer end pauses so its tail is not re-lexed as statements.
+    fn scanComment(self: *Tokenizer, start: usize) ?Token {
+        while (self.pos < self.input.len and self.input[self.pos] != '\n') self.advance();
+        if (self.pos >= self.input.len and self.resumable) {
+            self.pending = .{ .comment = start };
+            self.incomplete = true;
+            return null;
+        }
+        self.pending = .none;
+        return self.token(.comment, start);
     }
 
     fn advance(self: *Tokenizer) void {
@@ -471,5 +627,125 @@ test "tokenizer: span offsets stay byte-precise across lines" {
     while (t.next()) |tok| {
         try testing.expect(tok.span.end >= tok.span.start);
         try testing.expect(tok.span.end <= src.len);
+    }
+}
+
+test "tokenizer: resumable lex of a growing buffer matches whole-input lex" {
+    // Feed the input one byte at a time in resumable mode; the token stream
+    // (kind + span) must be identical to a single whole-input lex. Covers
+    // multi-line strings, single-line strings with interior brackets and
+    // escaped quotes, comments, scalars, and headers.
+    const src =
+        "key = \"\"\"line1\n[not a header]\nk = v\nline\\\"end\"\"\"\n" ++
+        "s = \"a [b] \\\" c\"  # trailing [x] comment\n" ++
+        "n = 1979-05-27T07:32:00Z\n" ++
+        "[real]\nx = 42\n";
+
+    // Oracle: whole-input, non-resumable.
+    var whole: Tokenizer = .init(src);
+    var want: std.ArrayList(Token) = .empty;
+    defer want.deinit(testing.allocator);
+    while (whole.next()) |tok| try want.append(testing.allocator, tok);
+
+    // Resumable, one byte revealed per step.
+    var t: Tokenizer = .{ .input = src[0..0], .resumable = true };
+    var got: std.ArrayList(Token) = .empty;
+    defer got.deinit(testing.allocator);
+    var revealed: usize = 0;
+    while (true) {
+        if (t.next()) |tok| {
+            try got.append(testing.allocator, tok);
+            continue;
+        }
+        if (t.incomplete) {
+            if (revealed < src.len) {
+                revealed += 1;
+                t.input = src[0..revealed];
+                continue;
+            }
+            // No more bytes will arrive: finalize the paused token.
+            t.resumable = false;
+            continue;
+        }
+        if (revealed < src.len) {
+            revealed += 1;
+            t.input = src[0..revealed];
+            continue;
+        }
+        break;
+    }
+
+    try testing.expectEqual(want.items.len, got.items.len);
+    for (want.items, got.items) |w, g| {
+        try testing.expectEqual(w.kind, g.kind);
+        try testing.expectEqual(w.span.start, g.span.start);
+        try testing.expectEqual(w.span.end, g.span.end);
+    }
+}
+
+test "tokenizer: resumable CRLF at buffer boundary emits one EOL matching whole-input" {
+    // Sweeps every split offset by revealing one byte at a time (implicit
+    // sweep over k = 0..src.len). Covers: \r\n mid-stream, multiple \r\n
+    // pairs, \r\n inside a multiline string, lone \r at EOF, \r\n at start.
+    const cases = [_][]const u8{
+        "a = 1\r\nb = 2\r\n",
+        "a = 1\r\nb = 2\r\n\r\nc = 3\r\n",
+        "[x]\r\nk = \"v\"\r\n",
+        "ml = \"\"\"\r\nline1\r\nline2\r\n\"\"\"\r\n[after]\r\nk = 1\r\n",
+        "a = 1\r",          // lone \r at EOF
+        "\r\na = 1\r\n",    // \r\n at start
+    };
+    for (cases) |src| {
+        // Oracle: whole-input, non-resumable.
+        var whole: Tokenizer = .init(src);
+        var want: std.ArrayList(Token) = .empty;
+        defer want.deinit(testing.allocator);
+        while (whole.next()) |tok| try want.append(testing.allocator, tok);
+
+        // Resumable, one byte revealed per step (sweeps all split offsets).
+        var t: Tokenizer = .{ .input = src[0..0], .resumable = true };
+        var got: std.ArrayList(Token) = .empty;
+        defer got.deinit(testing.allocator);
+        var revealed: usize = 0;
+        while (true) {
+            if (t.next()) |tok| {
+                try got.append(testing.allocator, tok);
+                continue;
+            }
+            if (t.incomplete) {
+                if (revealed < src.len) {
+                    revealed += 1;
+                    t.input = src[0..revealed];
+                    continue;
+                }
+                t.resumable = false;
+                continue;
+            }
+            if (revealed < src.len) {
+                revealed += 1;
+                t.input = src[0..revealed];
+                continue;
+            }
+            break;
+        }
+
+        testing.expectEqual(want.items.len, got.items.len) catch |e| {
+            std.debug.print("CRLF token-count mismatch on: {s}\n", .{src});
+            return e;
+        };
+        for (want.items, got.items) |w, g| {
+            testing.expectEqual(w.kind, g.kind) catch |e| {
+                std.debug.print("CRLF kind mismatch on: {s}\n", .{src});
+                return e;
+            };
+            testing.expectEqual(w.span.start, g.span.start) catch |e| {
+                std.debug.print("CRLF span.start mismatch on: {s}\n", .{src});
+                return e;
+            };
+            testing.expectEqual(w.span.end, g.span.end) catch |e| {
+                std.debug.print("CRLF span.end mismatch on: {s}\n", .{src});
+                return e;
+            };
+        }
     }
 }

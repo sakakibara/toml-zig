@@ -59,6 +59,10 @@ pub const StreamError = error{
 pub const Event = struct {
     kind: Kind,
     span: Span,
+    /// Trailing `# ...` comment on the same source line, including the `#`.
+    /// Empty when the line has no trailing comment. Borrows the per-unit
+    /// arena; copy before the next unit-boundary-crossing `next()`.
+    comment: []const u8 = "",
 
     pub const Kind = union(enum) {
         /// `[a.b]` header: decoded dotted path.
@@ -158,6 +162,14 @@ fn isLineLeading(bytes: []const u8, pos: usize) bool {
     }
     return true;
 }
+
+/// Hard cap on the byte length of the framing buffer (`doc_buf`): the unit
+/// currently being framed plus any bytes pulled ahead of it. When the buffer
+/// grows past this without a unit boundary appearing, framing returns
+/// `LineTooLong` rather than letting `doc_buf` grow without bound. A single
+/// statement-unit (one `[table]` / `[[aot]]` header plus its key-values, or
+/// the leading top-level kvs) is thus effectively bounded by this cap.
+const max_unit_bytes: usize = 16 * 1024 * 1024; // 16 MiB
 
 /// Reader-backed, table-at-a-time TOML event reader. See the module doc for
 /// the framing oracle, the per-unit-arena / shared-SeenState memory split, and
@@ -274,15 +286,71 @@ pub const EventReader = struct {
     /// Pull bytes until `doc_buf` holds a complete first unit (or EOF). Returns
     /// the unit's byte length, or null when the buffer holds no further unit
     /// (only whitespace/comments at EOF).
+    ///
+    /// Resumable framer: the tokenizer is a LOCAL variable whose `pos`,
+    /// `state`, and mid-token `pending` survive across `pull()` calls within
+    /// this invocation. Each byte in `doc_buf` is examined at most once per
+    /// unit frame (O(N) total, not O(N^2)). After each `pull()` we refresh
+    /// `ft.input` so the tokenizer sees the enlarged slice; `ft.pos` still
+    /// points to the first unexamined byte.
+    ///
+    /// Load-bearing invariant: the tokenizer runs in resumable mode so a token
+    /// TRUNCATED at the buffer end (multi-line string, string, comment, long
+    /// value) pauses (`incomplete`) and resumes the SAME scan after the next
+    /// pull, instead of force-terminating and re-lexing its tail. Without this
+    /// a `[header]`-looking byte run inside a multi-line string spanning the
+    /// pull boundary would be mis-cut as a unit boundary (spurious error) or
+    /// silently swallow a real header (value corruption).
     fn frame(self: *EventReader) StreamError!?usize {
+        var ft: tokenizer.Tokenizer = .init(self.doc_buf.items);
+        var seen_leading_header = false;
+        var saw_any_content = false;
+
         while (true) {
-            switch (frameNextUnit(self.doc_buf.items, self.ended)) {
-                .complete => |len| {
-                    if (len == 0) return null;
-                    return len;
-                },
-                .need_more => try self.pull(),
+            // Refresh the input slice: doc_buf may have reallocated after pull().
+            ft.input = self.doc_buf.items;
+
+            if (ft.input.len > max_unit_bytes) return error.LineTooLong;
+
+            // Once the reader is drained, no more bytes will arrive: finalize
+            // any paused token at buffer end instead of waiting for input.
+            ft.resumable = !self.ended;
+
+            while (ft.next()) |tok| {
+                const tok_start: usize = @intCast(tok.span.start);
+                switch (tok.kind) {
+                    .blank, .comment, .eol => {},
+                    .header_open, .header_array_open => {
+                        if (!isLineLeading(self.doc_buf.items, tok_start)) {
+                            saw_any_content = true;
+                        } else if (!seen_leading_header and !saw_any_content) {
+                            seen_leading_header = true;
+                            saw_any_content = true;
+                        } else {
+                            // Line-leading header starts the next unit.
+                            return tok_start;
+                        }
+                    },
+                    else => saw_any_content = true,
+                }
             }
+
+            // A mid-token pause: extend the buffer and resume the same scan
+            // (ft.pos + ft.pending preserved). `resumable` was false only when
+            // ended, in which case next() finalizes instead of pausing, so
+            // reaching here implies the reader is not yet ended.
+            if (ft.incomplete) {
+                try self.pull();
+                continue;
+            }
+
+            // Tokenizer exhausted doc_buf between tokens.
+            if (self.ended) {
+                const len = self.doc_buf.items.len;
+                if (len == 0) return null;
+                return len;
+            }
+            try self.pull();
         }
     }
 
@@ -393,7 +461,7 @@ pub const EventReader = struct {
             return mapParserError(e);
         };
 
-        try self.flattenUnit(up, &spans);
+        try self.flattenUnit(up, &spans, slice);
         self.cur_leaf = up.leaf;
         self.unit_open = true;
     }
@@ -419,9 +487,15 @@ pub const EventReader = struct {
 
     /// Flatten one parsed unit into the event list: an optional header event,
     /// then the leaf table's key-values walked depth-first.
-    fn flattenUnit(self: *EventReader, up: parser.UnitParse, spans: *const value.Spans) StreamError!void {
+    fn flattenUnit(self: *EventReader, up: parser.UnitParse, spans: *const value.Spans, unit_buf: []const u8) StreamError!void {
         if (up.header_path.len > 0) {
-            const hspan = self.headerSpan(spans, up.header_path);
+            const hlocal = headerSpanLocal(unit_buf);
+            const hspan = self.rebaseSpan(hlocal);
+            const hcomment = trailingComment(unit_buf, @intCast(hlocal.end));
+            const hcomment_dup: []const u8 = if (hcomment.len > 0)
+                self.dupAbs(hcomment) catch return error.OutOfMemory
+            else
+                "";
             const path = self.dupAbs(up.header_path) catch return error.OutOfMemory;
             try self.events.append(self.gpa, .{
                 .kind = if (up.is_array_element)
@@ -429,6 +503,7 @@ pub const EventReader = struct {
                 else
                     .{ .table_header = path },
                 .span = hspan,
+                .comment = hcomment_dup,
             });
         }
 
@@ -437,31 +512,50 @@ pub const EventReader = struct {
         defer prefix.deinit(self.gpa);
         if (up.header_path.len > 0) try prefix.appendSlice(self.gpa, up.header_path);
 
-        try self.walkTable(up.leaf, &prefix, spans);
+        try self.walkTable(up.leaf, &prefix, spans, unit_buf);
     }
 
     /// Emit `key` + value events for every entry of `table`, recursing into
     /// nested tables (created by dotted keys / inline tables) and arrays.
-    fn walkTable(self: *EventReader, table: *const parser.Value.Table, prefix: *std.ArrayList(u8), spans: *const value.Spans) StreamError!void {
+    fn walkTable(self: *EventReader, table: *const parser.Value.Table, prefix: *std.ArrayList(u8), spans: *const value.Spans, unit_buf: []const u8) StreamError!void {
         var it = table.iterator();
         while (it.next()) |entry| {
             const key_name = entry.key_ptr.*;
             const key_dup = self.dupAbs(key_name) catch return error.OutOfMemory;
+            const key_span = self.spanFor(spans, unit_buf, prefix.items, key_name);
+
+            // Trailing comment: locate via the value span's line.
+            const key_comment: []const u8 = blk: {
+                var pbuf: [512]u8 = undefined;
+                const n = buildPath(&pbuf, prefix.items, key_name);
+                if (n > 0) {
+                    if (spans.get(pbuf[0..n])) |sp| {
+                        break :blk trailingComment(unit_buf, @intCast(sp.end));
+                    }
+                }
+                break :blk "";
+            };
+            const key_comment_dup: []const u8 = if (key_comment.len > 0)
+                self.dupAbs(key_comment) catch return error.OutOfMemory
+            else
+                "";
+
             try self.events.append(self.gpa, .{
                 .kind = .{ .key = key_dup },
-                .span = self.spanFor(spans, prefix.items, key_name),
+                .span = key_span,
+                .comment = key_comment_dup,
             });
 
             const saved = prefix.items.len;
             if (prefix.items.len > 0) try prefix.append(self.gpa, '.');
             try prefix.appendSlice(self.gpa, key_name);
-            try self.emitValue(entry.value_ptr.*, prefix, spans);
+            try self.emitValue(entry.value_ptr.*, prefix, spans, unit_buf);
             prefix.shrinkRetainingCapacity(saved);
         }
     }
 
     /// Emit value events for one value (scalar / array / inline table).
-    fn emitValue(self: *EventReader, v: parser.Value, prefix: *std.ArrayList(u8), spans: *const value.Spans) StreamError!void {
+    fn emitValue(self: *EventReader, v: parser.Value, prefix: *std.ArrayList(u8), spans: *const value.Spans, unit_buf: []const u8) StreamError!void {
         const sp = spans.get(prefix.items) orelse self.zeroSpanLocal();
         const abs = self.rebaseSpan(sp);
         switch (v) {
@@ -477,45 +571,40 @@ pub const EventReader = struct {
                 for (arr.items, 0..) |item, i| {
                     const saved = prefix.items.len;
                     try prefix.print(self.gpa, "[{d}]", .{i});
-                    try self.emitValue(item, prefix, spans);
+                    try self.emitValue(item, prefix, spans, unit_buf);
                     prefix.shrinkRetainingCapacity(saved);
                 }
                 try self.events.append(self.gpa, .{ .kind = .array_end, .span = abs });
             },
             .table => |tbl| {
                 try self.events.append(self.gpa, .{ .kind = .inline_table_begin, .span = abs });
-                try self.walkTable(&tbl, prefix, spans);
+                try self.walkTable(&tbl, prefix, spans, unit_buf);
                 try self.events.append(self.gpa, .{ .kind = .inline_table_end, .span = abs });
             },
         }
     }
 
-    /// Span for a key event: prefer the value's recorded span (its path),
-    /// falling back to a zero span. Header/key positions are approximate
-    /// (best-effort); the value spans are exact.
-    fn spanFor(self: *EventReader, spans: *const value.Spans, prefix: []const u8, key: []const u8) Span {
+    /// Span for a key event: locate the first `key_segment` token on the same
+    /// source line as the value. For keys whose path is not in the spans map
+    /// (intermediate dotted-key tables), falls back to `zeroSpan`.
+    fn spanFor(self: *EventReader, spans: *const value.Spans, unit_buf: []const u8, prefix: []const u8, key: []const u8) Span {
         var buf: [512]u8 = undefined;
-        if (prefix.len + 1 + key.len <= buf.len) {
-            var n: usize = 0;
-            @memcpy(buf[0..prefix.len], prefix);
-            n = prefix.len;
-            if (prefix.len > 0) {
-                buf[n] = '.';
-                n += 1;
+        const n = buildPath(&buf, prefix, key);
+        if (n > 0) {
+            if (spans.get(buf[0..n])) |sp| {
+                const local_start: usize = @intCast(sp.start);
+                const key_local = keyTokenOnLine(unit_buf, local_start);
+                if (key_local.end > key_local.start) return self.rebaseSpan(key_local);
+                return self.rebaseSpan(sp);
             }
-            @memcpy(buf[n .. n + key.len], key);
-            n += key.len;
-            if (spans.get(buf[0..n])) |sp| return self.rebaseSpan(sp);
         }
         return self.zeroSpan();
     }
 
-    /// Best-effort span for a header: the value spans don't record the header
-    /// token, so return a zero span at the current buffer front.
-    fn headerSpan(self: *EventReader, spans: *const value.Spans, path: []const u8) Span {
-        _ = spans;
-        _ = path;
-        return self.zeroSpan();
+    /// Span for a header event: scan the unit buffer for the opening `[` or
+    /// `[[` and its matching `]` / `]]`, returning the rebased absolute span.
+    fn headerSpan(self: *EventReader, unit_buf: []const u8) Span {
+        return self.rebaseSpan(headerSpanLocal(unit_buf));
     }
 
     fn rebaseSpan(self: *const EventReader, sp: Span) Span {
@@ -565,6 +654,75 @@ fn mapParserError(e: parser.Error) StreamError {
         error.NestingTooDeep => error.NestingTooDeep,
         error.OutOfMemory => error.OutOfMemory,
     };
+}
+
+/// Scan `unit_buf` for the first line-leading `[` or `[[` header opener and
+/// its matching `]` / `]]` closer. Returns the local (unit-relative) byte
+/// span covering the whole `[path]` / `[[path]]` token, or a zero span when
+/// the unit has no header (leading-kv unit).
+fn headerSpanLocal(unit_buf: []const u8) Span {
+    var t: tokenizer.Tokenizer = .init(unit_buf);
+    while (t.next()) |tok| {
+        switch (tok.kind) {
+            .blank, .comment, .eol => {},
+            .header_open, .header_array_open => {
+                const start = tok.span.start;
+                while (t.next()) |tok2| {
+                    if (tok2.kind == .header_close) {
+                        return .{ .start = start, .end = tok2.span.end };
+                    }
+                }
+                return .{ .start = 0, .end = 0 };
+            },
+            else => return .{ .start = 0, .end = 0 },
+        }
+    }
+    return .{ .start = 0, .end = 0 };
+}
+
+/// Scan from `after` in `unit_buf` for an optional trailing `# comment`.
+/// Skips horizontal whitespace then checks for `#`; returns the comment
+/// text including the `#` up to (but not including) the line terminator.
+/// Returns an empty slice when no comment is present.
+fn trailingComment(unit_buf: []const u8, after: usize) []const u8 {
+    var i = after;
+    while (i < unit_buf.len and (unit_buf[i] == ' ' or unit_buf[i] == '\t')) : (i += 1) {}
+    if (i >= unit_buf.len or unit_buf[i] != '#') return "";
+    const start = i;
+    while (i < unit_buf.len and unit_buf[i] != '\n' and unit_buf[i] != '\r') : (i += 1) {}
+    return unit_buf[start..i];
+}
+
+/// Find the first `key_segment` token on the line containing byte offset
+/// `value_local_start` in `unit_buf`. Returns the local span of that token,
+/// or a zero span when none is found (e.g., inline-value context).
+fn keyTokenOnLine(unit_buf: []const u8, value_local_start: usize) Span {
+    var ls: usize = value_local_start;
+    while (ls > 0 and unit_buf[ls - 1] != '\n') ls -= 1;
+    var t: tokenizer.Tokenizer = .init(unit_buf);
+    t.pos = ls;
+    while (t.next()) |tok| {
+        if (tok.span.start >= value_local_start) break;
+        if (tok.kind == .key_segment) return .{ .start = tok.span.start, .end = tok.span.end };
+    }
+    return .{ .start = 0, .end = 0 };
+}
+
+/// Write `prefix + "." + key` (or just `key` when `prefix` is empty) into
+/// `buf`. Returns the byte count written, or 0 when `buf` is too small.
+fn buildPath(buf: []u8, prefix: []const u8, key: []const u8) usize {
+    const need = if (prefix.len > 0) prefix.len + 1 + key.len else key.len;
+    if (need > buf.len) return 0;
+    var n: usize = 0;
+    @memcpy(buf[0..prefix.len], prefix);
+    n = prefix.len;
+    if (prefix.len > 0) {
+        buf[n] = '.';
+        n += 1;
+    }
+    @memcpy(buf[n .. n + key.len], key);
+    n += key.len;
+    return n;
 }
 
 /// Value-composition layer over `EventReader`: yields one composed `Value`
@@ -1752,3 +1910,263 @@ test "gate F: whole-shape recovers valid units past a skipped malformed unit" {
         try testing.expectError(error.TomlParseError, vs.next(a));
     }
 }
+
+// --- Gate G: T-T1 resumable framing ------------------------------------------
+
+test "T-T1: 2 MiB single-unit input completes (O(N) framing regression)" {
+    // A unit with no headers; the whole input is one frame. With O(N^2)
+    // scanning this would time out; with the resumable tokenizer it is
+    // instant. Completing under zig build test's default timeout IS the
+    // assertion.
+    var src_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer src_arena.deinit();
+    const a = src_arena.allocator();
+
+    var src: std.ArrayList(u8) = .empty;
+    var i: u32 = 0;
+    while (src.items.len < 2 * 1024 * 1024) : (i += 1) {
+        try src.print(a, "k{d} = {d}\n", .{ i, i });
+    }
+
+    var str_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer str_arena.deinit();
+    const v = try reassemble(testing.allocator, str_arena.allocator(), src.items);
+    // Spot-check: key 0 exists and has value 0.
+    try testing.expectEqual(@as(i64, 0), v.get("k0").?.integer);
+}
+
+test "T-T1: unit exceeding max_unit_bytes returns LineTooLong (not a hang)" {
+    // Feed enough key-value lines to exceed max_unit_bytes in a single unit
+    // (no headers). The framer must return error.LineTooLong instead of
+    // looping indefinitely or running out of memory.
+    var src_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer src_arena.deinit();
+    const a = src_arena.allocator();
+
+    var src: std.ArrayList(u8) = .empty;
+    while (src.items.len <= max_unit_bytes) {
+        try src.appendSlice(a, "k = 1\n");
+    }
+
+    var r: std.Io.Reader = .fixed(src.items);
+    var er = EventReader.fromReader(testing.allocator, &r, .{});
+    defer er.deinit();
+    try testing.expectError(error.LineTooLong, er.next());
+}
+
+// --- Gate H: T-T2 per-event comment reset ------------------------------------
+
+test "T-T2: each event's comment reflects only its own line" {
+    // First key has a trailing comment; second key does not.
+    // The second key event must carry an empty comment, not the first's.
+    const src = "x = 1  # first comment\ny = 2\n";
+    var r: std.Io.Reader = .fixed(src);
+    var er = EventReader.fromReader(testing.allocator, &r, .{});
+    defer er.deinit();
+
+    // key "x"
+    const kx = (try er.next()).?;
+    try testing.expect(kx.kind == .key);
+    try testing.expectEqualStrings("x", kx.kind.key);
+    try testing.expectEqualStrings("# first comment", kx.comment);
+
+    // value 1
+    _ = try er.next();
+
+    // key "y" - must NOT carry forward "# first comment"
+    const ky = (try er.next()).?;
+    try testing.expect(ky.kind == .key);
+    try testing.expectEqualStrings("y", ky.kind.key);
+    try testing.expectEqualStrings("", ky.comment);
+}
+
+test "T-T2: header trailing comment is attached to header event" {
+    const src = "[section]  # header comment\nk = 1\n";
+    var r: std.Io.Reader = .fixed(src);
+    var er = EventReader.fromReader(testing.allocator, &r, .{});
+    defer er.deinit();
+
+    const hev = (try er.next()).?;
+    try testing.expect(hev.kind == .table_header);
+    try testing.expectEqualStrings("# header comment", hev.comment);
+
+    // key event has no comment
+    const kev = (try er.next()).?;
+    try testing.expect(kev.kind == .key);
+    try testing.expectEqualStrings("", kev.comment);
+}
+
+// --- Gate I: T-T3 real header and key spans ----------------------------------
+
+test "T-T3: header event span covers [section] bytes; key event span covers key bytes" {
+    const src = "[section]\nkey = 42\n";
+    var r: std.Io.Reader = .fixed(src);
+    var er = EventReader.fromReader(testing.allocator, &r, .{});
+    defer er.deinit();
+
+    // Header event
+    const hev = (try er.next()).?;
+    try testing.expect(hev.kind == .table_header);
+    try testing.expect(hev.span.start < hev.span.end);
+    try testing.expectEqualStrings("[section]", src[@intCast(hev.span.start)..@intCast(hev.span.end)]);
+    try testing.expectEqual(@as(u32, 1), hev.span.lineCol(src).line);
+
+    // Key event
+    const kev = (try er.next()).?;
+    try testing.expect(kev.kind == .key);
+    try testing.expect(kev.span.start < kev.span.end);
+    try testing.expectEqualStrings("key", src[@intCast(kev.span.start)..@intCast(kev.span.end)]);
+    try testing.expectEqual(@as(u32, 2), kev.span.lineCol(src).line);
+}
+
+test "T-T3: array-of-tables header span is non-zero and on the right line" {
+    const src = "[[items]]\nname = \"a\"\n";
+    var r: std.Io.Reader = .fixed(src);
+    var er = EventReader.fromReader(testing.allocator, &r, .{});
+    defer er.deinit();
+
+    const hev = (try er.next()).?;
+    try testing.expect(hev.kind == .array_of_tables_header);
+    try testing.expect(hev.span.start < hev.span.end);
+    try testing.expectEqualStrings("[[items]]", src[@intCast(hev.span.start)..@intCast(hev.span.end)]);
+    try testing.expectEqual(@as(u32, 1), hev.span.lineCol(src).line);
+}
+
+// --- Gate J: tokens truncated across a pull boundary -------------------------
+//
+// A single `Tokenizer` is kept alive across `pull()` refills. A token that
+// runs past the current buffer end (multi-line string, string, comment, long
+// value) must resume the SAME scan after the next pull, never re-lexing its
+// tail as fresh statements. These use inputs larger than one 4096-byte chunk
+// so `pull()` (which aggregates to 4096 bytes) fires more than once. The
+// oracle is the buffered `parser.parse` of the identical bytes.
+
+test "gate J: multi-line basic string across pull boundaries equals buffered" {
+    // ~15 KiB of interior content with line-leading `[header]`-looking and
+    // `key = val`-looking lines plus adjacent quotes. Spans several pulls; a
+    // non-resumable framer mis-lexes the interior (spurious boundary or a
+    // swallowed real header). Streamed must equal buffered.
+    var src_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer src_arena.deinit();
+    const a = src_arena.allocator();
+
+    var body: std.ArrayList(u8) = .empty;
+    var i: u32 = 0;
+    while (body.items.len < 15 * 1024) : (i += 1) {
+        try body.print(a, "[not_a_section_{d}]\nkey{d} = val{d}\ntext \"q\" and \"\" pair {d}\n", .{ i, i, i, i });
+    }
+    var src: std.ArrayList(u8) = .empty;
+    try src.print(a, "ml = \"\"\"\n{s}\"\"\"\n[after]\nk = 1\n", .{body.items});
+
+    var buf_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer buf_arena.deinit();
+    var str_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer str_arena.deinit();
+
+    const buffered = try parseBuffered(buf_arena.allocator(), src.items);
+    const streamed = try reassemble(testing.allocator, str_arena.allocator(), src.items);
+    try testing.expect(Value.eql(buffered, streamed));
+    // The follow-on unit must not have been swallowed by the string.
+    try testing.expectEqual(@as(i64, 1), streamed.get("after").?.get("k").?.integer);
+}
+
+test "gate J: multi-line literal string across pull boundaries equals buffered" {
+    var src_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer src_arena.deinit();
+    const a = src_arena.allocator();
+
+    var body: std.ArrayList(u8) = .empty;
+    var i: u32 = 0;
+    while (body.items.len < 15 * 1024) : (i += 1) {
+        try body.print(a, "# comment-ish {d}\n[bracket_{d}]\nval {d}\n", .{ i, i, i });
+    }
+    var src: std.ArrayList(u8) = .empty;
+    try src.print(a, "ml = '''\n{s}'''\n[after]\nk = 2\n", .{body.items});
+
+    var buf_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer buf_arena.deinit();
+    var str_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer str_arena.deinit();
+
+    const buffered = try parseBuffered(buf_arena.allocator(), src.items);
+    const streamed = try reassemble(testing.allocator, str_arena.allocator(), src.items);
+    try testing.expect(Value.eql(buffered, streamed));
+    try testing.expectEqual(@as(i64, 2), streamed.get("after").?.get("k").?.integer);
+}
+
+test "gate J: closing triple-quote straddling the pull boundary equals buffered" {
+    // Sweep the body length so the closing `"""` lands at every offset around
+    // the 4096-byte pull boundary (start of triple, middle, after), exercising
+    // resume both mid-`"""` and in the single-vs-multi-line classification.
+    var src_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer src_arena.deinit();
+    const a = src_arena.allocator();
+
+    var blen: usize = 4080;
+    while (blen <= 4112) : (blen += 1) {
+        const bod = try a.alloc(u8, blen);
+        @memset(bod, 'a');
+        var src: std.ArrayList(u8) = .empty;
+        try src.print(a, "ml = \"\"\"{s}\"\"\"\n[after]\nk = 3\n", .{bod});
+
+        var buf_arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer buf_arena.deinit();
+        var str_arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer str_arena.deinit();
+
+        const buffered = try parseBuffered(buf_arena.allocator(), src.items);
+        const streamed = try reassemble(testing.allocator, str_arena.allocator(), src.items);
+        testing.expect(Value.eql(buffered, streamed)) catch |e| {
+            std.debug.print("gate J straddle mismatch at body len {d}\n", .{blen});
+            return e;
+        };
+    }
+}
+
+test "gate J: unterminated multi-line string over 8 KiB errors (not LineTooLong, not a hang)" {
+    var src_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer src_arena.deinit();
+    const a = src_arena.allocator();
+
+    var src: std.ArrayList(u8) = .empty;
+    try src.appendSlice(a, "ml = \"\"\"\n");
+    while (src.items.len < 10 * 1024) try src.appendSlice(a, "aaaaaaaa\n");
+    // Deliberately no closing `"""`.
+
+    // Buffered rejects with an unterminated-string error; streaming matches.
+    var buf_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer buf_arena.deinit();
+    try testing.expectError(error.TomlParseError, parseBuffered(buf_arena.allocator(), src.items));
+
+    var str_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer str_arena.deinit();
+    try testing.expectError(error.TomlParseError, reassemble(testing.allocator, str_arena.allocator(), src.items));
+}
+
+test "gate J: 256 KiB multi-line string with interior brackets equals buffered (O(N))" {
+    // A single ~256 KiB multi-line string whose every line is `[header]`-like.
+    // Completing well within the test timeout is the O(N) guard: resuming the
+    // one giant token per pull must not re-scan it from the start.
+    var src_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer src_arena.deinit();
+    const a = src_arena.allocator();
+
+    var body: std.ArrayList(u8) = .empty;
+    var i: u32 = 0;
+    while (body.items.len < 256 * 1024) : (i += 1) {
+        try body.print(a, "[interior_{d}] line with brackets and key{d} = {d}\n", .{ i, i, i });
+    }
+    var src: std.ArrayList(u8) = .empty;
+    try src.print(a, "big = \"\"\"\n{s}\"\"\"\n[tail]\nn = 7\n", .{body.items});
+
+    var buf_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer buf_arena.deinit();
+    var str_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer str_arena.deinit();
+
+    const buffered = try parseBuffered(buf_arena.allocator(), src.items);
+    const streamed = try reassemble(testing.allocator, str_arena.allocator(), src.items);
+    try testing.expect(Value.eql(buffered, streamed));
+    try testing.expectEqual(@as(i64, 7), streamed.get("tail").?.get("n").?.integer);
+}
+

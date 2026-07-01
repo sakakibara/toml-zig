@@ -20,7 +20,11 @@ const std = @import("std");
 const Io = std.Io;
 const toml = @import("toml");
 
-const Mode = enum { random_bytes, biased, deep_nesting };
+const Mode = enum { random_bytes, biased, deep_nesting, streaming };
+
+// Max input size for the streaming arm. Deliberately exceeds EventReader's
+// 4096-byte pull chunk so cross-pull resumption is always exercised.
+const streaming_max_input: usize = 64 * 1024;
 
 pub fn main(init: std.process.Init) !u8 {
     const gpa = init.gpa;
@@ -70,19 +74,23 @@ pub fn main(init: std.process.Init) !u8 {
 
     const input_buf = try gpa.alloc(u8, max_input);
     defer gpa.free(input_buf);
+    const streaming_buf = try gpa.alloc(u8, streaming_max_input);
+    defer gpa.free(streaming_buf);
 
     var failures: usize = 0;
     var parsed_ok: usize = 0;
     var n: usize = 0;
 
     while (n < iters) : (n += 1) {
-        // One in eight iterations stresses pathological deep nesting (long
-        // runs of `[` / `{` and `a.a.a...` dotted keys) -- the class of
-        // input that recursive-descent value parsing can stack-overflow on
-        // without a depth bound. The rest split between biased and random.
-        const mode: Mode = switch (rng.uintLessThan(u8, 8)) {
+        // Mode distribution (10 buckets):
+        //   0        -> deep_nesting: stresses nesting depth guard
+        //   1        -> streaming:    stresses cross-pull resumption via >4096-byte inputs
+        //   2..5     -> biased:       grammar-biased random bytes
+        //   6..9     -> random_bytes: fully random bytes
+        const mode: Mode = switch (rng.uintLessThan(u8, 10)) {
             0 => .deep_nesting,
-            1...4 => .biased,
+            1 => .streaming,
+            2...5 => .biased,
             else => .random_bytes,
         };
 
@@ -95,12 +103,25 @@ pub fn main(init: std.process.Init) !u8 {
             continue;
         }
 
+        if (mode == .streaming) {
+            // Always > 4096 so EventReader.pull() fires more than once,
+            // exercising cross-pull token resumption on every iteration.
+            const len = rng.intRangeAtMost(usize, 4097, streaming_max_input);
+            const input = streaming_buf[0..len];
+            generateStreamingInput(rng, input);
+            if (try fuzzStreaming(gpa, input)) |err| {
+                failures += 1;
+                try reportFailure(ew, n, seed, input, err);
+            }
+            continue;
+        }
+
         const len = rng.intRangeAtMost(usize, 0, max_input);
         const input = input_buf[0..len];
         switch (mode) {
             .random_bytes => rng.bytes(input),
             .biased => generateBiased(rng, input),
-            .deep_nesting => unreachable,
+            .deep_nesting, .streaming => unreachable,
         }
 
         if (try fuzzOnce(gpa, input)) |err| {
@@ -127,6 +148,7 @@ const FuzzError = error{
     LosslessFailure,
     SpanOutOfBounds,
     DepthNotBounded,
+    StreamingMismatch,
 };
 
 fn fuzzOnce(gpa: std.mem.Allocator, input: []const u8) !?FuzzError {
@@ -197,6 +219,64 @@ fn didParse(gpa: std.mem.Allocator, input: []const u8) bool {
     defer arena.deinit();
     _ = toml.parse(arena.allocator(), input, .{}) catch return false;
     return true;
+}
+
+/// Verify that streaming (ValueStream .whole) and buffered parse agree:
+/// same success/failure verdict, and Value.eql when both succeed.
+/// Returns null on agreement, FuzzError.StreamingMismatch on disagreement,
+/// and null for OOM / infrastructure errors (treated as inconclusive).
+fn fuzzStreaming(gpa: std.mem.Allocator, input: []const u8) !?FuzzError {
+    var item_arena: std.heap.ArenaAllocator = .init(gpa);
+    defer item_arena.deinit();
+    var buf_arena: std.heap.ArenaAllocator = .init(gpa);
+    defer buf_arena.deinit();
+
+    // Streaming parse: fixed reader delivers bytes in 4096-byte pulls,
+    // so inputs > 4096 bytes always exercise cross-pull resumption.
+    var r: std.Io.Reader = .fixed(input);
+    var vs = toml.ValueStream.fromReader(gpa, &r, .{}, .whole);
+    defer vs.deinit();
+
+    // null = parse/stream error; non-null = success
+    const sv: ?toml.Value = vs.next(item_arena.allocator()) catch |e| switch (e) {
+        error.TomlParseError, error.NestingTooDeep => null,
+        else => return null, // OOM, LineTooLong, reader errors: inconclusive
+    };
+
+    const bv: ?toml.Value = toml.parse(buf_arena.allocator(), input, .{}) catch |e| switch (e) {
+        error.TomlParseError, error.NestingTooDeep => null,
+        else => return null,
+    };
+
+    if ((sv != null) != (bv != null)) return FuzzError.StreamingMismatch;
+
+    if (sv) |sv_val| {
+        if (!toml.Value.eql(sv_val, bv.?)) return FuzzError.StreamingMismatch;
+    }
+
+    return null;
+}
+
+/// Generate a streaming-arm input: one-third structured (valid multiline-
+/// string document guaranteeing the Value.eql path), two-thirds biased random
+/// (exercises the rejection and error-agreement paths).
+fn generateStreamingInput(rng: std.Random, out: []u8) void {
+    if (out.len >= 64 and rng.uintLessThan(u8, 3) == 0) {
+        // A valid TOML doc: key = """<body>"""\n[t]\nz = 99\n
+        // Body fills most of `out` with safe chars (no """ run).
+        const open: []const u8 = "ml = \"\"\"\n";
+        const close: []const u8 = "\"\"\"\n[t]\nz = 99\n";
+        if (out.len > open.len + close.len) {
+            @memcpy(out[0..open.len], open);
+            const body = out[open.len .. out.len - close.len];
+            for (body, 0..) |*b, idx| {
+                b.* = if (idx % 72 == 71) '\n' else @as(u8, 'a') + @as(u8, @intCast(idx % 26));
+            }
+            @memcpy(out[out.len - close.len ..], close);
+            return;
+        }
+    }
+    generateBiased(rng, out);
 }
 
 fn reportFailure(w: *Io.Writer, iter: usize, seed: u64, input: []const u8, err: FuzzError) !void {
