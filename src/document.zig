@@ -62,6 +62,8 @@ pub const Error = error{
     PathNotFound,
     PathExists,
     InvalidValue,
+    InvalidComment,
+    UnsupportedPath,
     IntegerOverflow,
     PathTooDeep,
     OutOfMemory,
@@ -218,6 +220,10 @@ pub const Document = struct {
     /// Use `set` (comptime-dispatched) for native values; this is the escape
     /// hatch for splicing in already-formatted TOML source.
     pub fn setLiteral(self: *Document, path: []const u8, raw: []const u8) Error!void {
+        // `get` reads `arr[0]` as array element 0; setLiteral cannot edit
+        // array elements, so reject the syntax rather than silently mint a
+        // literal `"arr[0]"` key that disagrees with the read path.
+        if (pathHasArrayIndex(path)) return error.UnsupportedPath;
         try validateValueLiteral(self.arena, raw);
 
         if (self.kv_index.get(path)) |idx| {
@@ -271,15 +277,35 @@ pub const Document = struct {
 
             if (self.kv_index.get(parent_path)) |parent_idx| {
                 if (self.items.items[parent_idx].kv.inline_layout) |layout| {
-                    try setInLayout(self.arena, layout, sub_path, raw_value);
-                    try self.rebuildInlineKv(parent_idx);
-                    try self.refreshParsed();
+                    // Edit a fresh clone of the layout so a failed reparse
+                    // rolls back cleanly: the layout is mutated in place, so
+                    // the original must survive untouched to restore the item
+                    // (mirrors replaceValueAt / setTrailingComment). Reachable
+                    // e.g. splicing a `1 # c` literal, which validates
+                    // standalone but whose `#` comments out the inline table's
+                    // closing brace on reparse.
+                    const old_item = self.items.items[parent_idx];
+                    self.items.items[parent_idx].kv.inline_layout = try cloneLayout(self.arena, layout);
+                    self.applyInlineEdit(parent_idx, sub_path, raw_value) catch |e| {
+                        self.items.items[parent_idx] = old_item;
+                        return e;
+                    };
                     return true;
                 }
             }
 
             dot_pos = dot;
         }
+    }
+
+    /// Mutate the (already-cloned) inline layout at `parent_idx`, rebuild its
+    /// kv raw, and reparse to validate. The caller snapshots the item first
+    /// and restores it on any error here.
+    fn applyInlineEdit(self: *Document, parent_idx: usize, sub_path: []const u8, raw_value: []const u8) Error!void {
+        const layout = self.items.items[parent_idx].kv.inline_layout.?;
+        try setInLayout(self.arena, layout, sub_path, raw_value);
+        try self.rebuildInlineKv(parent_idx);
+        try self.refreshParsed();
     }
 
     fn insertNewKey(self: *Document, path: []const u8, raw_value: []const u8) Error!void {
@@ -390,6 +416,9 @@ pub const Document = struct {
 
     /// Remove a key. Returns `error.PathNotFound` if absent.
     pub fn remove(self: *Document, path: []const u8) Error!void {
+        // Mirror setLiteral: `arr[0]` is array-element access, which remove
+        // does not support. Erroring keeps it consistent with `get`.
+        if (pathHasArrayIndex(path)) return error.UnsupportedPath;
         if (self.kv_index.get(path)) |idx| {
             _ = self.items.orderedRemove(idx);
             _ = self.kv_index.swapRemove(path);
@@ -437,18 +466,30 @@ pub const Document = struct {
     /// newline; both are added automatically.
     pub fn addCommentBefore(self: *Document, path: []const u8, text: []const u8) Error!void {
         const idx = self.kv_index.get(path) orelse return error.PathNotFound;
+        try rejectMultilineComment(text);
         const raw = try std.fmt.allocPrint(self.arena, "# {s}\n", .{text});
         try self.items.insert(self.arena, idx, .{ .comment = raw });
         self.shiftIndices(idx, 1);
+        self.refreshParsed() catch |e| {
+            _ = self.items.orderedRemove(idx);
+            self.shiftIndices(idx, -1);
+            return e;
+        };
     }
 
     /// Insert a comment line immediately after the kv at `path`.
     pub fn addCommentAfter(self: *Document, path: []const u8, text: []const u8) Error!void {
         const idx = self.kv_index.get(path) orelse return error.PathNotFound;
+        try rejectMultilineComment(text);
         try self.ensureItemEndsWithNewline(idx);
         const raw = try std.fmt.allocPrint(self.arena, "# {s}\n", .{text});
         try self.items.insert(self.arena, idx + 1, .{ .comment = raw });
         self.shiftIndices(idx + 1, 1);
+        self.refreshParsed() catch |e| {
+            _ = self.items.orderedRemove(idx + 1);
+            self.shiftIndices(idx + 1, -1);
+            return e;
+        };
     }
 
     /// Remove the comment line immediately preceding the kv at `path`,
@@ -477,7 +518,9 @@ pub const Document = struct {
     /// remove an existing trailing comment.
     pub fn setTrailingComment(self: *Document, path: []const u8, text: ?[]const u8) Error!void {
         const idx = self.kv_index.get(path) orelse return error.PathNotFound;
-        const old = self.items.items[idx].kv;
+        if (text) |t| try rejectMultilineComment(t);
+        const old_item = self.items.items[idx];
+        const old = old_item.kv;
 
         // Find the value end inside `raw`. The trailing-comment region
         // starts there.
@@ -504,6 +547,10 @@ pub const Document = struct {
             .value_offset = old.value_offset,
             .value_len = old.value_len,
         } };
+        self.refreshParsed() catch |e| {
+            self.items.items[idx] = old_item;
+            return e;
+        };
     }
 
     /// Move the section identified by `header_path` to a new position
@@ -713,15 +760,56 @@ fn writeInlineValue(w: *Io.Writer, value: Value) Io.Writer.Error!void {
     };
 }
 
+/// A comment is a single source line. Reject any embedded line break so a
+/// comment edit cannot splice in a new statement that re-parses live.
+fn rejectMultilineComment(text: []const u8) Error!void {
+    if (std.mem.indexOfAny(u8, text, "\n\r") != null) return error.InvalidComment;
+}
+
+/// True when `path` uses `[N]` array-index syntax, which `get` honors but
+/// the structural editors (setLiteral/remove) cannot act on.
+fn pathHasArrayIndex(path: []const u8) bool {
+    return std.mem.indexOfScalar(u8, path, '[') != null;
+}
+
+/// Validate that `raw` is a single TOML value literal, not a fragment that
+/// smuggles in extra statements. Wrapping `_v = {raw}` and merely checking
+/// that it parses is not enough: a `raw` like `1\n[evil]\npwned=true` parses
+/// as MULTIPLE statements and would, once spliced verbatim, inject a table
+/// header and reparent unrelated keys. Require the parse to yield exactly the
+/// one wrapper key `_v` so the literal can only ever replace one value.
 fn validateValueLiteral(arena: Allocator, raw: []const u8) Error!void {
     const wrapped = std.fmt.allocPrint(arena, "_v = {s}", .{raw}) catch return error.OutOfMemory;
-    _ = parser_mod.parse(arena, wrapped, .{}) catch return error.InvalidValue;
+    const parsed = parser_mod.parse(arena, wrapped, .{}) catch return error.InvalidValue;
+    if (parsed != .table or parsed.table.count() != 1 or parsed.table.get("_v") == null) {
+        return error.InvalidValue;
+    }
 }
 
 /// Mutate the layout in place: locate the entry matching sub_path's
 /// head, descend recursively for nested inline tables, replace the
 /// leaf entry's value bytes with raw_value. Errors on a sub-path
 /// through a scalar.
+/// Deep-copy a layout so it can be edited without touching the original
+/// (needed for rollback: the editors mutate a layout in place). Byte slices
+/// (`open`, `close`, keys, seps, raw values, trailings) are immutable and
+/// arena-owned, so they are shared; only the mutable spine -- the entries
+/// list and any nested inline-table layouts -- is duplicated.
+fn cloneLayout(arena: Allocator, src: *const InlineTableLayout) Error!*InlineTableLayout {
+    const out = try arena.create(InlineTableLayout);
+    out.* = .{ .open = src.open, .close = src.close, .entries = .empty };
+    try out.entries.ensureTotalCapacityPrecise(arena, src.entries.items.len);
+    for (src.entries.items) |entry| {
+        var copy = entry;
+        copy.value = switch (entry.value) {
+            .raw => |r| .{ .raw = r },
+            .inline_table => |inner| .{ .inline_table = try cloneLayout(arena, inner) },
+        };
+        out.entries.appendAssumeCapacity(copy);
+    }
+    return out;
+}
+
 fn setInLayout(arena: Allocator, layout: *InlineTableLayout, sub_path: []const u8, raw_value: []const u8) Error!void {
     const dot = std.mem.indexOfScalar(u8, sub_path, '.');
     const head = if (dot) |d| sub_path[0..d] else sub_path;
@@ -855,13 +943,15 @@ fn removeFromLayout(arena: Allocator, layout: *InlineTableLayout, sub_path: []co
     for (layout.entries.items, 0..) |entry, i| {
         if (std.mem.eql(u8, entry.key, head)) {
             if (tail.len == 0) {
+                const removed = entry;
                 _ = layout.entries.orderedRemove(i);
-                // If we removed the last entry, the previous entry's
-                // trailing might end with a comma that's now redundant.
+                // When the removed entry was last, the new last entry's
+                // trailing still carries the inter-entry comma. Replace it
+                // with the removed entry's close-side spacing so the padding
+                // before `}` stays symmetric (`{ x = 1 }`, not `{ x = 1}`).
                 if (i > 0 and i == layout.entries.items.len) {
                     var prev = &layout.entries.items[i - 1];
                     if (std.mem.lastIndexOfScalar(u8, prev.trailing, ',')) |comma_pos| {
-                        // Only strip if the remainder after the comma is whitespace only.
                         var all_ws = true;
                         for (prev.trailing[comma_pos + 1 ..]) |c| {
                             if (c != ' ' and c != '\t' and c != '\n' and c != '\r') {
@@ -870,7 +960,7 @@ fn removeFromLayout(arena: Allocator, layout: *InlineTableLayout, sub_path: []co
                             }
                         }
                         if (all_ws) {
-                            prev.trailing = try arena.dupe(u8, prev.trailing[0..comma_pos]);
+                            prev.trailing = try arena.dupe(u8, removed.trailing);
                         }
                     }
                 }
@@ -2027,6 +2117,37 @@ test "document: setLiteral appends new sub-key to inline table with existing ent
     try testing.expectEqualStrings("point = { x = 1, y = 2, z = 3 }\n", aw.written());
 }
 
+test "document: failed inline-table edit rolls back to unchanged document" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var doc = try Document.parse(arena.allocator(),
+        \\point = { x = 1, y = 2 }
+        \\
+    , .{});
+
+    // `1 # x` validates as a standalone value literal (the `#` is a trailing
+    // comment), but spliced into the single-line inline table its `#` comments
+    // out the closing brace, so the reparse fails. setLiteral must roll the
+    // mutated layout + kv raw back, leaving the document byte-identical and
+    // its parsed tree intact.
+    try testing.expectError(error.TomlParseError, doc.setLiteral("point.x", "1 # x"));
+
+    var aw: std.Io.Writer.Allocating = .init(arena.allocator());
+    defer aw.deinit();
+    try doc.emit(&aw.writer);
+    try testing.expectEqualStrings("point = { x = 1, y = 2 }\n", aw.written());
+    try testing.expectEqual(@as(i64, 1), doc.get("point.x").?.integer);
+    try testing.expectEqual(@as(i64, 2), doc.get("point.y").?.integer);
+
+    // The rollback must leave the layout editable: a subsequent valid edit
+    // still works (proving the original layout, not a half-mutated clone, is
+    // what remained live).
+    try doc.setLiteral("point.x", "99");
+    aw.clearRetainingCapacity();
+    try doc.emit(&aw.writer);
+    try testing.expectEqualStrings("point = { x = 99, y = 2 }\n", aw.written());
+}
+
 test "document: setLiteral creates first sub-key in empty inline table" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -2411,6 +2532,130 @@ test "document: failed insert (reparse rollback) leaves document unchanged" {
     try doc.setLiteral("server.tls", "true");
     try testing.expectEqual(true, doc.get("server.tls").?.boolean);
     try testing.expectEqual(@as(i64, 8080), doc.get("server.port").?.integer);
+}
+
+test "document: setTrailingComment rejects newline injection (atomic, cache consistent)" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var doc = try Document.parse(arena.allocator(),
+        \\port = 8080
+        \\
+    , .{});
+
+    // A newline in the comment text would splice a real `injected = 1` key
+    // that re-parses live. It must be rejected before any mutation.
+    try testing.expectError(error.InvalidComment, doc.setTrailingComment("port", "c\ninjected = 1"));
+
+    // Document is byte-identical and the cached tree never saw an injection.
+    var aw: Io.Writer.Allocating = .init(arena.allocator());
+    defer aw.deinit();
+    try doc.emit(&aw.writer);
+    try testing.expectEqualStrings("port = 8080\n", aw.written());
+    try testing.expectEqual(@as(i64, 8080), doc.get("port").?.integer);
+    try testing.expect(doc.get("injected") == null);
+
+    // A lone carriage return is rejected too.
+    try testing.expectError(error.InvalidComment, doc.setTrailingComment("port", "a\rb"));
+}
+
+test "document: addCommentBefore/After reject newline; normal comment keeps cache consistent" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var doc = try Document.parse(arena.allocator(),
+        \\port = 8080
+        \\
+    , .{});
+
+    try testing.expectError(error.InvalidComment, doc.addCommentBefore("port", "x\ny = 1"));
+    try testing.expectError(error.InvalidComment, doc.addCommentAfter("port", "x\ny = 1"));
+
+    // Untouched after the rejected edits.
+    {
+        var aw: Io.Writer.Allocating = .init(arena.allocator());
+        defer aw.deinit();
+        try doc.emit(&aw.writer);
+        try testing.expectEqualStrings("port = 8080\n", aw.written());
+    }
+
+    // A `#` inside the body is harmless and allowed.
+    try doc.addCommentBefore("port", "see # ref");
+    try doc.setTrailingComment("port", "default");
+    {
+        var aw: Io.Writer.Allocating = .init(arena.allocator());
+        defer aw.deinit();
+        try doc.emit(&aw.writer);
+        try testing.expectEqualStrings("# see # ref\nport = 8080  # default\n", aw.written());
+    }
+    // The cached tree agrees with the emitted bytes: the value is intact and
+    // re-parses, and no stray key was introduced by the comment edits.
+    try testing.expectEqual(@as(i64, 8080), doc.get("port").?.integer);
+}
+
+test "document: setLiteral rejects multi-statement injection (atomic, no reparent)" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var doc = try Document.parse(arena.allocator(),
+        \\name = "keep"
+        \\port = 8080
+        \\
+    , .{});
+
+    // `1\n[evil]\npwned=true` would inject `[evil]` and reparent `name`.
+    try testing.expectError(error.InvalidValue, doc.setLiteral("port", "1\n[evil]\npwned=true"));
+
+    // Atomic: byte-identical, no injected table, no reparented key.
+    var aw: Io.Writer.Allocating = .init(arena.allocator());
+    defer aw.deinit();
+    try doc.emit(&aw.writer);
+    try testing.expectEqualStrings("name = \"keep\"\nport = 8080\n", aw.written());
+    try testing.expectEqual(@as(i64, 8080), doc.get("port").?.integer);
+    try testing.expectEqualStrings("keep", doc.get("name").?.string);
+    try testing.expect(doc.get("evil.pwned") == null);
+
+    // A genuine single-value literal still works and stays consistent.
+    try doc.setLiteral("port", "42");
+    try testing.expectEqual(@as(i64, 42), doc.get("port").?.integer);
+    aw.clearRetainingCapacity();
+    try doc.emit(&aw.writer);
+    try testing.expectEqualStrings("name = \"keep\"\nport = 42\n", aw.written());
+}
+
+test "document: remove last inline member keeps the space before the brace" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var doc = try Document.parse(arena.allocator(),
+        \\t = { x = 1, y = 2 }
+        \\
+    , .{});
+
+    try doc.remove("t.y");
+
+    var aw: Io.Writer.Allocating = .init(arena.allocator());
+    defer aw.deinit();
+    try doc.emit(&aw.writer);
+    // Symmetric spacing: `{ x = 1 }`, not `{ x = 1}`.
+    try testing.expectEqualStrings("t = { x = 1 }\n", aw.written());
+}
+
+test "document: setLiteral/remove reject array-index paths" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var doc = try Document.parse(arena.allocator(),
+        \\arr = [1, 2, 3]
+        \\
+    , .{});
+
+    // `get` reads element 0; the editors must not silently mint an `arr[0]`
+    // literal key (or PathNotFound on remove) for the same path string.
+    try testing.expectError(error.UnsupportedPath, doc.setLiteral("arr[0]", "9"));
+    try testing.expectError(error.UnsupportedPath, doc.remove("arr[0]"));
+
+    // No bogus key was created; the document is unchanged.
+    var aw: Io.Writer.Allocating = .init(arena.allocator());
+    defer aw.deinit();
+    try doc.emit(&aw.writer);
+    try testing.expectEqualStrings("arr = [1, 2, 3]\n", aw.written());
+    try testing.expect(doc.get("arr[0]").?.integer == 1);
 }
 
 test "document: simple bare-key new section still emits unquoted" {
