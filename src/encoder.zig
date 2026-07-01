@@ -359,14 +359,14 @@ fn writePath(w: *Io.Writer, parts: []const []const u8) EncodeError!void {
 }
 
 /// Write a single key segment to `w`: bare when it is a valid bare key,
-/// otherwise as a basic-quoted string. The document model uses this when
-/// inserting a new key so a decoded special key re-emits as valid TOML.
+/// otherwise as a single-line basic-quoted string. TOML keys may not use
+/// multiline string syntax, so the multiline path is bypassed unconditionally.
 pub fn writeKey(w: *Io.Writer, k: []const u8) EncodeError!void {
     if (isBareKey(k)) {
         try w.writeAll(k);
         return;
     }
-    try writeQuotedString(w, k);
+    try writeSingleLineBasicString(w, k);
 }
 
 fn isBareKey(k: []const u8) bool {
@@ -455,8 +455,7 @@ fn scanQuotedStringPlain(bytes: []const u8) usize {
     return i;
 }
 
-fn writeQuotedString(w: *Io.Writer, s: []const u8) EncodeError!void {
-    if (shouldUseMultiline(s)) return writeMultilineString(w, s);
+fn writeSingleLineBasicString(w: *Io.Writer, s: []const u8) EncodeError!void {
     try w.writeByte('"');
     var i: usize = 0;
     while (i < s.len) {
@@ -484,6 +483,11 @@ fn writeQuotedString(w: *Io.Writer, s: []const u8) EncodeError!void {
         i += 1;
     }
     try w.writeByte('"');
+}
+
+fn writeQuotedString(w: *Io.Writer, s: []const u8) EncodeError!void {
+    if (shouldUseMultiline(s)) return writeMultilineString(w, s);
+    return writeSingleLineBasicString(w, s);
 }
 
 const multiline_threshold = 60;
@@ -523,6 +527,10 @@ fn writeMultilineString(w: *Io.Writer, s: []const u8) EncodeError!void {
             },
             0x08 => try w.writeAll("\\b"),
             0x0C => try w.writeAll("\\f"),
+            // CR must be escaped: a bare \r is invalid in multiline strings per
+            // spec, and even \r\n pairs are normalized away by compliant parsers
+            // so the value would not survive a round-trip without escaping.
+            0x0D => try w.writeAll("\\r"),
             else => try w.writeByte(c),
         }
     }
@@ -530,7 +538,7 @@ fn writeMultilineString(w: *Io.Writer, s: []const u8) EncodeError!void {
 }
 
 fn writeFloat(w: *Io.Writer, f: f64) EncodeError!void {
-    if (std.math.isNan(f)) return w.writeAll("nan");
+    if (std.math.isNan(f)) return w.writeAll(if (std.math.signbit(f)) "-nan" else "nan");
     if (std.math.isPositiveInf(f)) return w.writeAll("inf");
     if (std.math.isNegativeInf(f)) return w.writeAll("-inf");
 
@@ -1303,4 +1311,117 @@ test "encodeTyped: []const []const u8 emits array of strings and round-trips" {
     try testing.expectEqual(@as(usize, 3), cfg2.tags.len);
     try testing.expectEqualStrings("foo", cfg2.tags[0]);
     try testing.expectEqualStrings("baz", cfg2.tags[2]);
+}
+
+test "encode multiline string: CR escaped as \\r, CRLF round-trip byte-exact" {
+    // Build the initial value by parsing a single-line TOML that uses \r\n
+    // escape sequences. The decoded string has literal CR and LF bytes. At
+    // 62 bytes (>= multiline_threshold=60, has LF) it re-encodes as multiline.
+    const toml_src = "v = \"\\r\\n" ++ ("x" ** 60) ++ "\"\n";
+    var arena1: ArenaAllocator = .init(testing.allocator);
+    defer arena1.deinit();
+    const parsed1 = try parser.parse(arena1.allocator(), toml_src, .{});
+
+    const encoded = try allocEncode(testing.allocator, parsed1);
+    defer testing.allocator.free(encoded);
+
+    // Must use multiline form.
+    try testing.expect(std.mem.indexOf(u8, encoded, "\"\"\"") != null);
+    // No literal CR byte anywhere in the encoded TOML.
+    try testing.expect(std.mem.indexOfScalar(u8, encoded, '\r') == null);
+
+    // Round-trip: re-parse and compare structurally.
+    var arena2: ArenaAllocator = .init(testing.allocator);
+    defer arena2.deinit();
+    const parsed2 = try parser.parse(arena2.allocator(), encoded, .{});
+    try testing.expect(Value.eql(parsed1, parsed2));
+}
+
+test "encode multiline string: multiple CRs and CRLF pairs all escaped" {
+    // "start\r\n" ++ 58×'x' ++ "\r\nend" -> 70-byte value (>= 60, has LF).
+    const toml_src = "v = \"start\\r\\n" ++ ("x" ** 58) ++ "\\r\\nend\"\n";
+    var arena1: ArenaAllocator = .init(testing.allocator);
+    defer arena1.deinit();
+    const parsed1 = try parser.parse(arena1.allocator(), toml_src, .{});
+
+    const encoded = try allocEncode(testing.allocator, parsed1);
+    defer testing.allocator.free(encoded);
+
+    try testing.expect(std.mem.indexOf(u8, encoded, "\"\"\"") != null);
+    try testing.expect(std.mem.indexOfScalar(u8, encoded, '\r') == null);
+
+    var arena2: ArenaAllocator = .init(testing.allocator);
+    defer arena2.deinit();
+    const parsed2 = try parser.parse(arena2.allocator(), encoded, .{});
+    try testing.expect(Value.eql(parsed1, parsed2));
+}
+
+test "encode key with embedded newline: single-line basic string, no multiline form" {
+    // Parse a TOML document whose key uses \n escape to embed a newline.
+    // On re-encode, writeKey must emit a single-line basic string (not """).
+    const toml_src = "\"a\\nb\" = 1\n";
+    var arena1: ArenaAllocator = .init(testing.allocator);
+    defer arena1.deinit();
+    const parsed1 = try parser.parse(arena1.allocator(), toml_src, .{});
+
+    const encoded = try allocEncode(testing.allocator, parsed1);
+    defer testing.allocator.free(encoded);
+
+    // Key token (everything before the first " = ") must be single-line.
+    const eq_idx = std.mem.indexOf(u8, encoded, " = ").?;
+    const key_token = encoded[0..eq_idx];
+    try testing.expect(std.mem.indexOf(u8, key_token, "\"\"\"") == null);
+    try testing.expect(std.mem.indexOfScalar(u8, key_token, '\n') == null);
+    try testing.expect(std.mem.indexOfScalar(u8, key_token, '\r') == null);
+
+    // Round-trip: re-parse and structural equality.
+    var arena2: ArenaAllocator = .init(testing.allocator);
+    defer arena2.deinit();
+    const parsed2 = try parser.parse(arena2.allocator(), encoded, .{});
+    try testing.expect(Value.eql(parsed1, parsed2));
+}
+
+test "encode key with embedded CR: single-line basic string, no multiline form" {
+    // Key contains a \r escape (CR). Must re-encode as single-line basic string.
+    const toml_src = "\"a\\rb\" = 1\n";
+    var arena1: ArenaAllocator = .init(testing.allocator);
+    defer arena1.deinit();
+    const parsed1 = try parser.parse(arena1.allocator(), toml_src, .{});
+
+    const encoded = try allocEncode(testing.allocator, parsed1);
+    defer testing.allocator.free(encoded);
+
+    const eq_idx = std.mem.indexOf(u8, encoded, " = ").?;
+    const key_token = encoded[0..eq_idx];
+    try testing.expect(std.mem.indexOf(u8, key_token, "\"\"\"") == null);
+    try testing.expect(std.mem.indexOfScalar(u8, key_token, '\n') == null);
+    try testing.expect(std.mem.indexOfScalar(u8, key_token, '\r') == null);
+
+    var arena2: ArenaAllocator = .init(testing.allocator);
+    defer arena2.deinit();
+    const parsed2 = try parser.parse(arena2.allocator(), encoded, .{});
+    try testing.expect(Value.eql(parsed1, parsed2));
+}
+
+test "encode float: NaN sign bit preserved; inf spellings correct" {
+    const neg_nan: f64 = @bitCast(@as(u64, 0xFFF8000000000000));
+    const pos_nan: f64 = @bitCast(@as(u64, 0x7FF8000000000000));
+
+    var buf: [32]u8 = undefined;
+
+    var aw_neg_nan: Io.Writer = .fixed(&buf);
+    try writeFloat(&aw_neg_nan, neg_nan);
+    try testing.expectEqualStrings("-nan", aw_neg_nan.buffered());
+
+    var aw_pos_nan: Io.Writer = .fixed(&buf);
+    try writeFloat(&aw_pos_nan, pos_nan);
+    try testing.expectEqualStrings("nan", aw_pos_nan.buffered());
+
+    var aw_inf: Io.Writer = .fixed(&buf);
+    try writeFloat(&aw_inf, std.math.inf(f64));
+    try testing.expectEqualStrings("inf", aw_inf.buffered());
+
+    var aw_neg_inf: Io.Writer = .fixed(&buf);
+    try writeFloat(&aw_neg_inf, -std.math.inf(f64));
+    try testing.expectEqualStrings("-inf", aw_neg_inf.buffered());
 }
