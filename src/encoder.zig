@@ -142,18 +142,65 @@ fn emitStructSubTables(
         }
         if (comptime fieldHasSubTable(field.type)) {
             const eff_key = comptime renamedKey(T, field.name);
-            try path.append(path_alloc, eff_key);
-            defer _ = path.pop();
-            if (has_any_kv.* or !is_root) try w.writeByte('\n');
-            has_any_kv.* = true;
-            try w.writeByte('[');
-            try writePath(w, path.items);
-            try w.writeAll("]\n");
-            if (comptime (@typeInfo(field.type) == .@"union" and @hasDecl(field.type, "toml_tag"))) {
-                try encodeTaggedUnion(field.type, fv, w, path, path_alloc, arena, false);
-            } else {
-                try encodeTypedTable(field.type, fv, w, path, path_alloc, arena, false);
+            const is_opt = comptime @typeInfo(field.type) == .optional;
+            const ActualType = comptime if (is_opt) @typeInfo(field.type).optional.child else field.type;
+            // Unwrap ?T: null -> absent section (mirrors decode's absent-table -> null).
+            const should_emit: bool = if (comptime is_opt) fv != null else true;
+            if (should_emit) {
+                const actual_val: ActualType = if (comptime is_opt) fv.? else fv;
+                if (comptime arrayOfTablesChild(ActualType)) |Elem| {
+                    try emitArrayOfTables(Elem, actual_val, eff_key, w, path, path_alloc, arena, is_root, has_any_kv);
+                } else {
+                    try path.append(path_alloc, eff_key);
+                    defer _ = path.pop();
+                    if (has_any_kv.* or !is_root) try w.writeByte('\n');
+                    has_any_kv.* = true;
+                    try w.writeByte('[');
+                    try writePath(w, path.items);
+                    try w.writeAll("]\n");
+                    if (comptime (@typeInfo(ActualType) == .@"union" and @hasDecl(ActualType, "toml_tag"))) {
+                        try encodeTaggedUnion(ActualType, actual_val, w, path, path_alloc, arena, false);
+                    } else {
+                        try encodeTypedTable(ActualType, actual_val, w, path, path_alloc, arena, false);
+                    }
+                }
             }
+        }
+    }
+}
+
+// Emit a slice/array of sub-tables as consecutive `[[eff_key]]` sections, one
+// per element, in order. `Elem` is the element type (possibly `?SubTable`); a
+// null element is skipped, as TOML arrays-of-tables cannot hold a null entry.
+// Nested arrays-of-tables render correctly because each element's body is
+// emitted via encodeTypedTable at the pushed path (`[[a]]` then `[[a.b]]`).
+fn emitArrayOfTables(
+    comptime Elem: type,
+    value: anytype,
+    eff_key: []const u8,
+    w: *std.Io.Writer,
+    path: *ArrayList([]const u8),
+    path_alloc: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    is_root: bool,
+    has_any_kv: *bool,
+) EncodeError!void {
+    const is_elem_opt = comptime @typeInfo(Elem) == .optional;
+    const ElemActual = comptime if (is_elem_opt) @typeInfo(Elem).optional.child else Elem;
+
+    try path.append(path_alloc, eff_key);
+    defer _ = path.pop();
+    for (value) |elem| {
+        const item: ElemActual = if (comptime is_elem_opt) (elem orelse continue) else elem;
+        if (has_any_kv.* or !is_root) try w.writeByte('\n');
+        has_any_kv.* = true;
+        try w.writeAll("[[");
+        try writePath(w, path.items);
+        try w.writeAll("]]\n");
+        if (comptime (@typeInfo(ElemActual) == .@"union" and @hasDecl(ElemActual, "toml_tag"))) {
+            try encodeTaggedUnion(ElemActual, item, w, path, path_alloc, arena, false);
+        } else {
+            try encodeTypedTable(ElemActual, item, w, path, path_alloc, arena, false);
         }
     }
 }
@@ -223,7 +270,27 @@ fn fieldHasSubTable(comptime FT: type) bool {
     return switch (@typeInfo(FT)) {
         .@"struct" => !@hasDecl(FT, "toToml"),
         .@"union" => @hasDecl(FT, "toml_tag"),
+        // ?T is a sub-table field when T itself is one. The optional wrapper
+        // just controls whether the section is emitted (non-null) or skipped (null).
+        .optional => |o| fieldHasSubTable(o.child),
+        // A slice/array of sub-tables encodes as [[array-of-tables]], mirroring
+        // how decode reads []const Struct / [N]Struct from `[[header]]` blocks.
+        // A []const u8 (string) or []const <scalar> (inline array) has a
+        // non-sub-table element, so it stays in the scalar pass.
+        .pointer => |p| p.size == .slice and fieldHasSubTable(p.child),
+        .array => |a| fieldHasSubTable(a.child),
         else => false,
+    };
+}
+
+/// If `FT` is a slice/array whose element is a sub-table type (possibly an
+/// optional sub-table), returns that element type; otherwise null. Used to
+/// route array-of-tables fields to the `[[header]]` emission path.
+fn arrayOfTablesChild(comptime FT: type) ?type {
+    return switch (@typeInfo(FT)) {
+        .pointer => |p| if (p.size == .slice and fieldHasSubTable(p.child)) p.child else null,
+        .array => |a| if (fieldHasSubTable(a.child)) a.child else null,
+        else => null,
     };
 }
 
@@ -1401,6 +1468,308 @@ test "encode key with embedded CR: single-line basic string, no multiline form" 
     defer arena2.deinit();
     const parsed2 = try parser.parse(arena2.allocator(), encoded, .{});
     try testing.expect(Value.eql(parsed1, parsed2));
+}
+
+test "encodeTyped: optional sub-table present round-trips" {
+    const Sub = struct { x: i64, y: i64 };
+    const S = struct { name: []const u8, sub: ?Sub };
+
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cfg = S{ .name = "hello", .sub = .{ .x = 1, .y = 2 } };
+    var buf: [256]u8 = undefined;
+    var aw: std.Io.Writer = .fixed(&buf);
+    try encodeTyped(S, cfg, &aw, a);
+    const out = aw.buffered();
+
+    try testing.expect(std.mem.indexOf(u8, out, "[sub]") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "x = 1") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "y = 2") != null);
+
+    const decode_mod = @import("decode.zig");
+    const v1 = try parser.parse(a, out, .{});
+    const cfg2 = try decode_mod.decode(S, a, v1, .{});
+    try testing.expectEqualStrings("hello", cfg2.name);
+    try testing.expect(cfg2.sub != null);
+    try testing.expectEqual(@as(i64, 1), cfg2.sub.?.x);
+    try testing.expectEqual(@as(i64, 2), cfg2.sub.?.y);
+}
+
+test "encodeTyped: optional sub-table null emits no header" {
+    const Sub = struct { x: i64, y: i64 };
+    const S = struct { name: []const u8, sub: ?Sub };
+
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cfg = S{ .name = "hello", .sub = null };
+    var buf: [256]u8 = undefined;
+    var aw: std.Io.Writer = .fixed(&buf);
+    try encodeTyped(S, cfg, &aw, a);
+    const out = aw.buffered();
+
+    // No [sub] section header when the optional sub-table is null.
+    try testing.expect(std.mem.indexOf(u8, out, "[sub]") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "name = \"hello\"") != null);
+
+    const decode_mod = @import("decode.zig");
+    const v1 = try parser.parse(a, out, .{});
+    const cfg2 = try decode_mod.decode(S, a, v1, .{});
+    try testing.expectEqualStrings("hello", cfg2.name);
+    try testing.expectEqual(@as(?Sub, null), cfg2.sub);
+}
+
+test "encodeTyped: nested optional sub-tables round-trip" {
+    const Inner = struct { v: i64 };
+    const Outer = struct { b: ?Inner };
+    const Root = struct { a: ?Outer };
+
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Both levels present.
+    {
+        const cfg = Root{ .a = .{ .b = .{ .v = 42 } } };
+        var buf: [256]u8 = undefined;
+        var aw: std.Io.Writer = .fixed(&buf);
+        try encodeTyped(Root, cfg, &aw, a);
+        const out = aw.buffered();
+        try testing.expect(std.mem.indexOf(u8, out, "[a]") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "[a.b]") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "v = 42") != null);
+        const decode_mod = @import("decode.zig");
+        const v1 = try parser.parse(a, out, .{});
+        const cfg2 = try decode_mod.decode(Root, a, v1, .{});
+        try testing.expect(cfg2.a != null and cfg2.a.?.b != null);
+        try testing.expectEqual(@as(i64, 42), cfg2.a.?.b.?.v);
+    }
+
+    // Outer present, inner null.
+    {
+        const cfg = Root{ .a = .{ .b = null } };
+        var buf: [256]u8 = undefined;
+        var aw: std.Io.Writer = .fixed(&buf);
+        try encodeTyped(Root, cfg, &aw, a);
+        const out = aw.buffered();
+        try testing.expect(std.mem.indexOf(u8, out, "[a]") != null);
+        // Inner null means no [a.b] section.
+        try testing.expect(std.mem.indexOf(u8, out, "[a.b]") == null);
+        const decode_mod = @import("decode.zig");
+        const v1 = try parser.parse(a, out, .{});
+        const cfg2 = try decode_mod.decode(Root, a, v1, .{});
+        try testing.expect(cfg2.a != null);
+        try testing.expectEqual(@as(?Inner, null), cfg2.a.?.b);
+    }
+
+    // Both null.
+    {
+        const cfg = Root{ .a = null };
+        var buf: [256]u8 = undefined;
+        var aw: std.Io.Writer = .fixed(&buf);
+        try encodeTyped(Root, cfg, &aw, a);
+        const out = aw.buffered();
+        try testing.expect(std.mem.indexOf(u8, out, "[a]") == null);
+        const decode_mod = @import("decode.zig");
+        const v1 = try parser.parse(a, out, .{});
+        const cfg2 = try decode_mod.decode(Root, a, v1, .{});
+        try testing.expectEqual(@as(?Outer, null), cfg2.a);
+    }
+}
+
+test "encodeTyped: slice-of-struct emits [[array-of-tables]] and round-trips" {
+    const Item = struct { x: i64, name: []const u8 };
+    const Config = struct { items: []const Item };
+
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const items: []const Item = &.{
+        .{ .x = 1, .name = "alpha" },
+        .{ .x = 2, .name = "beta" },
+        .{ .x = 3, .name = "gamma" },
+    };
+    const cfg = Config{ .items = items };
+
+    var buf: [1024]u8 = undefined;
+    var aw: std.Io.Writer = .fixed(&buf);
+    try encodeTyped(Config, cfg, &aw, a);
+    const out = aw.buffered();
+
+    // Three [[items]] headers, one per element.
+    try testing.expect(std.mem.indexOf(u8, out, "[[items]]") != null);
+    var count: usize = 0;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, out, i, "[[items]]")) |pos| : (i = pos + 1) count += 1;
+    try testing.expectEqual(@as(usize, 3), count);
+
+    const decode_mod = @import("decode.zig");
+    const v1 = try parser.parse(a, out, .{});
+    const cfg2 = try decode_mod.decode(Config, a, v1, .{});
+    try testing.expectEqual(@as(usize, 3), cfg2.items.len);
+    try testing.expectEqual(@as(i64, 1), cfg2.items[0].x);
+    try testing.expectEqualStrings("alpha", cfg2.items[0].name);
+    try testing.expectEqual(@as(i64, 3), cfg2.items[2].x);
+    try testing.expectEqualStrings("gamma", cfg2.items[2].name);
+}
+
+test "encodeTyped: ?[]const struct null emits nothing, present emits blocks" {
+    const Item = struct { v: i64 };
+    const Config = struct { name: []const u8, items: ?[]const Item };
+
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const decode_mod = @import("decode.zig");
+
+    // null -> no [[items]] header.
+    {
+        const cfg = Config{ .name = "n", .items = null };
+        var buf: [512]u8 = undefined;
+        var aw: std.Io.Writer = .fixed(&buf);
+        try encodeTyped(Config, cfg, &aw, a);
+        const out = aw.buffered();
+        try testing.expect(std.mem.indexOf(u8, out, "[[items]]") == null);
+        const v1 = try parser.parse(a, out, .{});
+        const cfg2 = try decode_mod.decode(Config, a, v1, .{});
+        try testing.expectEqual(@as(?[]const Item, null), cfg2.items);
+    }
+
+    // present -> [[items]] blocks round-trip.
+    {
+        const items: []const Item = &.{ .{ .v = 10 }, .{ .v = 20 } };
+        const cfg = Config{ .name = "n", .items = items };
+        var buf: [512]u8 = undefined;
+        var aw: std.Io.Writer = .fixed(&buf);
+        try encodeTyped(Config, cfg, &aw, a);
+        const out = aw.buffered();
+        try testing.expect(std.mem.indexOf(u8, out, "[[items]]") != null);
+        const v1 = try parser.parse(a, out, .{});
+        const cfg2 = try decode_mod.decode(Config, a, v1, .{});
+        try testing.expect(cfg2.items != null);
+        try testing.expectEqual(@as(usize, 2), cfg2.items.?.len);
+        try testing.expectEqual(@as(i64, 20), cfg2.items.?[1].v);
+    }
+}
+
+test "encodeTyped: empty slice-of-struct emits no blocks, round-trips empty" {
+    const Item = struct { v: i64 };
+    // Absent array-of-tables decodes through the field default; decode has no
+    // absent-means-empty rule, so an empty slice needs a default (or optional)
+    // to round-trip -- otherwise an absent required field is MissingField.
+    const Config = struct { items: []const Item = &.{} };
+
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cfg = Config{ .items = &.{} };
+    var buf: [256]u8 = undefined;
+    var aw: std.Io.Writer = .fixed(&buf);
+    try encodeTyped(Config, cfg, &aw, a);
+    const out = aw.buffered();
+    try testing.expect(std.mem.indexOf(u8, out, "[[items]]") == null);
+
+    const decode_mod = @import("decode.zig");
+    const v1 = try parser.parse(a, out, .{});
+    const cfg2 = try decode_mod.decode(Config, a, v1, .{});
+    try testing.expectEqual(@as(usize, 0), cfg2.items.len);
+}
+
+test "encodeTyped: nested array-of-tables emits [[a]] + [[a.b]] and round-trips" {
+    const Inner = struct { val: i64 };
+    const Outer = struct { b: []const Inner };
+    const Config = struct { a: []const Outer };
+
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cfg = Config{ .a = &.{
+        .{ .b = &.{ .{ .val = 1 }, .{ .val = 2 } } },
+        .{ .b = &.{.{ .val = 3 }} },
+    } };
+
+    var buf: [1024]u8 = undefined;
+    var aw: std.Io.Writer = .fixed(&buf);
+    try encodeTyped(Config, cfg, &aw, a);
+    const out = aw.buffered();
+
+    try testing.expect(std.mem.indexOf(u8, out, "[[a]]") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "[[a.b]]") != null);
+
+    const decode_mod = @import("decode.zig");
+    const v1 = try parser.parse(a, out, .{});
+    const cfg2 = try decode_mod.decode(Config, a, v1, .{});
+    try testing.expectEqual(@as(usize, 2), cfg2.a.len);
+    try testing.expectEqual(@as(usize, 2), cfg2.a[0].b.len);
+    try testing.expectEqual(@as(i64, 1), cfg2.a[0].b[0].val);
+    try testing.expectEqual(@as(i64, 2), cfg2.a[0].b[1].val);
+    try testing.expectEqual(@as(usize, 1), cfg2.a[1].b.len);
+    try testing.expectEqual(@as(i64, 3), cfg2.a[1].b[0].val);
+}
+
+test "encodeTyped: array-of-tables element mixing scalar and sub-table field" {
+    // An array-of-tables element carrying both a scalar and a nested sub-table
+    // emits the scalar in the `[[items]]` body and the sub-table as an
+    // `[items.sub]` header at the element's path. That output is spec-valid,
+    // but this library's parser cannot yet re-open `[items.sub]` under a second
+    // `[[items]]` element (a separate latent parser bug), so full round-trip is
+    // blocked upstream. Assert the encoder emits the correct structure.
+    const Sub = struct { y: i64 };
+    const Item = struct { x: i64, sub: Sub };
+    const Config = struct { items: []const Item };
+
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cfg = Config{ .items = &.{
+        .{ .x = 1, .sub = .{ .y = 11 } },
+        .{ .x = 2, .sub = .{ .y = 22 } },
+    } };
+
+    var buf: [1024]u8 = undefined;
+    var aw: std.Io.Writer = .fixed(&buf);
+    try encodeTyped(Config, cfg, &aw, a);
+    const out = aw.buffered();
+
+    // Two [[items]] element headers, each with its own scalar and [items.sub].
+    var count: usize = 0;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, out, i, "[[items]]")) |pos| : (i = pos + 1) count += 1;
+    try testing.expectEqual(@as(usize, 2), count);
+    try testing.expect(std.mem.indexOf(u8, out, "x = 1") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "x = 2") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "[items.sub]") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "y = 11") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "y = 22") != null);
+}
+
+test "encodeTyped: [N]struct fixed array emits [[array-of-tables]] and round-trips" {
+    const Item = struct { v: i64 };
+    const Config = struct { items: [2]Item };
+
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const cfg = Config{ .items = .{ .{ .v = 7 }, .{ .v = 8 } } };
+    var buf: [512]u8 = undefined;
+    var aw: std.Io.Writer = .fixed(&buf);
+    try encodeTyped(Config, cfg, &aw, a);
+    const out = aw.buffered();
+    try testing.expect(std.mem.indexOf(u8, out, "[[items]]") != null);
+
+    const decode_mod = @import("decode.zig");
+    const v1 = try parser.parse(a, out, .{});
+    const cfg2 = try decode_mod.decode(Config, a, v1, .{});
+    try testing.expectEqual(@as(i64, 7), cfg2.items[0].v);
+    try testing.expectEqual(@as(i64, 8), cfg2.items[1].v);
 }
 
 test "encode float: NaN sign bit preserved; inf spellings correct" {
