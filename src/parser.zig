@@ -794,13 +794,13 @@ const Parser = struct {
             if (i > 0) try full_key.append(self.arena, '.');
             try full_key.appendSlice(self.arena, part);
 
-            if (seen_key.items.len > 0) try seen_key.append(self.arena, '.');
+            if (i > 0) try seen_key.append(self.arena, '.');
             try appendSeenSegment(self.arena, &seen_key, part);
 
-            if (indexed_key.items.len > 0) try indexed_key.append(self.arena, '.');
+            if (i > 0) try indexed_key.append(self.arena, '.');
             try indexed_key.appendSlice(self.arena, part);
 
-            if (indexed_seen_key.items.len > 0) try indexed_seen_key.append(self.arena, '.');
+            if (i > 0) try indexed_seen_key.append(self.arena, '.');
             try appendSeenSegment(self.arena, &indexed_seen_key, part);
 
             const last = i == key_parts.items.len - 1;
@@ -2573,6 +2573,74 @@ test "redefine table error" {
         \\y = 2
     ;
     try testing.expectError(error.TomlParseError, parse(arena.allocator(), src, .{}));
+}
+
+test "leading empty quoted key does not collapse distinct paths" {
+    // [""."x"] and [x] are distinct: the first is a child of the empty-string
+    // table, the second is a top-level key.  A leading empty segment left
+    // items.len == 0 so the separator before the next segment was dropped,
+    // making seen_key for both headers "x" -> false redefinition error.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\[""."x"]
+        \\k = 1
+        \\[x]
+        \\k = 2
+    ;
+    const val = try parse(arena.allocator(), src, .{});
+    try testing.expectEqual(@as(i64, 1), val.table.get("").?.table.get("x").?.table.get("k").?.integer);
+    try testing.expectEqual(@as(i64, 2), val.table.get("x").?.table.get("k").?.integer);
+}
+
+test "leading empty array-of-tables with sub-table per element" {
+    // Two [[""]] elements each with a [""."s"] sub-table: the array-append
+    // scopes each [""."s"] to its own element, so no redefinition occurs.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\[[""]]
+        \\[""."s"]
+        \\k = 1
+        \\
+        \\[[""]]
+        \\[""."s"]
+        \\k = 2
+    ;
+    const val = try parse(arena.allocator(), src, .{});
+    const arr = val.table.get("").?.array;
+    try testing.expectEqual(@as(usize, 2), arr.items.len);
+    try testing.expectEqual(@as(i64, 1), arr.items[0].table.get("s").?.table.get("k").?.integer);
+    try testing.expectEqual(@as(i64, 2), arr.items[1].table.get("s").?.table.get("k").?.integer);
+}
+
+test "genuine duplicate leading-empty sub-table still errors" {
+    // [""."s"] defined twice within the same element is a genuine redefinition.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\[""."s"]
+        \\k = 1
+        \\[""."s"]
+        \\k = 2
+    ;
+    try testing.expectError(error.TomlParseError, parse(arena.allocator(), src, .{}));
+}
+
+test "non-leading empty key segments still parse" {
+    // Trailing and middle empty segments worked before; guard against regressing.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    {
+        const val = try parse(arena.allocator(), "[a.\"\"]\nk = 1\n", .{});
+        try testing.expectEqual(@as(i64, 1), val.table.get("a").?.table.get("").?.table.get("k").?.integer);
+    }
+    {
+        var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena2.deinit();
+        const val = try parse(arena2.allocator(), "[a.\"\".b]\nk = 1\n", .{});
+        try testing.expectEqual(@as(i64, 1), val.table.get("a").?.table.get("").?.table.get("b").?.table.get("k").?.integer);
+    }
 }
 
 test "dotted keys create tables" {
