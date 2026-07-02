@@ -366,7 +366,19 @@ pub fn streamParseUnit(
     };
 }
 
-const Parser = struct {
+/// Comptime sink for the statement executor's value side. The executor is
+/// generic over it: `ValueSink` builds the dynamic `Value` tree (the
+/// buffered and streaming paths), while decode.zig's typed sink dispatches
+/// statements straight into a target type. Every seen-set verdict runs
+/// identically under either sink; the sink only navigates and stores.
+const ValueSink = struct {
+    pub const TableRef = *StringArrayHashMap(Value);
+};
+
+fn ParserOf(comptime Sink: type) type {
+    return struct {
+        const Self = @This();
+
     arena: Allocator,
     input: []const u8,
     pos: usize = 0,
@@ -379,11 +391,11 @@ const Parser = struct {
     /// Top-level (root) table. Injected: the buffered path points it at a
     /// fresh local map; the streaming path points it at the accumulating
     /// shared root so units land in the same tree.
-    root: *StringArrayHashMap(Value) = undefined,
+    root: Sink.TableRef = undefined,
 
     /// Where the next `key = value` pair lands. Changes on
     /// `[header]` / `[[array-of-tables]]`.
-    current: *StringArrayHashMap(Value) = undefined,
+    current: Sink.TableRef = undefined,
     /// Dotted path prefix that identifies `current` (empty at root).
     /// Used to build full keys during kv dotted-descent. Plain '.'-join,
     /// human-facing: it seeds `current_path` (span keys) and error text.
@@ -443,7 +455,7 @@ const Parser = struct {
     /// Bare init. Leaves `root` / `seen` undefined; the caller must either
     /// drive `parseDocument` (which wires fresh local storage) or only use
     /// helpers that don't touch the value tree (e.g. `parseKeyPath`).
-    fn init(arena: Allocator, input: []const u8) Parser {
+    fn init(arena: Allocator, input: []const u8) Self {
         return .{ .arena = arena, .input = input, .seen_arena = arena };
     }
 
@@ -466,7 +478,7 @@ const Parser = struct {
         input: []const u8,
         root: *StringArrayHashMap(Value),
         seen: *SeenState,
-    ) Parser {
+    ) Self {
         return .{
             .arena = arena,
             .seen_arena = seen_arena,
@@ -479,13 +491,13 @@ const Parser = struct {
 
     /// The offending span for a diagnostic: `[token_start, pos]` as u64 byte
     /// offsets. Line/col are derived from it at render time.
-    fn diagSpan(self: *const Parser) Span {
+    fn diagSpan(self: *const Self) Span {
         return .{ .start = self.token_start, .end = self.pos };
     }
 
     /// Append a child path segment, returning the previous length so the
     /// caller can restore via `popPath`. Cheap when spans are off.
-    fn pushPath(self: *Parser, separator: u8, segment: []const u8) Error!usize {
+    fn pushPath(self: *Self, separator: u8, segment: []const u8) Error!usize {
         if (self.spans == null) return 0;
         const prev_len = self.current_path.items.len;
         if (prev_len > 0 and separator != 0) try self.current_path.append(self.arena, separator);
@@ -494,19 +506,19 @@ const Parser = struct {
     }
 
     /// Append `[N]` index segment.
-    fn pushIndex(self: *Parser, idx: usize) Error!usize {
+    fn pushIndex(self: *Self, idx: usize) Error!usize {
         if (self.spans == null) return 0;
         const prev_len = self.current_path.items.len;
         try self.current_path.print(self.arena, "[{d}]", .{idx});
         return prev_len;
     }
 
-    fn popPath(self: *Parser, prev_len: usize) void {
+    fn popPath(self: *Self, prev_len: usize) void {
         if (self.spans == null) return;
         self.current_path.shrinkRetainingCapacity(prev_len);
     }
 
-    fn parseDocument(self: *Parser) Error!Value {
+    fn parseDocument(self: *Self) Error!Value {
         self.current = self.root;
         try self.parseStatements();
         return Value{ .table = self.root.* };
@@ -519,7 +531,7 @@ const Parser = struct {
     /// `parseDocument`, but does NOT own the value tree  -  the shared root
     /// is the result and persists across units. Recovery semantics match
     /// the buffered path.
-    fn parseStatements(self: *Parser) Error!void {
+    fn parseStatements(self: *Self) Error!void {
         var had_error = false;
 
         while (true) {
@@ -549,31 +561,31 @@ const Parser = struct {
 
     // ----- location / lookahead primitives -----
 
-    inline fn eof(self: *Parser) bool {
+    inline fn eof(self: *Self) bool {
         return self.pos >= self.input.len;
     }
 
-    inline fn peek(self: *Parser) u8 {
+    inline fn peek(self: *Self) u8 {
         return self.input[self.pos];
     }
 
-    inline fn peekAt(self: *Parser, offset: usize) ?u8 {
+    inline fn peekAt(self: *Self, offset: usize) ?u8 {
         const idx = self.pos + offset;
         if (idx >= self.input.len) return null;
         return self.input[idx];
     }
 
-    inline fn advance(self: *Parser) void {
+    inline fn advance(self: *Self) void {
         self.pos += 1;
     }
 
-    inline fn match(self: *Parser, c: u8) bool {
+    inline fn match(self: *Self, c: u8) bool {
         if (self.eof() or self.peek() != c) return false;
         self.advance();
         return true;
     }
 
-    fn matchStr(self: *Parser, s: []const u8) bool {
+    fn matchStr(self: *Self, s: []const u8) bool {
         if (self.pos + s.len > self.input.len) return false;
         if (!std.mem.eql(u8, self.input[self.pos .. self.pos + s.len], s)) return false;
         var i: usize = 0;
@@ -581,7 +593,7 @@ const Parser = struct {
         return true;
     }
 
-    fn skipWs(self: *Parser) void {
+    fn skipWs(self: *Self) void {
         while (!self.eof()) {
             const c = self.peek();
             if (c == ' ' or c == '\t') self.advance() else return;
@@ -591,14 +603,14 @@ const Parser = struct {
     /// Skip to the end of the current line and consume the newline.
     /// Used for error recovery: after a statement-level parse failure,
     /// advance past the bad line so the outer loop can attempt the next one.
-    fn recoverToNextStatement(self: *Parser) void {
+    fn recoverToNextStatement(self: *Self) void {
         while (!self.eof() and self.peek() != '\n') self.advance();
         if (!self.eof()) self.advance(); // consume the newline
     }
 
     /// Skip whitespace, comments, and newlines. Used at statement
     /// boundaries. Returns an error on malformed comments or bare CR.
-    fn skipWsAndComments(self: *Parser) Error!void {
+    fn skipWsAndComments(self: *Self) Error!void {
         while (!self.eof()) {
             const c = self.peek();
             switch (c) {
@@ -622,7 +634,7 @@ const Parser = struct {
     /// Consume a `#`-prefixed comment up to (but not including) the
     /// terminating newline. Returns an error if the comment contains
     /// disallowed control characters or invalid UTF-8.
-    fn consumeComment(self: *Parser) Error!void {
+    fn consumeComment(self: *Self) Error!void {
         _ = self.match('#');
         while (!self.eof() and self.peek() != '\n') {
             const k = self.peek();
@@ -648,7 +660,7 @@ const Parser = struct {
     /// Validate that the current position is the start of a valid UTF-8
     /// multi-byte sequence and advance past it. Rejects overlong
     /// encodings and surrogate code points.
-    fn validateUtf8(self: *Parser) Error!void {
+    fn validateUtf8(self: *Self) Error!void {
         const b0 = self.peek();
         const seq_len: usize = if (b0 < 0x80) 1 else if (b0 < 0xC2) 0 // 0x80..0xC1: invalid continuation or overlong
             else if (b0 < 0xE0) 2 else if (b0 < 0xF0) 3 else if (b0 < 0xF5) 4 else 0;
@@ -665,7 +677,7 @@ const Parser = struct {
 
     /// Expect end-of-line (newline or EOF), possibly preceded by whitespace
     /// and a comment.
-    fn expectEol(self: *Parser) Error!void {
+    fn expectEol(self: *Self) Error!void {
         self.skipWs();
         if (self.eof()) return;
         if (self.peek() == '#') {
@@ -685,7 +697,7 @@ const Parser = struct {
         return self.setError("expected newline");
     }
 
-    fn setError(self: *Parser, comptime msg: []const u8) Error {
+    fn setError(self: *Self, comptime msg: []const u8) Error {
         if (self.errors) |list| {
             const owned_msg = self.arena.dupe(u8, msg) catch return error.OutOfMemory;
             list.append(self.arena, .{
@@ -698,7 +710,7 @@ const Parser = struct {
 
     /// Depth-guard failure: records a diagnostic but returns the distinct
     /// `error.NestingTooDeep`, which the document recovery loop never swallows.
-    fn setDepthError(self: *Parser) Error {
+    fn setDepthError(self: *Self) Error {
         if (self.errors) |list| {
             const msg = std.fmt.allocPrint(self.arena, "nesting depth exceeds limit ({d})", .{self.max_depth}) catch return error.OutOfMemory;
             list.append(self.arena, .{
@@ -709,7 +721,7 @@ const Parser = struct {
         return error.NestingTooDeep;
     }
 
-    fn setErrorFmt(self: *Parser, comptime fmt: []const u8, args: anytype) Error {
+    fn setErrorFmt(self: *Self, comptime fmt: []const u8, args: anytype) Error {
         if (self.errors) |list| {
             const msg = std.fmt.allocPrint(self.arena, fmt, args) catch return error.OutOfMemory;
             list.append(self.arena, .{
@@ -720,7 +732,7 @@ const Parser = struct {
         return error.TomlParseError;
     }
 
-    fn setErrorWithSuggestion(self: *Parser, msg: []const u8, suggestion: ?[]const u8) Error {
+    fn setErrorWithSuggestion(self: *Self, msg: []const u8, suggestion: ?[]const u8) Error {
         if (self.errors) |list| {
             const owned_msg = self.arena.dupe(u8, msg) catch return error.OutOfMemory;
             const owned_sug = if (suggestion) |s| self.arena.dupe(u8, s) catch return error.OutOfMemory else null;
@@ -735,7 +747,7 @@ const Parser = struct {
 
     // ----- header / array-of-tables parsing -----
 
-    fn parseHeader(self: *Parser) Error!void {
+    fn parseHeader(self: *Self) Error!void {
         // Already saw `[`
         _ = self.match('[');
         const is_array = self.match('[');
@@ -917,7 +929,7 @@ const Parser = struct {
     /// current element index (`name[N].rest`); it addresses `scalar_leaves`,
     /// whose non-table leaves were recorded under that element-qualified form
     /// by `parseKeyValue`. `display` is the plain '.'-join for error text.
-    fn openTable(self: *Parser, parent: *StringArrayHashMap(Value), key: []const u8, seen_key: []const u8, leaf_key: []const u8, display: []const u8) Error!void {
+    fn openTable(self: *Self, parent: Sink.TableRef, key: []const u8, seen_key: []const u8, leaf_key: []const u8, display: []const u8) Error!void {
         if (self.seen.inline_tables.contains(seen_key)) {
             return self.setErrorFmt("cannot redefine inline table '{s}'", .{display});
         }
@@ -955,7 +967,7 @@ const Parser = struct {
     }
 
     /// See `openTable` for the `seen_key` / `leaf_key` / `display` split.
-    fn openArrayOfTables(self: *Parser, parent: *StringArrayHashMap(Value), key: []const u8, seen_key: []const u8, leaf_key: []const u8, display: []const u8) Error!void {
+    fn openArrayOfTables(self: *Self, parent: Sink.TableRef, key: []const u8, seen_key: []const u8, leaf_key: []const u8, display: []const u8) Error!void {
         // Seen-sets are authoritative for the type-conflict verdict (see
         // `openTable`). A path previously defined as a `[table]`, an inline
         // table, or a dotted-key table cannot be reopened as `[[array]]`.
@@ -1011,7 +1023,7 @@ const Parser = struct {
     /// index-free path `seen_key`. `seen_key` is already seen-arena-owned (it
     /// is the lookup key the other AOT sets store), so it can key
     /// `aot_lengths` directly.
-    fn bumpAotLength(self: *Parser, seen_key: []const u8) Error!void {
+    fn bumpAotLength(self: *Self, seen_key: []const u8) Error!void {
         const gop = try self.seen.aot_lengths.getOrPut(self.seen_arena, seen_key);
         if (!gop.found_existing) gop.value_ptr.* = 0;
         gop.value_ptr.* += 1;
@@ -1030,7 +1042,7 @@ const Parser = struct {
     /// kv-created `inline_tables` / `dotted_created`) are keyed via the
     /// element-qualified `current_seen_prefix` (`base[N].rest`), so they are
     /// already element-scoped and untouched.
-    fn resetAotSubPaths(self: *Parser, base: []const u8) Error!void {
+    fn resetAotSubPaths(self: *Self, base: []const u8) Error!void {
         const prefix = try std.fmt.allocPrint(self.arena, "{s}.", .{base});
         inline for (.{
             &self.seen.defined_tables,
@@ -1052,7 +1064,7 @@ const Parser = struct {
 
     // ----- key/value parsing -----
 
-    fn parseKeyValue(self: *Parser, target: *StringArrayHashMap(Value)) Error!void {
+    fn parseKeyValue(self: *Self, target: Sink.TableRef) Error!void {
         self.skipWs();
         self.token_start = self.pos;
         var parts: ArrayList([]const u8) = .empty;
@@ -1185,7 +1197,7 @@ const Parser = struct {
     /// encoding (`appendSeenSegment`) the seen-sets index on; child segments
     /// are appended with the same escaping so a child key containing a '.'
     /// keys distinctly from a dotted sub-path.
-    fn sealInlineValue(self: *Parser, seen_key: []const u8, value: Value) Error!void {
+    fn sealInlineValue(self: *Self, seen_key: []const u8, value: Value) Error!void {
         // Only inline-table values (and their sub-tables) need sealing.
         // Scalars and inline arrays don't introduce header-extendable
         // table paths, so we save the HashMap insert in the hot path.
@@ -1212,7 +1224,7 @@ const Parser = struct {
         }
     }
 
-    fn parseKeyPath(self: *Parser, out: *ArrayList([]const u8)) Error!void {
+    fn parseKeyPath(self: *Self, out: *ArrayList([]const u8)) Error!void {
         while (true) {
             self.skipWs();
             const part = try self.parseOneKey();
@@ -1222,7 +1234,7 @@ const Parser = struct {
         }
     }
 
-    fn parseOneKey(self: *Parser) Error![]const u8 {
+    fn parseOneKey(self: *Self) Error![]const u8 {
         if (self.eof()) return self.setError("expected key");
         const c = self.peek();
         if (c == '"') {
@@ -1245,7 +1257,7 @@ const Parser = struct {
 
     // ----- values -----
 
-    fn parseValue(self: *Parser) Error!Value {
+    fn parseValue(self: *Self) Error!Value {
         if (self.eof()) return self.setError("expected value");
 
         self.token_start = self.pos;
@@ -1258,7 +1270,7 @@ const Parser = struct {
         return value;
     }
 
-    fn parseValueInner(self: *Parser) Error!Value {
+    fn parseValueInner(self: *Self) Error!Value {
         const c = self.peek();
         switch (c) {
             '"' => {
@@ -1286,7 +1298,7 @@ const Parser = struct {
 
     /// Record a span for the value currently being parsed at the current
     /// path. No-op when spans are disabled. `start` is the value's byte offset.
-    fn recordSpanAtCurrentPath(self: *Parser, start: usize) Error!void {
+    fn recordSpanAtCurrentPath(self: *Self, start: usize) Error!void {
         const sm = self.spans orelse return;
         const dup = try self.arena.dupe(u8, self.current_path.items);
         try sm.put(self.arena, dup, .{
@@ -1297,7 +1309,7 @@ const Parser = struct {
 
     // ----- strings -----
 
-    fn parseBasicString(self: *Parser) Error![]const u8 {
+    fn parseBasicString(self: *Self) Error![]const u8 {
         self.token_start = self.pos;
         if (!self.match('"')) return self.setError("expected '\"'");
 
@@ -1369,7 +1381,7 @@ const Parser = struct {
         return self.setError("unterminated string");
     }
 
-    fn consumeEscape(self: *Parser, buf: *ArrayList(u8), multiline: bool) Error!void {
+    fn consumeEscape(self: *Self, buf: *ArrayList(u8), multiline: bool) Error!void {
         _ = self.match('\\');
         if (self.eof()) return self.setError("unterminated escape");
         const e = self.peek();
@@ -1444,7 +1456,7 @@ const Parser = struct {
         }
     }
 
-    fn parseUnicodeEscape(self: *Parser, n: usize) Error!u32 {
+    fn parseUnicodeEscape(self: *Self, n: usize) Error!u32 {
         if (self.pos + n > self.input.len) return self.setError("short unicode escape");
         var cp: u32 = 0;
         var i: usize = 0;
@@ -1471,7 +1483,7 @@ const Parser = struct {
         try buf.appendSlice(arena, utf8[0..n]);
     }
 
-    fn parseLiteralString(self: *Parser) Error![]const u8 {
+    fn parseLiteralString(self: *Self) Error![]const u8 {
         self.token_start = self.pos;
         if (!self.match('\'')) return self.setError("expected '\\''");
         const start = self.pos;
@@ -1494,7 +1506,7 @@ const Parser = struct {
         return self.setError("unterminated literal string");
     }
 
-    fn parseMultilineBasicString(self: *Parser) Error![]const u8 {
+    fn parseMultilineBasicString(self: *Self) Error![]const u8 {
         self.token_start = self.pos;
         // consume opening """
         _ = self.match('"');
@@ -1562,7 +1574,7 @@ const Parser = struct {
         return self.setError("unterminated multiline string");
     }
 
-    fn parseMultilineLiteralString(self: *Parser) Error![]const u8 {
+    fn parseMultilineLiteralString(self: *Self) Error![]const u8 {
         self.token_start = self.pos;
         _ = self.match('\'');
         _ = self.match('\'');
@@ -1667,7 +1679,7 @@ const Parser = struct {
 
     // ----- booleans -----
 
-    fn parseBoolean(self: *Parser) Error!Value {
+    fn parseBoolean(self: *Self) Error!Value {
         self.token_start = self.pos;
         if (self.matchStr("true")) return .{ .boolean = true };
         if (self.matchStr("false")) return .{ .boolean = false };
@@ -1691,7 +1703,7 @@ const Parser = struct {
     /// Unified entry point for unquoted values: integers, floats, inf/nan,
     /// and datetimes. Needs lookahead because `1979-05-27` looks like a
     /// subtraction in integer context.
-    fn parseNumberOrDateTime(self: *Parser) Error!Value {
+    fn parseNumberOrDateTime(self: *Self) Error!Value {
         self.token_start = self.pos;
         // Scan the token.
         const start = self.pos;
@@ -1804,7 +1816,7 @@ const Parser = struct {
         return .{ .integer = i };
     }
 
-    fn peekKeyword(self: *Parser, kw: []const u8) bool {
+    fn peekKeyword(self: *Self, kw: []const u8) bool {
         if (self.pos + kw.len > self.input.len) return false;
         if (!std.mem.eql(u8, self.input[self.pos .. self.pos + kw.len], kw)) return false;
         // Must be followed by a non-identifier char.
@@ -1816,7 +1828,7 @@ const Parser = struct {
         return true;
     }
 
-    fn scanDateTimeLiteral(self: *Parser) []const u8 {
+    fn scanDateTimeLiteral(self: *Self) []const u8 {
         // Scan characters valid in a TOML datetime literal:
         // digits, `-`, `:`, `T`, `t`, ` `, `.`, `+`, `Z`, `z`.
         // Stop at whitespace/comma/]/}/#/newline.
@@ -1848,7 +1860,7 @@ const Parser = struct {
         return self.input[start..last_nonspace_end];
     }
 
-    fn scanTimeLiteral(self: *Parser) []const u8 {
+    fn scanTimeLiteral(self: *Self) []const u8 {
         const start = self.pos;
         while (self.pos < self.input.len) {
             const c = self.input[self.pos];
@@ -1860,7 +1872,7 @@ const Parser = struct {
         return self.input[start..self.pos];
     }
 
-    fn parseArray(self: *Parser) Error!Value {
+    fn parseArray(self: *Self) Error!Value {
         self.token_start = self.pos;
         if (self.depth >= self.max_depth) return self.setDepthError();
         self.depth += 1;
@@ -1891,7 +1903,7 @@ const Parser = struct {
         }
     }
 
-    fn parseInlineTable(self: *Parser) Error!Value {
+    fn parseInlineTable(self: *Self) Error!Value {
         self.token_start = self.pos;
         if (self.depth >= self.max_depth) return self.setDepthError();
         self.depth += 1;
@@ -1971,7 +1983,7 @@ const Parser = struct {
         }
     }
 
-    fn parseRadixInteger(self: *Parser, comptime base: u8) Error!Value {
+    fn parseRadixInteger(self: *Self, comptime base: u8) Error!Value {
         const start = self.pos;
         var last_was_underscore = true; // require digit first
         while (self.pos < self.input.len) {
@@ -2019,7 +2031,10 @@ const Parser = struct {
         }
         return .{ .integer = @intCast(acc) };
     }
-};
+    };
+}
+
+const Parser = ParserOf(ValueSink);
 
 fn isDig(c: u8) bool {
     return c >= '0' and c <= '9';
