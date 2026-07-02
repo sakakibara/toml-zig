@@ -935,6 +935,7 @@ const Parser = struct {
                     }
                     try existing.array.append(self.arena, .{ .table = .empty });
                     try self.bumpAotLength(full_key);
+                    try self.resetAotSubPaths(full_key);
                     return;
                 },
                 else => return self.setErrorFmt("key '{s}' already defined", .{full_key}),
@@ -951,6 +952,12 @@ const Parser = struct {
         try parent.put(self.arena, key, .{ .array = arr });
         try self.seen.array_tables.put(self.seen_arena, full_key, {});
         try self.bumpAotLength(full_key);
+        // The buffered path reaches here only on a first definition (no
+        // sub-paths yet), but the streaming path frames each `[[base]]`
+        // against a fresh per-unit root, so an "absent slot" may actually be
+        // an append to an array from an earlier unit whose element left
+        // sub-path bookkeeping behind. Reset it here too so both paths agree.
+        try self.resetAotSubPaths(full_key);
     }
 
     /// Record one more element for the array-of-tables at the index-free path
@@ -960,6 +967,36 @@ const Parser = struct {
         const gop = try self.seen.aot_lengths.getOrPut(self.seen_arena, full_key);
         if (!gop.found_existing) gop.value_ptr.* = 0;
         gop.value_ptr.* += 1;
+    }
+
+    /// Opening a new element of the array-of-tables at `base` starts that
+    /// element's sub-structure fresh: a `[base.sub]` / `[[base.sub]]` under
+    /// the new element is a DISTINCT table from the same-named one under the
+    /// prior element, not a redefinition. The table-shaped seen-sets key
+    /// sub-tables by their index-free path (`base.sub`), so an entry left by
+    /// a prior element would wrongly flag the new one as a redefinition.
+    /// Drop every entry under `base.` from those index-free sets. The
+    /// value-leaf sets (`scalar_leaves`, and kv-created `inline_tables` /
+    /// `dotted_created`) are keyed via the element-qualified `current_prefix`
+    /// (`base[N].rest`), so they are already element-scoped and untouched.
+    fn resetAotSubPaths(self: *Parser, base: []const u8) Error!void {
+        const prefix = try std.fmt.allocPrint(self.arena, "{s}.", .{base});
+        inline for (.{
+            &self.seen.defined_tables,
+            &self.seen.implicit_tables,
+            &self.seen.array_tables,
+            &self.seen.aot_lengths,
+        }) |map| {
+            var doomed: ArrayList([]const u8) = .empty;
+            defer doomed.deinit(self.arena);
+            var it = map.iterator();
+            while (it.next()) |entry| {
+                if (std.mem.startsWith(u8, entry.key_ptr.*, prefix)) {
+                    try doomed.append(self.arena, entry.key_ptr.*);
+                }
+            }
+            for (doomed.items) |k| _ = map.remove(k);
+        }
     }
 
     // ----- key/value parsing -----
@@ -2327,6 +2364,127 @@ test "parse array of tables" {
     try testing.expectEqualStrings("Nail", products.items[1].table.get("name").?.string);
 }
 
+test "sub-table under array-of-tables scopes to the current element" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\[[items]]
+        \\x = 1
+        \\
+        \\[items.sub]
+        \\k = 1
+        \\
+        \\[[items]]
+        \\x = 2
+        \\
+        \\[items.sub]
+        \\k = 2
+    ;
+    const val = try parse(arena.allocator(), src, .{});
+    const items = val.table.get("items").?.array;
+    try testing.expectEqual(@as(usize, 2), items.items.len);
+    try testing.expectEqual(@as(i64, 1), items.items[0].table.get("x").?.integer);
+    try testing.expectEqual(@as(i64, 1), items.items[0].table.get("sub").?.table.get("k").?.integer);
+    try testing.expectEqual(@as(i64, 2), items.items[1].table.get("x").?.integer);
+    try testing.expectEqual(@as(i64, 2), items.items[1].table.get("sub").?.table.get("k").?.integer);
+}
+
+test "multi-level sub-path per array-of-tables element" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\[[a]]
+        \\[a.b.c]
+        \\x = 1
+        \\[[a]]
+        \\[a.b.c]
+        \\x = 2
+    ;
+    const val = try parse(arena.allocator(), src, .{});
+    const a = val.table.get("a").?.array;
+    try testing.expectEqual(@as(usize, 2), a.items.len);
+    try testing.expectEqual(@as(i64, 1), a.items[0].table.get("b").?.table.get("c").?.table.get("x").?.integer);
+    try testing.expectEqual(@as(i64, 2), a.items[1].table.get("b").?.table.get("c").?.table.get("x").?.integer);
+}
+
+test "nested array-of-tables under repeated array-of-tables element" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\[[a]]
+        \\[[a.sub]]
+        \\n = 1
+        \\[[a]]
+        \\[[a.sub]]
+        \\n = 2
+    ;
+    const val = try parse(arena.allocator(), src, .{});
+    const a = val.table.get("a").?.array;
+    try testing.expectEqual(@as(usize, 2), a.items.len);
+    const s0 = a.items[0].table.get("sub").?.array;
+    const s1 = a.items[1].table.get("sub").?.array;
+    try testing.expectEqual(@as(usize, 1), s0.items.len);
+    try testing.expectEqual(@as(usize, 1), s1.items.len);
+    try testing.expectEqual(@as(i64, 1), s0.items[0].table.get("n").?.integer);
+    try testing.expectEqual(@as(i64, 2), s1.items[0].table.get("n").?.integer);
+}
+
+test "keys after a sub-table header target that sub-table" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\[[a]]
+        \\x = 1
+        \\[a.sub]
+        \\k = 1
+        \\y = 2
+    ;
+    const val = try parse(arena.allocator(), src, .{});
+    const a = val.table.get("a").?.array;
+    try testing.expectEqual(@as(usize, 1), a.items.len);
+    try testing.expectEqual(@as(i64, 1), a.items[0].table.get("x").?.integer);
+    const sub = a.items[0].table.get("sub").?.table;
+    try testing.expectEqual(@as(i64, 1), sub.get("k").?.integer);
+    try testing.expectEqual(@as(i64, 2), sub.get("y").?.integer);
+}
+
+test "genuine sub-table redefinition within one element still errors" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\[[items]]
+        \\[items.sub]
+        \\k = 1
+        \\[items.sub]
+        \\k = 2
+    ;
+    try testing.expectError(error.TomlParseError, parse(arena.allocator(), src, .{}));
+}
+
+test "sub-table header before its array-of-tables still errors" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\[items.sub]
+        \\k = 1
+        \\[[items]]
+        \\x = 1
+    ;
+    try testing.expectError(error.TomlParseError, parse(arena.allocator(), src, .{}));
+}
+
+test "plain table then array-of-tables of same name still errors" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\[items]
+        \\x = 1
+        \\[[items]]
+        \\y = 2
+    ;
+    try testing.expectError(error.TomlParseError, parse(arena.allocator(), src, .{}));
+}
+
 test "duplicate key error" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -2937,6 +3095,11 @@ test "streaming seam: statement-by-statement parse equals buffered parse" {
         .{ .src = "top = 1\n[a]\nx = 1\n[b]\ny = 2\n", .ok = true },
         // Mixed values to exercise scalar reproduction across units.
         .{ .src = "[nums]\ni = 42\nf = 3.14\ns = \"hi\"\nb = true\n[dt]\nd = 1979-05-27\n", .ok = true },
+        // Sub-table under a reopened array-of-tables element: each [items.sub]
+        // attaches to its own element, so no false redefinition -> accept.
+        .{ .src = "[[items]]\nx = 1\n[items.sub]\nk = 1\n[[items]]\nx = 2\n[items.sub]\nk = 2\n", .ok = true },
+        // Genuine sub-table redefinition WITHIN one element -> ERROR.
+        .{ .src = "[[items]]\n[items.sub]\nk = 1\n[items.sub]\nk = 2\n", .ok = false },
     };
 
     for (cases, 0..) |c, ci| {

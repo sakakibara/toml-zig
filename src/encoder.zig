@@ -1716,10 +1716,9 @@ test "encodeTyped: nested array-of-tables emits [[a]] + [[a.b]] and round-trips"
 test "encodeTyped: array-of-tables element mixing scalar and sub-table field" {
     // An array-of-tables element carrying both a scalar and a nested sub-table
     // emits the scalar in the `[[items]]` body and the sub-table as an
-    // `[items.sub]` header at the element's path. That output is spec-valid,
-    // but this library's parser cannot yet re-open `[items.sub]` under a second
-    // `[[items]]` element (a separate latent parser bug), so full round-trip is
-    // blocked upstream. Assert the encoder emits the correct structure.
+    // `[items.sub]` header at the element's path. Each `[items.sub]` attaches
+    // to its own element, so the emitted document parses and decodes back to
+    // the original.
     const Sub = struct { y: i64 };
     const Item = struct { x: i64, sub: Sub };
     const Config = struct { items: []const Item };
@@ -1743,11 +1742,16 @@ test "encodeTyped: array-of-tables element mixing scalar and sub-table field" {
     var i: usize = 0;
     while (std.mem.indexOfPos(u8, out, i, "[[items]]")) |pos| : (i = pos + 1) count += 1;
     try testing.expectEqual(@as(usize, 2), count);
-    try testing.expect(std.mem.indexOf(u8, out, "x = 1") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "x = 2") != null);
     try testing.expect(std.mem.indexOf(u8, out, "[items.sub]") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "y = 11") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "y = 22") != null);
+
+    const decode_mod = @import("decode.zig");
+    const v1 = try parser.parse(a, out, .{});
+    const cfg2 = try decode_mod.decode(Config, a, v1, .{});
+    try testing.expectEqual(@as(usize, 2), cfg2.items.len);
+    try testing.expectEqual(@as(i64, 1), cfg2.items[0].x);
+    try testing.expectEqual(@as(i64, 11), cfg2.items[0].sub.y);
+    try testing.expectEqual(@as(i64, 2), cfg2.items[1].x);
+    try testing.expectEqual(@as(i64, 22), cfg2.items[1].sub.y);
 }
 
 test "encodeTyped: [N]struct fixed array emits [[array-of-tables]] and round-trips" {
