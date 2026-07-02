@@ -67,9 +67,71 @@ pub fn main(init: std.process.Init) !void {
     // The bench prints peak capacity alongside throughput so regressions are
     // visible.
     try benchValueStreamBounded(w, gpa, io);
+    try benchParseIntoBig(w, gpa, io);
 
     try printFooter(w);
     try w.flush();
+}
+
+/// Large typed-decode bench: a multi-MB [[record]] array-of-tables decoded
+/// into a slice of structs. This is the workload where typed decode
+/// throughput matters most (manifests are small; data files are not).
+fn benchParseIntoBig(w: *Io.Writer, gpa: std.mem.Allocator, io: Io) !void {
+    const Rec = struct {
+        id: u64,
+        name: []const u8,
+        active: bool,
+        score: f64,
+        tags: []const []const u8,
+    };
+    const Doc = struct { record: []const Rec };
+
+    var buf: Io.Writer.Allocating = .init(gpa);
+    defer buf.deinit();
+    for (0..30_000) |i| {
+        try buf.writer.print(
+            "[[record]]\nid = {d}\nname = \"record-{d}-with-some-name\"\nactive = {}\nscore = {d}.5\ntags = [\"alpha\", \"beta-{d}\"]\n",
+            .{ i, i, i % 2 == 0, i % 100, i % 97 },
+        );
+    }
+    const src = buf.written();
+
+    const samples = try gpa.alloc(u64, 11);
+    defer gpa.free(samples);
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+
+    // One untimed warmup pass.
+    {
+        _ = arena.reset(.retain_capacity);
+        const doc = try toml.parseInto(Doc, arena.allocator(), src, .{});
+        std.mem.doNotOptimizeAway(&doc);
+    }
+    for (samples) |*s| {
+        _ = arena.reset(.retain_capacity);
+        const t0 = Io.Clock.Timestamp.now(io, .awake);
+        const doc = try toml.parseInto(Doc, arena.allocator(), src, .{});
+        s.* = @intCast(@max(t0.untilNow(io).raw.toNanoseconds(), 0));
+        std.mem.doNotOptimizeAway(&doc);
+    }
+
+    const stats = computeStats(samples, 1);
+    try w.print(
+        "\n== parseInto (typed big)  (30000 [[record]] elements, {d} bytes) ==\n",
+        .{src.len},
+    );
+    try w.print(
+        "  typed    min {d:>9} ns  p50 {d:>9} ns  p99 {d:>9} ns  max {d:>9} ns  stddev {d:>7.0} ns  ({d:>6.1} MB/s)\n",
+        .{
+            stats.min_per_op,
+            stats.p50_per_op,
+            stats.p99_per_op,
+            stats.max_per_op,
+            stats.stddev,
+            mbPerSec(src.len, stats.p50_per_op),
+        },
+    );
 }
 
 fn printHeader(w: *Io.Writer) !void {
