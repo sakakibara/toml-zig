@@ -227,6 +227,23 @@ pub fn decodeKeyPath(arena: Allocator, raw: []const u8) Error![]const u8 {
     return out.items;
 }
 
+/// Append one DECODED key segment to a duplicate-detection key, escaping so
+/// a literal '.' inside a quoted segment is never confused with the '.' that
+/// separates path segments. A backslash (which a literal-string key like
+/// `'a\b'` decodes to) is escaped too, keeping the encoding reversible.
+///
+/// The seen-sets are keyed on this encoding, so the sequence of decoded
+/// segments  -  not a lossy '.'-join  -  is what a lookup compares. Thus
+/// `[a."b.c"]` (segments `a`, `b.c` -> `a.b\.c`) is DISTINCT from `[a.b.c]`
+/// (segments `a`, `b`, `c` -> `a.b.c`), while `[a."b"]` and `[a.b]` still
+/// collide (both decode segment `b` -> `a.b`).
+fn appendSeenSegment(arena: Allocator, out: *ArrayList(u8), segment: []const u8) Error!void {
+    for (segment) |ch| {
+        if (ch == '\\' or ch == '.') try out.append(arena, '\\');
+        try out.append(arena, ch);
+    }
+}
+
 /// Whole-file duplicate-detection bookkeeping, holding only PATH NAMES
 /// (void-valued sets), never values. Shared across statement-units so
 /// cross-unit uniqueness survives even when each unit's VALUES are
@@ -368,8 +385,14 @@ const Parser = struct {
     /// `[header]` / `[[array-of-tables]]`.
     current: *StringArrayHashMap(Value) = undefined,
     /// Dotted path prefix that identifies `current` (empty at root).
-    /// Used to build full keys during kv dotted-descent.
+    /// Used to build full keys during kv dotted-descent. Plain '.'-join,
+    /// human-facing: it seeds `current_path` (span keys) and error text.
     current_prefix: ArrayList(u8) = .empty,
+    /// Escaped mirror of `current_prefix` (see `appendSeenSegment`), used to
+    /// seed the seen-set keys a kv records. Split from `current_prefix` so
+    /// span keys / streaming header paths stay a plain '.'-join while the
+    /// duplicate-detection sets distinguish quoted-dotted segments.
+    current_seen_prefix: ArrayList(u8) = .empty,
 
     /// Decoded dotted header path of the most recent `[header]` /
     /// `[[header]]` (without the synthetic `[N]` array index), or empty
@@ -736,21 +759,30 @@ const Parser = struct {
         // scope  -  headers never share dotted-created tables.
         self.seen.clearHeaderScope();
 
-        // Navigate / create intermediate tables.
+        // Navigate / create intermediate tables. Two key builders run in
+        // lockstep: `full_key` is the plain '.'-join (error text +
+        // `last_header_path` / streaming header path), while `seen_key` is the
+        // escaped encoding (`appendSeenSegment`) that keys every seen-set, so
+        // a quoted segment containing a '.' stays distinct from a dotted path.
         var table = self.root;
         var full_key: ArrayList(u8) = .empty;
         defer full_key.deinit(self.arena);
+        var seen_key: ArrayList(u8) = .empty;
+        defer seen_key.deinit(self.arena);
 
-        // Same path as `full_key` but with each traversed array-of-tables
-        // segment resolved to its CURRENT element index (`name[N]`), matching
-        // the `current_prefix` convention `parseKeyValue` uses to key
-        // `scalar_leaves`. Non-table leaves live inside a specific AOT element,
-        // so this is the path that lets the verdict reject a same-element
-        // conflict while letting a later element's `[w.a]` (which targets a
-        // fresh element with no such leaf) through. Used ONLY for
-        // `scalar_leaves` lookups; the other seen-sets stay index-free.
+        // Same paths as `full_key` / `seen_key` but with each traversed
+        // array-of-tables segment resolved to its CURRENT element index
+        // (`name[N]`), matching the `current_prefix` / `current_seen_prefix`
+        // convention `parseKeyValue` uses to key `scalar_leaves`. Non-table
+        // leaves live inside a specific AOT element, so this lets the verdict
+        // reject a same-element conflict while letting a later element's `[w.a]`
+        // (which targets a fresh element with no such leaf) through.
+        // `indexed_key` is plain (seeds `current_prefix` / span keys);
+        // `indexed_seen_key` is escaped (`scalar_leaves` lookups).
         var indexed_key: ArrayList(u8) = .empty;
         defer indexed_key.deinit(self.arena);
+        var indexed_seen_key: ArrayList(u8) = .empty;
+        defer indexed_seen_key.deinit(self.arena);
 
         for (key_parts.items, 0..) |part, i| {
             // Bound header nesting by max_depth: a long dotted header
@@ -762,14 +794,20 @@ const Parser = struct {
             if (i > 0) try full_key.append(self.arena, '.');
             try full_key.appendSlice(self.arena, part);
 
+            if (seen_key.items.len > 0) try seen_key.append(self.arena, '.');
+            try appendSeenSegment(self.arena, &seen_key, part);
+
             if (indexed_key.items.len > 0) try indexed_key.append(self.arena, '.');
             try indexed_key.appendSlice(self.arena, part);
+
+            if (indexed_seen_key.items.len > 0) try indexed_seen_key.append(self.arena, '.');
+            try appendSeenSegment(self.arena, &indexed_seen_key, part);
 
             const last = i == key_parts.items.len - 1;
             // Duped into the seen-arena: it is stored into seen-sets
             // (implicit/defined/array) and used as their lookup key, so it
             // must outlive the per-unit value arena in the streaming path.
-            const key_owned = try self.seen_arena.dupe(u8, full_key.items);
+            const key_owned = try self.seen_arena.dupe(u8, seen_key.items);
 
             // Inline-defined paths are sealed  -  never re-openable via
             // `[header]` (even for intermediates, you can't traverse
@@ -791,7 +829,7 @@ const Parser = struct {
                 try self.last_header_path.appendSlice(self.arena, full_key.items);
                 self.last_header_was_array = is_array;
                 if (is_array) {
-                    try self.openArrayOfTables(table, part, key_owned, indexed_key.items);
+                    try self.openArrayOfTables(table, part, key_owned, indexed_seen_key.items, full_key.items);
                     // current becomes the newly appended table element
                     const gop = table.getPtr(part).?; // array entry
                     const last_elem = &gop.array.items[gop.array.items.len - 1];
@@ -810,11 +848,16 @@ const Parser = struct {
                     self.current_prefix.clearRetainingCapacity();
                     try self.current_prefix.appendSlice(self.arena, indexed_key.items);
                     try self.current_prefix.print(self.arena, "[{d}]", .{idx});
+                    self.current_seen_prefix.clearRetainingCapacity();
+                    try self.current_seen_prefix.appendSlice(self.arena, indexed_seen_key.items);
+                    try self.current_seen_prefix.print(self.arena, "[{d}]", .{idx});
                 } else {
-                    try self.openTable(table, part, key_owned, indexed_key.items);
+                    try self.openTable(table, part, key_owned, indexed_seen_key.items, full_key.items);
                     self.current = &table.getPtr(part).?.table;
                     self.current_prefix.clearRetainingCapacity();
                     try self.current_prefix.appendSlice(self.arena, indexed_key.items);
+                    self.current_seen_prefix.clearRetainingCapacity();
+                    try self.current_seen_prefix.appendSlice(self.arena, indexed_seen_key.items);
                 }
             } else {
                 // Intermediate  -  walk or create, but forbid traversing
@@ -827,7 +870,7 @@ const Parser = struct {
                 // tree-walk below, which reports a static array
                 // ("cannot redefine array ...") differently from a scalar
                 // ("... is not a table").
-                if (self.seen.scalar_leaves.get(indexed_key.items)) |kind| {
+                if (self.seen.scalar_leaves.get(indexed_seen_key.items)) |kind| {
                     return switch (kind) {
                         .static_array => self.setErrorFmt("cannot redefine array '{s}' as table", .{full_key.items}),
                         .scalar => self.setErrorFmt("key '{s}' is not a table", .{full_key.items}),
@@ -835,12 +878,15 @@ const Parser = struct {
                 }
                 // An array-of-tables intermediate resolves to its CURRENT
                 // element (per `aot_lengths`, which is sound even when the live
-                // slot is absent in the streaming path). Qualify `indexed_key`
-                // with that element's index so deeper `scalar_leaves` lookups
-                // address the element the leaf was recorded under.
+                // slot is absent in the streaming path). Qualify both indexed
+                // keys with that element's index so deeper `scalar_leaves`
+                // lookups address the element the leaf was recorded under.
                 if (self.seen.array_tables.contains(key_owned)) {
                     const count = self.seen.aot_lengths.get(key_owned) orelse 0;
-                    if (count > 0) try indexed_key.print(self.arena, "[{d}]", .{count - 1});
+                    if (count > 0) {
+                        try indexed_key.print(self.arena, "[{d}]", .{count - 1});
+                        try indexed_seen_key.print(self.arena, "[{d}]", .{count - 1});
+                    }
                 }
                 if (table.getPtr(part)) |existing| {
                     switch (existing.*) {
@@ -865,80 +911,81 @@ const Parser = struct {
         }
     }
 
-    /// `full_key` is the index-free header path used to key the table-shaped
-    /// seen-sets. `leaf_key` is the same path with traversed array-of-tables
-    /// segments resolved to their current element index (`name[N].rest`); it
-    /// addresses `scalar_leaves`, whose non-table leaves were recorded under
-    /// that element-qualified form by `parseKeyValue`.
-    fn openTable(self: *Parser, parent: *StringArrayHashMap(Value), key: []const u8, full_key: []const u8, leaf_key: []const u8) Error!void {
-        if (self.seen.inline_tables.contains(full_key)) {
-            return self.setErrorFmt("cannot redefine inline table '{s}'", .{full_key});
+    /// `seen_key` is the escaped index-free header path used to key the
+    /// table-shaped seen-sets (see `appendSeenSegment`). `leaf_key` is the
+    /// escaped path with traversed array-of-tables segments resolved to their
+    /// current element index (`name[N].rest`); it addresses `scalar_leaves`,
+    /// whose non-table leaves were recorded under that element-qualified form
+    /// by `parseKeyValue`. `display` is the plain '.'-join for error text.
+    fn openTable(self: *Parser, parent: *StringArrayHashMap(Value), key: []const u8, seen_key: []const u8, leaf_key: []const u8, display: []const u8) Error!void {
+        if (self.seen.inline_tables.contains(seen_key)) {
+            return self.setErrorFmt("cannot redefine inline table '{s}'", .{display});
         }
         // Seen-sets are authoritative for the redefinition / type-conflict
         // verdict, so the decision holds even when the live tree slot is
         // absent (the streaming path frames units against a fresh per-unit
         // root). In the buffered path the tree and seen-sets always agree, so
         // these early checks reproduce the previous behavior exactly.
-        if (self.seen.defined_tables.contains(full_key)) {
-            return self.setErrorFmt("table '{s}' redefined", .{full_key});
+        if (self.seen.defined_tables.contains(seen_key)) {
+            return self.setErrorFmt("table '{s}' redefined", .{display});
         }
-        if (self.seen.array_tables.contains(full_key)) {
-            return self.setErrorFmt("key '{s}' already defined with different type", .{full_key});
+        if (self.seen.array_tables.contains(seen_key)) {
+            return self.setErrorFmt("key '{s}' already defined with different type", .{display});
         }
         // A scalar / static-array leaf at this path is a type conflict.
         // The seen-set catches it even when the value tree was discarded
         // (streaming), matching the buffered tree-walk's `else` branch below.
         if (self.seen.scalar_leaves.contains(leaf_key)) {
-            return self.setErrorFmt("key '{s}' already defined with different type", .{full_key});
+            return self.setErrorFmt("key '{s}' already defined with different type", .{display});
         }
         if (parent.getPtr(key)) |existing| {
             switch (existing.*) {
                 .table => {
-                    _ = self.seen.implicit_tables.remove(full_key);
-                    try self.seen.defined_tables.put(self.seen_arena, full_key, {});
+                    _ = self.seen.implicit_tables.remove(seen_key);
+                    try self.seen.defined_tables.put(self.seen_arena, seen_key, {});
                     return;
                 },
-                else => return self.setErrorFmt("key '{s}' already defined with different type", .{full_key}),
+                else => return self.setErrorFmt("key '{s}' already defined with different type", .{display}),
             }
         }
         // Zero-copy: `key` is a slice into self.input.
         try parent.put(self.arena, key, .{ .table = .empty });
-        _ = self.seen.implicit_tables.remove(full_key);
-        try self.seen.defined_tables.put(self.seen_arena, full_key, {});
+        _ = self.seen.implicit_tables.remove(seen_key);
+        try self.seen.defined_tables.put(self.seen_arena, seen_key, {});
     }
 
-    /// See `openTable` for the `full_key` / `leaf_key` split.
-    fn openArrayOfTables(self: *Parser, parent: *StringArrayHashMap(Value), key: []const u8, full_key: []const u8, leaf_key: []const u8) Error!void {
+    /// See `openTable` for the `seen_key` / `leaf_key` / `display` split.
+    fn openArrayOfTables(self: *Parser, parent: *StringArrayHashMap(Value), key: []const u8, seen_key: []const u8, leaf_key: []const u8, display: []const u8) Error!void {
         // Seen-sets are authoritative for the type-conflict verdict (see
         // `openTable`). A path previously defined as a `[table]`, an inline
         // table, or a dotted-key table cannot be reopened as `[[array]]`.
-        if (self.seen.defined_tables.contains(full_key) or
-            self.seen.inline_tables.contains(full_key) or
-            self.seen.dotted_created.contains(full_key))
+        if (self.seen.defined_tables.contains(seen_key) or
+            self.seen.inline_tables.contains(seen_key) or
+            self.seen.dotted_created.contains(seen_key))
         {
-            return self.setErrorFmt("key '{s}' already defined", .{full_key});
+            return self.setErrorFmt("key '{s}' already defined", .{display});
         }
         // A non-table leaf at this path blocks `[[aot]]`. The message
         // mirrors the buffered tree-walk below: a static array reports
         // "cannot append to static array", a scalar "already defined".
         if (self.seen.scalar_leaves.get(leaf_key)) |kind| {
             return switch (kind) {
-                .static_array => self.setErrorFmt("cannot append to static array '{s}'", .{full_key}),
-                .scalar => self.setErrorFmt("key '{s}' already defined", .{full_key}),
+                .static_array => self.setErrorFmt("cannot append to static array '{s}'", .{display}),
+                .scalar => self.setErrorFmt("key '{s}' already defined", .{display}),
             };
         }
         if (parent.getPtr(key)) |existing| {
             switch (existing.*) {
                 .array => {
-                    if (!self.seen.array_tables.contains(full_key)) {
-                        return self.setErrorFmt("cannot append to static array '{s}'", .{full_key});
+                    if (!self.seen.array_tables.contains(seen_key)) {
+                        return self.setErrorFmt("cannot append to static array '{s}'", .{display});
                     }
                     try existing.array.append(self.arena, .{ .table = .empty });
-                    try self.bumpAotLength(full_key);
-                    try self.resetAotSubPaths(full_key);
+                    try self.bumpAotLength(seen_key);
+                    try self.resetAotSubPaths(seen_key);
                     return;
                 },
-                else => return self.setErrorFmt("key '{s}' already defined", .{full_key}),
+                else => return self.setErrorFmt("key '{s}' already defined", .{display}),
             }
         }
         // Slot absent. In the buffered path this is a first definition; in the
@@ -950,21 +997,22 @@ const Parser = struct {
         var arr: ArrayList(Value) = .empty;
         try arr.append(self.arena, .{ .table = .empty });
         try parent.put(self.arena, key, .{ .array = arr });
-        try self.seen.array_tables.put(self.seen_arena, full_key, {});
-        try self.bumpAotLength(full_key);
+        try self.seen.array_tables.put(self.seen_arena, seen_key, {});
+        try self.bumpAotLength(seen_key);
         // The buffered path reaches here only on a first definition (no
         // sub-paths yet), but the streaming path frames each `[[base]]`
         // against a fresh per-unit root, so an "absent slot" may actually be
         // an append to an array from an earlier unit whose element left
         // sub-path bookkeeping behind. Reset it here too so both paths agree.
-        try self.resetAotSubPaths(full_key);
+        try self.resetAotSubPaths(seen_key);
     }
 
-    /// Record one more element for the array-of-tables at the index-free path
-    /// `full_key`. `full_key` is already seen-arena-owned (it is the lookup key
-    /// the other AOT sets store), so it can key `aot_lengths` directly.
-    fn bumpAotLength(self: *Parser, full_key: []const u8) Error!void {
-        const gop = try self.seen.aot_lengths.getOrPut(self.seen_arena, full_key);
+    /// Record one more element for the array-of-tables at the escaped
+    /// index-free path `seen_key`. `seen_key` is already seen-arena-owned (it
+    /// is the lookup key the other AOT sets store), so it can key
+    /// `aot_lengths` directly.
+    fn bumpAotLength(self: *Parser, seen_key: []const u8) Error!void {
+        const gop = try self.seen.aot_lengths.getOrPut(self.seen_arena, seen_key);
         if (!gop.found_existing) gop.value_ptr.* = 0;
         gop.value_ptr.* += 1;
     }
@@ -973,12 +1021,15 @@ const Parser = struct {
     /// element's sub-structure fresh: a `[base.sub]` / `[[base.sub]]` under
     /// the new element is a DISTINCT table from the same-named one under the
     /// prior element, not a redefinition. The table-shaped seen-sets key
-    /// sub-tables by their index-free path (`base.sub`), so an entry left by
-    /// a prior element would wrongly flag the new one as a redefinition.
-    /// Drop every entry under `base.` from those index-free sets. The
-    /// value-leaf sets (`scalar_leaves`, and kv-created `inline_tables` /
-    /// `dotted_created`) are keyed via the element-qualified `current_prefix`
-    /// (`base[N].rest`), so they are already element-scoped and untouched.
+    /// sub-tables by their escaped index-free path (`base.sub`), so an entry
+    /// left by a prior element would wrongly flag the new one as a
+    /// redefinition. Drop every entry under `base.` from those index-free
+    /// sets. `base` is the escaped encoding, so the `base.` prefix match
+    /// stops at a true segment boundary and never matches an escaped '.'
+    /// inside a quoted segment. The value-leaf sets (`scalar_leaves`, and
+    /// kv-created `inline_tables` / `dotted_created`) are keyed via the
+    /// element-qualified `current_seen_prefix` (`base[N].rest`), so they are
+    /// already element-scoped and untouched.
     fn resetAotSubPaths(self: *Parser, base: []const u8) Error!void {
         const prefix = try std.fmt.allocPrint(self.arena, "{s}.", .{base});
         inline for (.{
@@ -1011,11 +1062,16 @@ const Parser = struct {
         if (!self.match('=')) return self.setError("expected '=' after key");
         self.skipWs();
 
-        // Build the full key prefix so we can check against closed-set
-        // rules. The prefix is `current_prefix` + parts joined by '.'.
+        // Build the full key prefix so we can check against closed-set rules.
+        // Two builders run in lockstep: `full_key` is the plain '.'-join
+        // (span keys + error text), `seen_key` the escaped encoding that keys
+        // the seen-sets so quoted-dotted segments stay distinct.
         var full_key: ArrayList(u8) = .empty;
         defer full_key.deinit(self.arena);
         try full_key.appendSlice(self.arena, self.current_prefix.items);
+        var seen_key: ArrayList(u8) = .empty;
+        defer seen_key.deinit(self.arena);
+        try seen_key.appendSlice(self.arena, self.current_seen_prefix.items);
 
         // Descend intermediate tables for dotted keys. Bound the descent by
         // max_depth: without this, a long dotted key (`a.a.a...=1`) builds an
@@ -1030,28 +1086,30 @@ const Parser = struct {
             // in TOML (e.g. `""."x" = 1`) and would otherwise collapse.
             if (self.current_prefix.items.len > 0 or i > 0) try full_key.append(self.arena, '.');
             try full_key.appendSlice(self.arena, part);
+            if (self.current_seen_prefix.items.len > 0 or i > 0) try seen_key.append(self.arena, '.');
+            try appendSeenSegment(self.arena, &seen_key, part);
             // Duped into the seen-arena: stored into dotted_created /
             // dotted_current and used as their lookup key, so it must
             // outlive the per-unit value arena in the streaming path.
-            const fk = try self.seen_arena.dupe(u8, full_key.items);
+            const fk = try self.seen_arena.dupe(u8, seen_key.items);
 
             // Inline/header-defined/other-header-dotted-created tables
             // cannot be extended via dotted-key descent.
             if (self.seen.inline_tables.contains(fk)) {
-                return self.setErrorFmt("cannot extend inline table '{s}'", .{fk});
+                return self.setErrorFmt("cannot extend inline table '{s}'", .{full_key.items});
             }
             if (self.seen.defined_tables.contains(fk)) {
-                return self.setErrorFmt("cannot extend header-defined table '{s}'", .{fk});
+                return self.setErrorFmt("cannot extend header-defined table '{s}'", .{full_key.items});
             }
             if (self.seen.dotted_created.contains(fk) and !self.seen.dotted_current.contains(fk)) {
-                return self.setErrorFmt("cannot extend dotted-key-created table '{s}' from a different scope", .{fk});
+                return self.setErrorFmt("cannot extend dotted-key-created table '{s}' from a different scope", .{full_key.items});
             }
             // A scalar / static-array leaf at this intermediate path is a
             // conflict: the seen-set catches it even when the value tree was
             // discarded (streaming), matching the buffered tree-walk's `else`
             // branch below.
             if (self.seen.scalar_leaves.contains(fk)) {
-                return self.setErrorFmt("key '{s}' is not a table", .{fk});
+                return self.setErrorFmt("key '{s}' is not a table", .{full_key.items});
             }
 
             if (t.getPtr(part)) |existing| {
@@ -1059,7 +1117,7 @@ const Parser = struct {
                     .table => {
                         t = &existing.table;
                     },
-                    else => return self.setErrorFmt("key '{s}' is not a table", .{fk}),
+                    else => return self.setErrorFmt("key '{s}' is not a table", .{full_key.items}),
                 }
             } else {
                 // Zero-copy: `part` is a slice into self.input.
@@ -1075,6 +1133,9 @@ const Parser = struct {
         if (self.current_prefix.items.len > 0 or parts.items.len > 1) try full_key.append(self.arena, '.');
         try full_key.appendSlice(self.arena, last);
         const fk_final = try self.arena.dupe(u8, full_key.items);
+        if (self.current_seen_prefix.items.len > 0 or parts.items.len > 1) try seen_key.append(self.arena, '.');
+        try appendSeenSegment(self.arena, &seen_key, last);
+        const seen_final = try self.arena.dupe(u8, seen_key.items);
 
         if (t.contains(last)) {
             return self.setErrorFmt("duplicate key '{s}'", .{last});
@@ -1104,11 +1165,11 @@ const Parser = struct {
         switch (value) {
             .table => {},
             .array => {
-                const owned = try self.seen_arena.dupe(u8, fk_final);
+                const owned = try self.seen_arena.dupe(u8, seen_final);
                 try self.seen.scalar_leaves.put(self.seen_arena, owned, .static_array);
             },
             else => {
-                const owned = try self.seen_arena.dupe(u8, fk_final);
+                const owned = try self.seen_arena.dupe(u8, seen_final);
                 try self.seen.scalar_leaves.put(self.seen_arena, owned, .scalar);
             },
         }
@@ -1116,12 +1177,15 @@ const Parser = struct {
         // If value is an inline table or an array containing inline
         // tables, seal the affected paths so they can't be reopened
         // or extended.
-        try self.sealInlineValue(fk_final, value);
+        try self.sealInlineValue(seen_final, value);
     }
 
-    /// Recursively mark `full_key` (and, if the value is a table or array
-    /// of tables, its children) as inline-defined.
-    fn sealInlineValue(self: *Parser, full_key: []const u8, value: Value) Error!void {
+    /// Recursively mark `seen_key` (and, if the value is a table or array
+    /// of tables, its children) as inline-defined. `seen_key` is the escaped
+    /// encoding (`appendSeenSegment`) the seen-sets index on; child segments
+    /// are appended with the same escaping so a child key containing a '.'
+    /// keys distinctly from a dotted sub-path.
+    fn sealInlineValue(self: *Parser, seen_key: []const u8, value: Value) Error!void {
         // Only inline-table values (and their sub-tables) need sealing.
         // Scalars and inline arrays don't introduce header-extendable
         // table paths, so we save the HashMap insert in the hot path.
@@ -1129,15 +1193,19 @@ const Parser = struct {
             .table => |t| {
                 // The key is duped into the seen-arena: it is stored into
                 // inline_tables (a seen-set), so it must outlive the
-                // per-unit value arena in the streaming path. `full_key`
+                // per-unit value arena in the streaming path. `seen_key`
                 // may be a per-unit-arena slice (from `parseKeyValue`), so
                 // re-dupe rather than store it directly.
-                const owned = try self.seen_arena.dupe(u8, full_key);
+                const owned = try self.seen_arena.dupe(u8, seen_key);
                 try self.seen.inline_tables.put(self.seen_arena, owned, {});
                 var it = t.iterator();
                 while (it.next()) |entry| {
-                    const sub = try std.fmt.allocPrint(self.arena, "{s}.{s}", .{ full_key, entry.key_ptr.* });
-                    try self.sealInlineValue(sub, entry.value_ptr.*);
+                    var sub: ArrayList(u8) = .empty;
+                    defer sub.deinit(self.arena);
+                    try sub.appendSlice(self.arena, seen_key);
+                    try sub.append(self.arena, '.');
+                    try appendSeenSegment(self.arena, &sub, entry.key_ptr.*);
+                    try self.sealInlineValue(sub.items, entry.value_ptr.*);
                 }
             },
             else => {},

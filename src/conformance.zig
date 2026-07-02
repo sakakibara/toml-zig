@@ -1884,3 +1884,88 @@ test "pos: negative float near zero" {
     defer p.deinit();
     try testing.expect(p.get("x").?.float < 0);
 }
+
+// ----- quoted vs dotted table-header key segments (segment-aware bookkeeping) -----
+
+test "table: quoted dotted segment is distinct from dotted path" {
+    // `[a."b.c"]` is table a with a child whose single key is "b.c"; it must
+    // NOT collide with the three-segment path `[a.b.c]`.
+    var p = try parseOk("[a.b.c]\n[a.\"b.c\"]\n");
+    defer p.deinit();
+    try testing.expect(getPath(p.value, &.{ "a", "b", "c" }).? == .table);
+    try testing.expect(getPath(p.value, &.{ "a", "b.c" }).? == .table);
+    // a has exactly two children: b and "b.c".
+    try testing.expectEqual(@as(usize, 2), getPath(p.value, &.{"a"}).?.table.count());
+}
+
+test "table: literal-quoted dotted segment is distinct from dotted path" {
+    var p = try parseOk("[a.b.c]\n[a.'b.c']\n");
+    defer p.deinit();
+    try testing.expect(getPath(p.value, &.{ "a", "b", "c" }).? == .table);
+    try testing.expect(getPath(p.value, &.{ "a", "b.c" }).? == .table);
+}
+
+test "table: quoted segment decoding to a bare key still redefines" {
+    // `"b"` decodes to segment b, same as bare b -> genuine redefinition.
+    try expectParseFails("[a.b]\n[a.\"b\"]\n");
+}
+
+test "table: quoted dotted segment defined twice is a redefinition" {
+    try expectParseFails("[a.\"b.c\"]\n[a.\"b.c\"]\n");
+}
+
+test "table: dotted path defined twice is still a redefinition" {
+    try expectParseFails("[a.b.c]\n[a.b.c]\n");
+}
+
+test "table: whitespace and quoted-mix header parses" {
+    var p = try parseOk("[ j . \"x\" . 'l' ]\nv = 1\n");
+    defer p.deinit();
+    try testing.expectEqual(@as(i64, 1), getPath(p.value, &.{ "j", "x", "l", "v" }).?.integer);
+}
+
+test "table: names-style mixed quoted/dotted/numeric headers parse distinctly" {
+    const src =
+        \\[a.b.c]
+        \\[a.'b.c']
+        \\[a.'d.e']
+        \\[a.' x ']
+        \\[ d.e ]
+        \\[ g . h . i ]
+        \\[ j . '?' . '?' ]
+        \\['l'.'q'.'r']
+        \\['p.q'.r]
+        \\
+    ;
+    var p = try parseOk(src);
+    defer p.deinit();
+    try testing.expect(getPath(p.value, &.{ "a", "b", "c" }).? == .table);
+    try testing.expect(getPath(p.value, &.{ "a", "b.c" }).? == .table);
+    try testing.expect(getPath(p.value, &.{ "a", "d.e" }).? == .table);
+    try testing.expect(getPath(p.value, &.{ "a", " x " }).? == .table);
+    try testing.expect(getPath(p.value, &.{ "d", "e" }).? == .table);
+    try testing.expect(getPath(p.value, &.{ "g", "h", "i" }).? == .table);
+    try testing.expect(getPath(p.value, &.{ "p.q", "r" }).? == .table);
+}
+
+test "table: aot scoping with quoted subtable parses across elements" {
+    // Two [[a]] elements, each with a distinct-key quoted subtable "b.c".
+    var p = try parseOk("[[a]]\n[a.\"b.c\"]\nx = 1\n[[a]]\n[a.\"b.c\"]\nx = 2\n");
+    defer p.deinit();
+    const arr = getPath(p.value, &.{"a"}).?.array.items;
+    try testing.expectEqual(@as(usize, 2), arr.len);
+    try testing.expectEqual(@as(i64, 1), getPath(arr[0], &.{ "b.c", "x" }).?.integer);
+    try testing.expectEqual(@as(i64, 2), getPath(arr[1], &.{ "b.c", "x" }).?.integer);
+}
+
+test "table: quoted subtable twice within one aot element is a redefinition" {
+    try expectParseFails("[[a]]\n[a.\"b.c\"]\n[a.\"b.c\"]\n");
+}
+
+test "table: dotted key-value with quoted dotted segment is distinct" {
+    var p = try parseOk("a.\"b.c\" = 1\na.b.c = 2\n");
+    defer p.deinit();
+    try testing.expectEqual(@as(i64, 1), getPath(p.value, &.{ "a", "b.c" }).?.integer);
+    try testing.expectEqual(@as(i64, 2), getPath(p.value, &.{ "a", "b", "c" }).?.integer);
+}
+
