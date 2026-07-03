@@ -3,7 +3,7 @@
 A complete TOML 1.1 implementation for Zig.
 
 - **100% spec compliance** - passes every test in the official [toml-lang/toml-test](https://github.com/toml-lang/toml-test) suite (decoder, encoder, and invalid) against TOML 1.1.0.
-- **Typed decoding** - `parseInto(Config, arena, src)` deserializes straight into your Zig struct via comptime reflection. No annotations, no codegen.
+- **Typed decoding** - `parseInto(Config, arena, src)` deserializes straight into your Zig struct via comptime reflection, in a single streaming pass with no intermediate value tree for most shapes. No annotations, no codegen.
 - **Lossless document model** - edit a TOML file in place; comments, formatting, ordering preserved. Add/remove/reorder sections, edit sub-keys inside inline tables.
 - **Byte-precise spans** - every value (top-level or deeply nested) carries an exact byte range and line/col, populated on demand.
 - **Streaming input** - parse from any `std.Io.Reader`. A separate token-stream API yields lex events for incremental tooling.

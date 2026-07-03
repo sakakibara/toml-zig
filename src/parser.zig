@@ -371,11 +371,12 @@ pub fn streamParseUnit(
 /// buffered and streaming paths), while decode.zig's typed sink dispatches
 /// statements straight into a target type. Every seen-set verdict runs
 /// identically under either sink; the sink only navigates and stores.
-const ValueSink = struct {
+pub const ValueSink = struct {
+    pub const is_value_sink = true;
     pub const TableRef = *StringArrayHashMap(Value);
 };
 
-fn ParserOf(comptime Sink: type) type {
+pub fn ParserOf(comptime Sink: type) type {
     return struct {
         const Self = @This();
 
@@ -430,6 +431,10 @@ fn ParserOf(comptime Sink: type) type {
     /// `arena` so non-streaming callers see no behavior change.
     seen_arena: Allocator = undefined,
 
+    /// Typed-sink instance (decode.zig's streaming typed decode). Unused
+    /// and never dereferenced under ValueSink.
+    sink: *Sink = undefined,
+
     /// Current array / inline-table nesting depth. Incremented on
     /// entering `parseArray` / `parseInlineTable`; exceeding `max_depth`
     /// bails with `error.NestingTooDeep` before recursing further, which
@@ -455,7 +460,7 @@ fn ParserOf(comptime Sink: type) type {
     /// Bare init. Leaves `root` / `seen` undefined; the caller must either
     /// drive `parseDocument` (which wires fresh local storage) or only use
     /// helpers that don't touch the value tree (e.g. `parseKeyPath`).
-    fn init(arena: Allocator, input: []const u8) Self {
+    pub fn init(arena: Allocator, input: []const u8) Self {
         return .{ .arena = arena, .input = input, .seen_arena = arena };
     }
 
@@ -531,7 +536,7 @@ fn ParserOf(comptime Sink: type) type {
     /// `parseDocument`, but does NOT own the value tree  -  the shared root
     /// is the result and persists across units. Recovery semantics match
     /// the buffered path.
-    fn parseStatements(self: *Self) Error!void {
+    pub fn parseStatements(self: *Self) Error!void {
         var had_error = false;
 
         while (true) {
@@ -842,10 +847,14 @@ fn ParserOf(comptime Sink: type) type {
                 self.last_header_was_array = is_array;
                 if (is_array) {
                     try self.openArrayOfTables(table, part, key_owned, indexed_seen_key.items, full_key.items);
-                    // current becomes the newly appended table element
-                    const gop = table.getPtr(part).?; // array entry
-                    const last_elem = &gop.array.items[gop.array.items.len - 1];
-                    self.current = &last_elem.table;
+                    if (comptime Sink.is_value_sink) {
+                        // current becomes the newly appended table element
+                        const gop = table.getPtr(part).?; // array entry
+                        const last_elem = &gop.array.items[gop.array.items.len - 1];
+                        self.current = &last_elem.table;
+                    } else {
+                        self.current = try self.sink.openAotAppend(table, part);
+                    }
                     // `current_prefix` keys the non-table leaves a kv records
                     // (`scalar_leaves`), so it must equal the path the verdict
                     // sites reconstruct: every array-of-tables segment (including
@@ -865,7 +874,11 @@ fn ParserOf(comptime Sink: type) type {
                     try self.current_seen_prefix.print(self.arena, "[{d}]", .{idx});
                 } else {
                     try self.openTable(table, part, key_owned, indexed_seen_key.items, full_key.items);
-                    self.current = &table.getPtr(part).?.table;
+                    if (comptime Sink.is_value_sink) {
+                        self.current = &table.getPtr(part).?.table;
+                    } else {
+                        self.current = try self.sink.openPlainTable(table, part);
+                    }
                     self.current_prefix.clearRetainingCapacity();
                     try self.current_prefix.appendSlice(self.arena, indexed_key.items);
                     self.current_seen_prefix.clearRetainingCapacity();
@@ -900,24 +913,38 @@ fn ParserOf(comptime Sink: type) type {
                         try indexed_seen_key.print(self.arena, "[{d}]", .{count - 1});
                     }
                 }
-                if (table.getPtr(part)) |existing| {
-                    switch (existing.*) {
-                        .table => table = &existing.table,
-                        .array => {
-                            if (!self.seen.array_tables.contains(key_owned)) {
-                                return self.setErrorFmt("cannot redefine array '{s}' as table", .{full_key.items});
-                            }
-                            const last_elem = &existing.array.items[existing.array.items.len - 1];
-                            table = &last_elem.table;
-                        },
-                        else => return self.setErrorFmt("key '{s}' is not a table", .{full_key.items}),
+                if (comptime Sink.is_value_sink) {
+                    if (table.getPtr(part)) |existing| {
+                        switch (existing.*) {
+                            .table => table = &existing.table,
+                            .array => {
+                                if (!self.seen.array_tables.contains(key_owned)) {
+                                    return self.setErrorFmt("cannot redefine array '{s}' as table", .{full_key.items});
+                                }
+                                const last_elem = &existing.array.items[existing.array.items.len - 1];
+                                table = &last_elem.table;
+                            },
+                            else => return self.setErrorFmt("key '{s}' is not a table", .{full_key.items}),
+                        }
+                    } else {
+                        // Create implicit intermediate table. `part` is a
+                        // zero-copy slice into self.input.
+                        try table.put(self.arena, part, .{ .table = .empty });
+                        try self.seen.implicit_tables.put(self.seen_arena, key_owned, {});
+                        table = &table.getPtr(part).?.table;
                     }
                 } else {
-                    // Create implicit intermediate table. `part` is a
-                    // zero-copy slice into self.input.
-                    try table.put(self.arena, part, .{ .table = .empty });
-                    try self.seen.implicit_tables.put(self.seen_arena, key_owned, {});
-                    table = &table.getPtr(part).?.table;
+                    // Seen-sets carry the verdicts (checked above); mirror
+                    // the buffered path's bookkeeping: a path not yet known
+                    // in any table-shaped set is a fresh implicit table.
+                    if (!self.seen.implicit_tables.contains(key_owned) and
+                        !self.seen.defined_tables.contains(key_owned) and
+                        !self.seen.array_tables.contains(key_owned) and
+                        !self.seen.dotted_created.contains(key_owned))
+                    {
+                        try self.seen.implicit_tables.put(self.seen_arena, key_owned, {});
+                    }
+                    table = try self.sink.childTable(table, part, true);
                 }
             }
         }
@@ -950,20 +977,28 @@ fn ParserOf(comptime Sink: type) type {
         if (self.seen.scalar_leaves.contains(leaf_key)) {
             return self.setErrorFmt("key '{s}' already defined with different type", .{display});
         }
-        if (parent.getPtr(key)) |existing| {
-            switch (existing.*) {
-                .table => {
-                    _ = self.seen.implicit_tables.remove(seen_key);
-                    try self.seen.defined_tables.put(self.seen_arena, seen_key, {});
-                    return;
-                },
-                else => return self.setErrorFmt("key '{s}' already defined with different type", .{display}),
+        if (comptime Sink.is_value_sink) {
+            if (parent.getPtr(key)) |existing| {
+                switch (existing.*) {
+                    .table => {
+                        _ = self.seen.implicit_tables.remove(seen_key);
+                        try self.seen.defined_tables.put(self.seen_arena, seen_key, {});
+                        return;
+                    },
+                    else => return self.setErrorFmt("key '{s}' already defined with different type", .{display}),
+                }
             }
+            // Zero-copy: `key` is a slice into self.input.
+            try parent.put(self.arena, key, .{ .table = .empty });
+            _ = self.seen.implicit_tables.remove(seen_key);
+            try self.seen.defined_tables.put(self.seen_arena, seen_key, {});
+        } else {
+            // Non-table conflicts were rejected by the seen checks above;
+            // the caller navigates the sink. Same net seen effect as both
+            // buffered branches.
+            _ = self.seen.implicit_tables.remove(seen_key);
+            try self.seen.defined_tables.put(self.seen_arena, seen_key, {});
         }
-        // Zero-copy: `key` is a slice into self.input.
-        try parent.put(self.arena, key, .{ .table = .empty });
-        _ = self.seen.implicit_tables.remove(seen_key);
-        try self.seen.defined_tables.put(self.seen_arena, seen_key, {});
     }
 
     /// See `openTable` for the `seen_key` / `leaf_key` / `display` split.
@@ -985,6 +1020,17 @@ fn ParserOf(comptime Sink: type) type {
                 .static_array => self.setErrorFmt("cannot append to static array '{s}'", .{display}),
                 .scalar => self.setErrorFmt("key '{s}' already defined", .{display}),
             };
+        }
+        if (comptime !Sink.is_value_sink) {
+            // An implicit table at this exact path blocks [[aot]]; the
+            // buffered path catches it via the live tree's else-branch.
+            if (self.seen.implicit_tables.contains(seen_key)) {
+                return self.setErrorFmt("key '{s}' already defined", .{display});
+            }
+            try self.seen.array_tables.put(self.seen_arena, seen_key, {});
+            try self.bumpAotLength(seen_key);
+            try self.resetAotSubPaths(seen_key);
+            return;
         }
         if (parent.getPtr(key)) |existing| {
             switch (existing.*) {
@@ -1124,19 +1170,34 @@ fn ParserOf(comptime Sink: type) type {
                 return self.setErrorFmt("key '{s}' is not a table", .{full_key.items});
             }
 
-            if (t.getPtr(part)) |existing| {
-                switch (existing.*) {
-                    .table => {
-                        t = &existing.table;
-                    },
-                    else => return self.setErrorFmt("key '{s}' is not a table", .{full_key.items}),
+            if (comptime Sink.is_value_sink) {
+                if (t.getPtr(part)) |existing| {
+                    switch (existing.*) {
+                        .table => {
+                            t = &existing.table;
+                        },
+                        else => return self.setErrorFmt("key '{s}' is not a table", .{full_key.items}),
+                    }
+                } else {
+                    // Zero-copy: `part` is a slice into self.input.
+                    try t.put(self.arena, part, .{ .table = .empty });
+                    t = &t.getPtr(part).?.table;
+                    try self.seen.dotted_created.put(self.seen_arena, fk, {});
+                    try self.seen.dotted_current.put(self.seen_arena, fk, {});
                 }
             } else {
-                // Zero-copy: `part` is a slice into self.input.
-                try t.put(self.arena, part, .{ .table = .empty });
-                t = &t.getPtr(part).?.table;
-                try self.seen.dotted_created.put(self.seen_arena, fk, {});
-                try self.seen.dotted_current.put(self.seen_arena, fk, {});
+                // Mirror the buffered bookkeeping: a path not yet known in
+                // any table-shaped set is a fresh dotted-created table.
+                // Dotted descent never traverses arrays-of-tables.
+                if (!self.seen.implicit_tables.contains(fk) and
+                    !self.seen.defined_tables.contains(fk) and
+                    !self.seen.array_tables.contains(fk) and
+                    !self.seen.dotted_created.contains(fk))
+                {
+                    try self.seen.dotted_created.put(self.seen_arena, fk, {});
+                    try self.seen.dotted_current.put(self.seen_arena, fk, {});
+                }
+                t = try self.sink.childTable(t, part, false);
             }
         }
 
@@ -1149,8 +1210,23 @@ fn ParserOf(comptime Sink: type) type {
         try appendSeenSegment(self.arena, &seen_key, last);
         const seen_final = try self.arena.dupe(u8, seen_key.items);
 
-        if (t.contains(last)) {
-            return self.setErrorFmt("duplicate key '{s}'", .{last});
+        if (comptime Sink.is_value_sink) {
+            if (t.contains(last)) {
+                return self.setErrorFmt("duplicate key '{s}'", .{last});
+            }
+        } else {
+            // The live-tree membership test, reconstructed from the
+            // seen-sets: any prior definition at this exact path (leaf,
+            // inline value, or any table shape) is a duplicate.
+            if (self.seen.scalar_leaves.contains(seen_final) or
+                self.seen.inline_tables.contains(seen_final) or
+                self.seen.dotted_created.contains(seen_final) or
+                self.seen.defined_tables.contains(seen_final) or
+                self.seen.array_tables.contains(seen_final) or
+                self.seen.implicit_tables.contains(seen_final))
+            {
+                return self.setErrorFmt("duplicate key '{s}'", .{last});
+            }
         }
 
         // Set the current path so parseValue records its span (and
@@ -1163,10 +1239,14 @@ fn ParserOf(comptime Sink: type) type {
         }
 
         const value = try self.parseValue();
-        // Zero-copy: `last` is a slice into self.input, which the caller
-        // guarantees outlives the parse tree (documented contract). The
-        // HashMap stores the slice header, not a copy of the bytes.
-        try t.put(self.arena, last, value);
+        if (comptime Sink.is_value_sink) {
+            // Zero-copy: `last` is a slice into self.input, which the caller
+            // guarantees outlives the parse tree (documented contract). The
+            // HashMap stores the slice header, not a copy of the bytes.
+            try t.put(self.arena, last, value);
+        } else {
+            try self.sink.putLeaf(t, last, value);
+        }
 
         // Record non-table leaves (scalars and static arrays) so a later
         // header / `[[aot]]` / dotted-key that traverses through or

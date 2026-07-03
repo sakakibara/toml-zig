@@ -6,6 +6,14 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Single-pass typed decode: `parseInto` dispatches parsed statements
+  straight into the target type (no intermediate `Value` tree) for types
+  without `Value` fields, `fromToml` hooks, tagged unions, optional
+  sub-tables, or nested arrays-of-tables; on any error it re-decodes
+  through the tree path so diagnostics are identical either way.
+
 ## [0.2.0] - 2026-06-21
 
 ### Added

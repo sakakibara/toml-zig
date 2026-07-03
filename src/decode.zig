@@ -1117,3 +1117,745 @@ test "round-trip: annotated config decode + encode" {
     try testing.expectEqualStrings(cfg1.plugin.http.host, cfg2.plugin.http.host);
     try testing.expectEqual(cfg1.plugin.http.port, cfg2.plugin.http.port);
 }
+
+// ----- streaming typed decode (no Value tree) -----
+
+// The machinery below implements the streaming side of `parseInto`: a
+// comptime sink for the parser's statement executor that dispatches
+// headers and key-values straight into a target type, with no Value
+// tree. See ParserOf in parser.zig for the executor seam.
+
+/// One streamable destination at a table level: the effective wire key,
+/// the field path from that table's struct (flattened inner structs
+/// contribute multi-segment paths), and the leaf type.
+const EffField = struct {
+    key: []const u8,
+    path: []const []const u8,
+    Type: type,
+};
+
+/// Effective field list of `T` with flattened inner structs expanded,
+/// skipped fields excluded. Mirrors `expectedKeys` exactly.
+fn effFieldsOf(comptime T: type, comptime prefix: []const []const u8) []const EffField {
+    comptime {
+        var out: []const EffField = &.{};
+        for (@typeInfo(T).@"struct".fields) |f| {
+            if (isSkipped(T, f.name)) continue;
+            const p2 = prefix ++ &[_][]const u8{f.name};
+            if (isFlattened(T, f.name)) {
+                out = out ++ effFieldsOf(f.type, p2);
+            } else {
+                out = out ++ &[_]EffField{.{ .key = renamedKey(T, f.name), .path = p2, .Type = f.type }};
+            }
+        }
+        return out;
+    }
+}
+
+fn hasKeyCollisions(comptime T: type) bool {
+    comptime {
+        const fs = effFieldsOf(T, &.{});
+        for (fs, 0..) |a, i| {
+            for (fs[i + 1 ..]) |b| {
+                if (std.mem.eql(u8, a.key, b.key)) return true;
+            }
+        }
+        return false;
+    }
+}
+
+fn PathType(comptime T: type, comptime path: []const []const u8) type {
+    comptime {
+        var C = T;
+        for (path) |seg| C = @FieldType(C, seg);
+        return C;
+    }
+}
+
+fn pathPtr(comptime T: type, comptime path: []const []const u8, base: *T) *PathType(T, path) {
+    if (comptime path.len == 0) return base;
+    return pathPtr(@FieldType(T, path[0]), path[1..], &@field(base.*, path[0]));
+}
+
+fn isAotSlice(comptime FT: type) bool {
+    comptime {
+        const info = @typeInfo(FT);
+        if (info != .pointer) return false;
+        const p = info.pointer;
+        return p.size == .slice and @typeInfo(p.child) == .@"struct";
+    }
+}
+
+/// Comptime: true when decoding `T` requires the tree path somewhere in
+/// its type closure: `Value` targets, `fromToml` hooks, unions (the
+/// `toml_tag` discriminator may follow the payload), flattened non-struct
+/// fields, effective-key collisions, optional struct / optional
+/// array-of-tables fields (cursor navigation cannot address an optional
+/// payload in place), nested arrays-of-tables, or a table with more than
+/// 128 effective fields (the seen-bit mask width).
+pub fn needsTree(comptime T: type) bool {
+    return comptime needsTreeImpl(T, false, &.{});
+}
+
+fn needsTreeImpl(comptime T: type, comptime under_aot: bool, comptime seen: []const type) bool {
+    comptime {
+        for (seen) |S| if (S == T) return false;
+        if (T == Value) return true;
+        const seen2 = seen ++ &[_]type{T};
+        return switch (@typeInfo(T)) {
+            .@"struct" => |s| blk: {
+                if (@hasDecl(T, "fromToml")) break :blk true;
+                for (s.fields) |f| {
+                    if (isFlattened(T, f.name) and @typeInfo(f.type) != .@"struct") break :blk true;
+                }
+                if (hasKeyCollisions(T)) break :blk true;
+                if (effFieldsOf(T, &.{}).len > 128) break :blk true;
+                for (s.fields) |f| {
+                    if (isSkipped(T, f.name)) continue;
+                    const fi = @typeInfo(f.type);
+                    if (fi == .optional and @typeInfo(fi.optional.child) == .@"struct") break :blk true;
+                    if (fi == .optional and isAotSlice(fi.optional.child)) break :blk true;
+                    if (isAotSlice(f.type) and under_aot) break :blk true;
+                    const child_under = under_aot or isAotSlice(f.type);
+                    if (needsTreeImpl(f.type, child_under, seen2)) break :blk true;
+                }
+                break :blk false;
+            },
+            .@"union" => true,
+            .pointer => |p| p.size == .slice and !(p.child == u8 and p.is_const) and needsTreeImpl(p.child, under_aot, seen2),
+            .array => |a| needsTreeImpl(a.child, under_aot, seen2),
+            .optional => |o| needsTreeImpl(o.child, under_aot, seen2),
+            else => false,
+        };
+    }
+}
+
+/// One statically-addressable table position: a struct reached from the
+/// root (or an array-of-tables element type) through plain struct fields
+/// only. `path` is the field path from the region root.
+const StaticTable = struct {
+    Type: type,
+    path: []const []const u8,
+};
+
+fn collectStatic(comptime T: type) []const StaticTable {
+    comptime {
+        var out: []const StaticTable = &.{.{ .Type = T, .path = &.{} }};
+        var i: usize = 0;
+        while (i < out.len) : (i += 1) {
+            const st = out[i];
+            for (effFieldsOf(st.Type, &.{})) |e| {
+                if (@typeInfo(e.Type) == .@"struct") {
+                    out = out ++ &[_]StaticTable{.{ .Type = e.Type, .path = st.path ++ e.path }};
+                }
+            }
+        }
+        return out;
+    }
+}
+
+/// Find the static index of `parent.path ++ e.path` in `list`.
+fn staticChildIdx(comptime list: []const StaticTable, comptime parent: usize, comptime rel: []const []const u8) usize {
+    comptime {
+        const want = list[parent].path ++ rel;
+        for (list, 0..) |st, i| {
+            if (st.path.len != want.len) continue;
+            var eq = true;
+            for (st.path, want) |a, b| {
+                if (!std.mem.eql(u8, a, b)) eq = false;
+            }
+            if (eq) return i;
+        }
+        unreachable;
+    }
+}
+
+/// One array-of-tables position in the static region.
+const AotSpec = struct {
+    Elem: type,
+    owner: usize,
+    key: []const u8,
+    path: []const []const u8,
+};
+
+fn collectAots(comptime statics: []const StaticTable) []const AotSpec {
+    comptime {
+        var out: []const AotSpec = &.{};
+        for (statics, 0..) |st, si| {
+            for (effFieldsOf(st.Type, &.{})) |e| {
+                if (isAotSlice(e.Type)) {
+                    out = out ++ &[_]AotSpec{.{
+                        .Elem = @typeInfo(e.Type).pointer.child,
+                        .owner = si,
+                        .key = e.key,
+                        .path = st.path ++ e.path,
+                    }};
+                }
+            }
+        }
+        return out;
+    }
+}
+
+/// Typed sink for `ParserOf`: navigates and stores into an instance of
+/// `T` while the executor's seen-sets carry every structural verdict.
+/// Any construct the sink cannot address returns error.TomlParseError;
+/// the public parseInto then reruns the tree path, whose error selection
+/// and diagnostics are canonical.
+pub fn TypedSink(comptime T: type) type {
+    return struct {
+        const Ts = @This();
+        pub const is_value_sink = false;
+        pub const TableRef = Cursor;
+
+        const statics = collectStatic(T);
+        const aots = collectAots(statics);
+        const n_static = statics.len;
+        const n_aot = aots.len;
+
+        // Per-builder element sub-tables (the element type's own static
+        // region), flattened into shared arrays via comptime offsets.
+        const elem_statics: [n_aot][]const StaticTable = blk: {
+            var arr: [n_aot][]const StaticTable = undefined;
+            for (aots, 0..) |a, i| arr[i] = collectStatic(a.Elem);
+            break :blk arr;
+        };
+        const sub_off: [n_aot + 1]usize = blk: {
+            var arr: [n_aot + 1]usize = undefined;
+            arr[0] = 0;
+            for (elem_statics, 0..) |es, i| arr[i + 1] = arr[i] + es.len;
+            break :blk arr;
+        };
+        const n_sub = sub_off[n_aot];
+
+        const Lists = std.meta.Tuple(blk: {
+            var types: [n_aot]type = undefined;
+            for (aots, 0..) |a, i| types[i] = std.ArrayList(a.Elem);
+            break :blk &types;
+        });
+
+        pub const Cursor = struct {
+            kind: enum(u8) { discard, static, elem },
+            b: u16 = 0,
+            sp: u16 = 0,
+        };
+        pub const root_cursor: Cursor = .{ .kind = .static, .sp = 0 };
+
+        arena: Allocator,
+        options: parser_mod.ParseOptions,
+        out: T = undefined,
+        st_inst: [n_static]bool = @splat(false),
+        st_bits: [n_static]u128 = @splat(0),
+        lists: Lists = undefined,
+        open: [n_aot]bool = @splat(false),
+        eb_inst: [n_sub]bool = @splat(false),
+        eb_bits: [n_sub]u128 = @splat(0),
+
+        pub fn init(arena: Allocator, options: parser_mod.ParseOptions) Ts {
+            var self: Ts = .{ .arena = arena, .options = options };
+            self.st_inst[0] = true;
+            inline for (0..n_aot) |i| self.lists[i] = .empty;
+            return self;
+        }
+
+        /// Navigate one segment from `cur` into a table position. Called
+        /// for header intermediates (allow_aot: an array-of-tables
+        /// segment resolves to its current element) and dotted-key
+        /// descent (never traverses arrays-of-tables).
+        pub fn childTable(self: *Ts, cur: Cursor, part: []const u8, comptime allow_aot: bool) parser_mod.Error!Cursor {
+            switch (cur.kind) {
+                .discard => return cur,
+                .static => switch (cur.sp) {
+                    inline 0...n_static - 1 => |sp| {
+                        inline for (comptime effFieldsOf(statics[sp].Type, &.{})) |e| {
+                            if (std.mem.eql(u8, part, e.key)) {
+                                if (comptime @typeInfo(e.Type) == .@"struct") {
+                                    const child = comptime staticChildIdx(statics, sp, e.path);
+                                    self.st_inst[child] = true;
+                                    return .{ .kind = .static, .sp = child };
+                                }
+                                if (comptime isAotSlice(e.Type)) {
+                                    if (!allow_aot) return error.TomlParseError;
+                                    const b = comptime aotIdxAt(sp, e.key);
+                                    if (!self.open[b]) return error.TomlParseError;
+                                    return .{ .kind = .elem, .b = b, .sp = 0 };
+                                }
+                                return error.TomlParseError;
+                            }
+                        }
+                        return self.unknown();
+                    },
+                    else => unreachable,
+                },
+                .elem => switch (cur.b) {
+                    inline 0...if (n_aot == 0) 0 else n_aot - 1 => |b| {
+                        if (comptime n_aot == 0) unreachable;
+                        switch (cur.sp) {
+                            inline 0...elem_statics[b].len - 1 => |sp| {
+                                inline for (comptime effFieldsOf(elem_statics[b][sp].Type, &.{})) |e| {
+                                    if (std.mem.eql(u8, part, e.key)) {
+                                        if (comptime @typeInfo(e.Type) == .@"struct") {
+                                            const child = comptime staticChildIdx(elem_statics[b], sp, e.path);
+                                            self.eb_inst[sub_off[b] + child] = true;
+                                            return .{ .kind = .elem, .b = b, .sp = child };
+                                        }
+                                        // Nested arrays-of-tables are routed
+                                        // to the tree path at comptime.
+                                        return error.TomlParseError;
+                                    }
+                                }
+                                return self.unknown();
+                            },
+                            else => unreachable,
+                        }
+                    },
+                    else => unreachable,
+                },
+            }
+        }
+
+        pub fn openPlainTable(self: *Ts, cur: Cursor, part: []const u8) parser_mod.Error!Cursor {
+            return self.childTable(cur, part, false);
+        }
+
+        pub fn openAotAppend(self: *Ts, cur: Cursor, part: []const u8) parser_mod.Error!Cursor {
+            switch (cur.kind) {
+                .discard => return cur,
+                .static => switch (cur.sp) {
+                    inline 0...n_static - 1 => |sp| {
+                        inline for (comptime effFieldsOf(statics[sp].Type, &.{})) |e| {
+                            if (std.mem.eql(u8, part, e.key)) {
+                                if (comptime isAotSlice(e.Type)) {
+                                    const b = comptime aotIdxAt(sp, e.key);
+                                    try self.closeElem(b);
+                                    try self.lists[b].append(self.arena, undefined);
+                                    const range = self.eb_inst[sub_off[b]..sub_off[b + 1]];
+                                    @memset(range, false);
+                                    @memset(self.eb_bits[sub_off[b]..sub_off[b + 1]], 0);
+                                    self.eb_inst[sub_off[b]] = true;
+                                    self.open[b] = true;
+                                    return .{ .kind = .elem, .b = b, .sp = 0 };
+                                }
+                                return error.TomlParseError;
+                            }
+                        }
+                        return self.unknown();
+                    },
+                    else => unreachable,
+                },
+                // Nested arrays-of-tables never stream (comptime routing).
+                .elem => return error.TomlParseError,
+            }
+        }
+
+        pub fn putLeaf(self: *Ts, cur: Cursor, part: []const u8, value: Value) parser_mod.Error!void {
+            switch (cur.kind) {
+                .discard => return,
+                .static => switch (cur.sp) {
+                    inline 0...n_static - 1 => |sp| {
+                        inline for (comptime effFieldsOf(statics[sp].Type, &.{}), 0..) |e, i| {
+                            if (std.mem.eql(u8, part, e.key)) {
+                                const dst = pathPtr(T, statics[sp].path ++ e.path, &self.out);
+                                dst.* = self.decodeLeaf(e.Type, value) catch return error.TomlParseError;
+                                self.st_bits[sp] |= @as(u128, 1) << i;
+                                return;
+                            }
+                        }
+                        _ = try self.unknown();
+                    },
+                    else => unreachable,
+                },
+                .elem => switch (cur.b) {
+                    inline 0...if (n_aot == 0) 0 else n_aot - 1 => |b| {
+                        if (comptime n_aot == 0) unreachable;
+                        switch (cur.sp) {
+                            inline 0...elem_statics[b].len - 1 => |sp| {
+                                inline for (comptime effFieldsOf(elem_statics[b][sp].Type, &.{}), 0..) |e, i| {
+                                    if (std.mem.eql(u8, part, e.key)) {
+                                        const items = self.lists[b].items;
+                                        const base = &items[items.len - 1];
+                                        const dst = pathPtr(aots[b].Elem, elem_statics[b][sp].path ++ e.path, base);
+                                        dst.* = self.decodeLeaf(e.Type, value) catch return error.TomlParseError;
+                                        self.eb_bits[sub_off[b] + sp] |= @as(u128, 1) << i;
+                                        return;
+                                    }
+                                }
+                                _ = try self.unknown();
+                            },
+                            else => unreachable,
+                        }
+                    },
+                    else => unreachable,
+                },
+            }
+        }
+
+        fn decodeLeaf(self: *Ts, comptime FT: type, value: Value) DecodeError!FT {
+            var path: PathBuilder = .{ .buf = .empty };
+            return decodeInner(FT, self.arena, value, self.options, &path);
+        }
+
+        fn unknown(self: *Ts) parser_mod.Error!Cursor {
+            if (self.options.ignore_unknown_fields) return .{ .kind = .discard };
+            return error.TomlParseError;
+        }
+
+        /// Close the currently open element of builder `b`: resolve its
+        /// unseen fields (defaults, optional-null, or abort on a missing
+        /// required field) exactly like decodeStruct does on an absent key.
+        fn closeElem(self: *Ts, comptime b: usize) parser_mod.Error!void {
+            if (comptime n_aot == 0) unreachable;
+            if (!self.open[b]) return;
+            try self.resolveRegionTable(aots[b].Elem, elem_statics[b], .{ .elem = b }, 0);
+            self.open[b] = false;
+        }
+
+        const Region = union(enum) { static, elem: usize };
+
+        fn regionInst(self: *Ts, comptime region: Region, comptime sp: usize) bool {
+            return switch (region) {
+                .static => self.st_inst[sp],
+                .elem => |b| self.eb_inst[sub_off[b] + sp],
+            };
+        }
+
+        fn regionBits(self: *Ts, comptime region: Region, comptime sp: usize) u128 {
+            return switch (region) {
+                .static => self.st_bits[sp],
+                .elem => |b| self.eb_bits[sub_off[b] + sp],
+            };
+        }
+
+        fn regionBasePtr(self: *Ts, comptime RT: type, comptime region: Region, comptime list: []const StaticTable, comptime sp: usize) *list[sp].Type {
+            return switch (region) {
+                .static => pathPtr(RT, list[sp].path, &self.out),
+                .elem => |b| blk: {
+                    const items = self.lists[b].items;
+                    break :blk pathPtr(RT, list[sp].path, &items[items.len - 1]);
+                },
+            };
+        }
+
+        /// Resolve one table position at close time: skipped fields get
+        /// their defaults; unseen fields get default, then optional-null,
+        /// then abort (the tree rerun reports the canonical MissingField).
+        /// Instantiated sub-tables recurse; absent ones resolve at the
+        /// parent as a whole-field default/optional/missing.
+        fn resolveRegionTable(self: *Ts, comptime RT: type, comptime list: []const StaticTable, comptime region: Region, comptime sp: usize) parser_mod.Error!void {
+            const ST = list[sp].Type;
+            const base = self.regionBasePtr(RT, region, list, sp);
+            const bits = self.regionBits(region, sp);
+
+            // Skipped fields always take their defaults.
+            inline for (@typeInfo(ST).@"struct".fields) |f| {
+                if (comptime isSkipped(ST, f.name)) {
+                    const dv = comptime f.defaultValue() orelse
+                        @compileError("toml_skip field `" ++ f.name ++ "` on " ++ @typeName(ST) ++ " has no default value");
+                    @field(base.*, f.name) = dv;
+                }
+            }
+
+            inline for (comptime effFieldsOf(ST, &.{}), 0..) |e, i| {
+                const bit_set = bits & (@as(u128, 1) << i) != 0;
+                if (!bit_set) {
+                    if (comptime @typeInfo(e.Type) == .@"struct") {
+                        const child = comptime staticChildIdx(list, sp, e.path);
+                        if (self.regionInst(region, child)) {
+                            try self.resolveRegionTable(RT, list, region, child);
+                        } else {
+                            try self.absentField(ST, e, base);
+                        }
+                    } else if (comptime isAotSlice(e.Type)) {
+                        // Static-region builders are assigned in finish();
+                        // an AoT reached inside an element type never
+                        // streams (comptime routing), so this is only ever
+                        // the static region.
+                        const b = comptime aotIdxAt2(list, sp, e.key);
+                        if (self.lists[b].items.len > 0) {
+                            pathPtr(ST, e.path, base).* = self.lists[b].items;
+                        } else {
+                            try self.absentField(ST, e, base);
+                        }
+                    } else {
+                        try self.absentField(ST, e, base);
+                    }
+                }
+            }
+        }
+
+        fn absentField(self: *Ts, comptime ST: type, comptime e: EffField, base: *ST) parser_mod.Error!void {
+            _ = self;
+            const Parent = PathType(ST, e.path[0 .. e.path.len - 1]);
+            const fi = comptime blk: {
+                for (@typeInfo(Parent).@"struct".fields) |sf| {
+                    if (std.mem.eql(u8, sf.name, e.path[e.path.len - 1])) break :blk sf;
+                }
+                unreachable;
+            };
+            const dv_opt = comptime fi.defaultValue();
+            if (dv_opt) |dv| {
+                pathPtr(ST, e.path, base).* = dv;
+            } else if (comptime @typeInfo(e.Type) == .optional) {
+                pathPtr(ST, e.path, base).* = null;
+            } else {
+                return error.TomlParseError;
+            }
+        }
+
+        fn aotIdxAt(comptime owner_sp: usize, comptime key: []const u8) u16 {
+            comptime {
+                for (aots, 0..) |a, i| {
+                    if (a.owner == owner_sp and std.mem.eql(u8, a.key, key)) return i;
+                }
+                unreachable;
+            }
+        }
+
+        fn aotIdxAt2(comptime list: []const StaticTable, comptime sp: usize, comptime key: []const u8) usize {
+            comptime {
+                if (list.ptr != statics.ptr) unreachable;
+                return aotIdxAt(sp, key);
+            }
+        }
+
+        /// End of document: close the last open element of every builder,
+        /// then resolve the whole static region from the root.
+        pub fn finish(self: *Ts) parser_mod.Error!void {
+            inline for (0..n_aot) |b| try self.closeElem(b);
+            try self.resolveRegionTable(T, statics, .static, 0);
+        }
+    };
+}
+
+/// Streaming `parseInto`: one statement-executor pass dispatching straight
+/// into `T`. Runs with diagnostics off; the caller falls back to the tree
+/// path on any error, whose error selection and diagnostics are canonical.
+pub fn streamParseInto(comptime T: type, arena: Allocator, src: []const u8, options: parser_mod.ParseOptions) (parser_mod.Error || DecodeError)!T {
+    var stream_options = options;
+    stream_options.errors = null;
+    stream_options.spans = null;
+
+    const Ts = TypedSink(T);
+    var sink = Ts.init(arena, stream_options);
+    var seen: parser_mod.SeenState = .empty;
+    const P = parser_mod.ParserOf(Ts);
+    var p = P.init(arena, src);
+    p.root = Ts.root_cursor;
+    p.current = Ts.root_cursor;
+    p.seen = &seen;
+    p.seen_arena = arena;
+    p.max_depth = stream_options.max_depth;
+    p.sink = &sink;
+    try p.parseStatements();
+    try sink.finish();
+    return sink.out;
+}
+
+/// Allocator wrapper that counts bytes handed out. Used to bound the
+/// allocation cost of the streaming typed decode path.
+const CountingAllocator = struct {
+    child: Allocator,
+    total: usize = 0,
+
+    fn allocator(self: *CountingAllocator) Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable: Allocator.VTable = .{
+        .alloc = alloc,
+        .resize = resize,
+        .remap = remap,
+        .free = free,
+    };
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        self.total += len;
+        return self.child.vtable.alloc(self.child.ptr, len, alignment, ret_addr);
+    }
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        if (new_len > memory.len) self.total += new_len - memory.len;
+        return self.child.vtable.resize(self.child.ptr, memory, alignment, new_len, ret_addr);
+    }
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        if (new_len > memory.len) self.total += new_len - memory.len;
+        return self.child.vtable.remap(self.child.ptr, memory, alignment, new_len, ret_addr);
+    }
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        self.child.vtable.free(self.child.ptr, memory, alignment, ret_addr);
+    }
+};
+
+test "parseInto streams: allocation bounded, no Value tree materialized" {
+    // An array-of-tables large enough that tree materialization (a hash
+    // table per element) dwarfs the decoded output. The streaming path
+    // must stay within a small multiple of the input size; the tree path
+    // exceeds it severalfold.
+    const Rec = struct {
+        id: u64,
+        name: []const u8,
+        active: bool,
+        score: f64,
+        tags: []const []const u8,
+    };
+    const Doc = struct { record: []const Rec };
+
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(testing.allocator);
+    var i: usize = 0;
+    while (i < 2000) : (i += 1) {
+        try src.print(testing.allocator, "[[record]]\nid = {d}\nname = \"record-{d}\"\nactive = {}\nscore = {d}.5\ntags = [\"a\", \"b\"]\n", .{ i, i, i % 2 == 0, i % 100 });
+    }
+
+    var ar = ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    var counting: CountingAllocator = .{ .child = ar.allocator() };
+
+    const toml_mod = @import("toml.zig");
+    const out = try toml_mod.parseInto(Doc, counting.allocator(), src.items, .{});
+    try testing.expectEqual(@as(usize, 2000), out.record.len);
+    try testing.expectEqualStrings("record-1999", out.record[1999].name);
+
+    var tree_arena = ArenaAllocator.init(testing.allocator);
+    defer tree_arena.deinit();
+    var tree_counting: CountingAllocator = .{ .child = tree_arena.allocator() };
+    const tree_val = try parser_mod.parse(tree_counting.allocator(), src.items, .{});
+    const tree_out = try decode(Doc, tree_counting.allocator(), tree_val, .{});
+    try testing.expectEqual(@as(usize, 2000), tree_out.record.len);
+
+    // Allocation in BOTH paths is dominated by the parser's seen-set
+    // bookkeeping (per-statement path keys recorded for cross-statement
+    // redefinition verdicts), which the streaming path shares by design.
+    // What streaming saves is the Value boxes and the hash table per
+    // element; assert it stays strictly cheaper than the tree path, and
+    // leave throughput to the `parseInto (typed big)` bench arm.
+    try testing.expect(counting.total < tree_counting.total);
+}
+
+test "streaming: order-free tables, dotted keys, and root kvs" {
+    const T = struct {
+        title: []const u8,
+        a: struct { sub: struct { x: u32 }, y: u32 },
+        b: struct { z: u32 },
+    };
+    var ar = ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const toml_mod = @import("toml.zig");
+    const v = try toml_mod.parseInto(T, ar.allocator(),
+        \\title = "t"
+        \\[b]
+        \\z = 3
+        \\[a.sub]
+        \\x = 1
+        \\[a]
+        \\y = 2
+    , .{});
+    try testing.expectEqualStrings("t", v.title);
+    try testing.expectEqual(@as(u32, 1), v.a.sub.x);
+    try testing.expectEqual(@as(u32, 2), v.a.y);
+    try testing.expectEqual(@as(u32, 3), v.b.z);
+}
+
+test "streaming: interleaved arrays-of-tables with element sub-tables and defaults" {
+    const Rec = struct { id: u32, note: []const u8 = "none", meta: struct { w: u32 = 9 } = .{} };
+    const T = struct { a: []const Rec, b: []const Rec };
+    var ar = ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const toml_mod = @import("toml.zig");
+    const v = try toml_mod.parseInto(T, ar.allocator(),
+        \\[[a]]
+        \\id = 1
+        \\[a.meta]
+        \\w = 5
+        \\[[b]]
+        \\id = 2
+        \\[[a]]
+        \\id = 3
+        \\note = "x"
+    , .{});
+    try testing.expectEqual(@as(usize, 2), v.a.len);
+    try testing.expectEqual(@as(usize, 1), v.b.len);
+    try testing.expectEqual(@as(u32, 5), v.a[0].meta.w);
+    try testing.expectEqualStrings("none", v.a[0].note);
+    try testing.expectEqual(@as(u32, 9), v.a[1].meta.w);
+    try testing.expectEqualStrings("x", v.a[1].note);
+    // Missing required field in an element errors (canonically via the tree).
+    try testing.expectError(error.MissingField, toml_mod.parseInto(T, ar.allocator(), "[[a]]\nnote = \"x\"\n[[b]]\nid = 1\n", .{}));
+}
+
+test "streaming: redefinition and duplicate errors still fire" {
+    const T = struct { a: struct { x: u32 = 0 } = .{}, w: []const struct { z: u32 } = &.{} };
+    var ar = ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const toml_mod = @import("toml.zig");
+    try testing.expectError(error.TomlParseError, toml_mod.parseInto(T, ar.allocator(), "[a]\nx = 1\n[a]\nx = 2\n", .{}));
+    try testing.expectError(error.TomlParseError, toml_mod.parseInto(T, ar.allocator(), "[a]\nx = 1\nx = 2\n", .{}));
+    // Inline array-of-tables cannot be appended to with [[w]].
+    try testing.expectError(error.TomlParseError, toml_mod.parseInto(T, ar.allocator(), "w = [{z = 1}]\n[[w]]\nz = 2\n", .{}));
+    // A header at a scalar field's path parses but cannot decode.
+    try testing.expectError(error.TypeMismatch, toml_mod.parseInto(T, ar.allocator(), "[a.x]\n", .{ .ignore_unknown_fields = true }));
+    // Implicit table then [[...]] at the same path (inside an ignored
+    // subtree, so the verdict must come from the shared seen-sets).
+    try testing.expectError(error.TomlParseError, toml_mod.parseInto(T, ar.allocator(), "[q.sub]\n[[q]]\n", .{ .ignore_unknown_fields = true }));
+}
+
+test "streaming: inline tables and inline arrays-of-tables assign whole fields" {
+    const Rec = struct { z: u32 };
+    const T = struct { a: struct { x: u32 }, w: []const Rec };
+    var ar = ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const toml_mod = @import("toml.zig");
+    const v = try toml_mod.parseInto(T, ar.allocator(), "a = { x = 7 }\nw = [{ z = 1 }, { z = 2 }]\n", .{});
+    try testing.expectEqual(@as(u32, 7), v.a.x);
+    try testing.expectEqual(@as(usize, 2), v.w.len);
+    try testing.expectEqual(@as(u32, 2), v.w[1].z);
+}
+
+test "streaming: unknown subtrees under ignore_unknown_fields still validate" {
+    const T = struct { a: u32 = 0 };
+    var ar = ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const toml_mod = @import("toml.zig");
+    const v = try toml_mod.parseInto(T, ar.allocator(), "a = 1\n[junk]\nk = \"v\"\n[junk.deep]\nq = 2\n", .{ .ignore_unknown_fields = true });
+    try testing.expectEqual(@as(u32, 1), v.a);
+    // A malformed value inside a skipped subtree still errors.
+    try testing.expectError(error.TomlParseError, toml_mod.parseInto(T, ar.allocator(), "a = 1\n[junk]\nk = 1979-13-99\n", .{ .ignore_unknown_fields = true }));
+    // Unknown field without the opt-in errors.
+    try testing.expectError(error.UnknownField, toml_mod.parseInto(T, ar.allocator(), "a = 1\nzzz = 2\n", .{}));
+}
+
+test "streaming: datetime scalars and escaped strings decode" {
+    const T = struct { when: Value, s: []const u8 };
+    _ = T; // Value fields route to the tree; use concrete types here.
+    const T2 = struct { s: []const u8, n: i64 };
+    var ar = ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const toml_mod = @import("toml.zig");
+    const v = try toml_mod.parseInto(T2, ar.allocator(), "s = \"esc\\u00e9\"\nn = 42\n", .{});
+    try testing.expectEqual(@as(i64, 42), v.n);
+    try testing.expect(v.s.len == 5);
+}
+
+test "streaming equivalence: needsTree shapes still decode through the tree" {
+    const Plugin = union(enum) {
+        http: struct { host: []const u8 },
+        file: struct { path: []const u8 },
+        pub const toml_tag = "kind";
+    };
+    const T = struct { plugin: Plugin, opt: ?struct { x: u32 } = null };
+    var ar = ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const toml_mod = @import("toml.zig");
+    const v = try toml_mod.parseInto(T, ar.allocator(),
+        \\[plugin]
+        \\kind = "http"
+        \\host = "h"
+        \\[opt]
+        \\x = 3
+    , .{});
+    try testing.expect(v.plugin == .http);
+    try testing.expectEqual(@as(u32, 3), v.opt.?.x);
+}

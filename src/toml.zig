@@ -103,15 +103,31 @@ pub const DecodeError = decode_mod.DecodeError;
 pub const decode = decode_mod.decode;
 
 /// Parse TOML and decode straight into an instance of `T`.
+///
+/// Fast path: types without `Value` fields, `fromToml` hooks, tagged
+/// unions, optional sub-tables, or nested arrays-of-tables decode in a
+/// single statement-executor pass with no intermediate `Value` tree. On
+/// any error the input is re-decoded through the tree path, so
+/// diagnostics and error selection are always the canonical ones.
+/// Callers requesting `options.spans` use the tree path unconditionally.
 pub fn parseInto(comptime T: type, arena: std.mem.Allocator, src: []const u8, options: ParseOptions) Error!T {
+    if (comptime decode_mod.needsTree(T)) return parseIntoTree(T, arena, src, options);
+    if (options.spans != null) return parseIntoTree(T, arena, src, options);
+    return decode_mod.streamParseInto(T, arena, src, options) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => parseIntoTree(T, arena, src, options),
+    };
+}
+
+fn parseIntoTree(comptime T: type, arena: std.mem.Allocator, src: []const u8, options: ParseOptions) Error!T {
     const value = try parse(arena, src, options);
     return decode(T, arena, value, options);
 }
 
 /// Reader-input variant of `parseInto`.
 pub fn parseIntoReader(comptime T: type, arena: std.mem.Allocator, reader: *std.Io.Reader, options: ParseOptions) ReaderError!T {
-    const value = try parseReader(arena, reader, options);
-    return decode(T, arena, value, options);
+    const input = try reader.allocRemaining(arena, .unlimited);
+    return parseInto(T, arena, input, options);
 }
 
 test {
