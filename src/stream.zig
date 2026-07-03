@@ -183,8 +183,8 @@ pub const EventReader = struct {
     /// ahead that belong to following units. `doc_buf.items[0]` is at absolute
     /// stream offset `base`.
     doc_buf: std.ArrayList(u8) = .empty,
-    /// Absolute stream offset of `doc_buf.items[0]`. Added to every event span
-    /// (saturating to u32) so spans are absolute across the whole stream.
+    /// Absolute stream offset of `doc_buf.items[0]`. Added to every event
+    /// span so spans are absolute (exact u64) across the whole stream.
     base: u64 = 0,
     /// Reader at EOF: a short read returned zero bytes. Once set, no further
     /// pulls are attempted.
@@ -232,6 +232,11 @@ pub const EventReader = struct {
     /// Chunk size pulled from the reader per `pull()`.
     const chunk = 4096;
 
+    /// `options.spans` is NOT populated by the streaming path: the reader
+    /// keeps a private per-unit spans map (reset at every unit boundary) to
+    /// derive event spans, and never writes into a caller-provided map. Use
+    /// each `Event.span` instead. The other options (`errors`, `max_depth`)
+    /// are honored.
     pub fn fromReader(gpa: std.mem.Allocator, reader: *std.Io.Reader, options: parser.ParseOptions) EventReader {
         return .{
             .gpa = gpa,
@@ -447,7 +452,10 @@ pub const EventReader = struct {
             // here. Without a sink the first error is terminal: leave the unit
             // in place and just propagate.
             if (self.options.errors) |sink| {
-                for (errors.items) |d| sink.append(self.gpa, self.rebaseDiag(d)) catch {};
+                for (errors.items) |d| {
+                    const rd = self.rebaseDiag(d) catch break;
+                    sink.append(self.gpa, rd) catch break;
+                }
                 self.compact(len);
                 _ = self.unit_arena.reset(.retain_capacity);
                 self.root = .empty;
@@ -630,19 +638,35 @@ pub const EventReader = struct {
     }
 
     /// Capture the parser's last diagnostic, re-based to absolute stream
-    /// offsets, into `diag`. The message is duped into the stream-lifetime
-    /// seen-arena so it stays valid after the per-unit arena is freed.
+    /// offsets, into `diag`. All borrowed fields are duped into the
+    /// stream-lifetime seen-arena so they stay valid after the per-unit
+    /// arena is freed. On OOM the diagnostic is dropped rather than kept
+    /// with dangling unit-arena pointers.
     fn captureDiag(self: *EventReader, errors: []const Diagnostic) void {
         if (errors.len == 0) return;
-        self.diag = self.rebaseDiag(errors[errors.len - 1]);
+        self.diag = self.rebaseDiag(errors[errors.len - 1]) catch null;
     }
 
     /// Copy a unit-arena diagnostic into stream-lifetime memory and re-base
-    /// its byte range to absolute stream offsets. The message is duped into
+    /// its byte ranges (including note spans) to absolute stream offsets.
+    /// Every borrowed field (message, path, suggestion, notes) is duped into
     /// the seen-arena so it survives the per-unit arena reset.
-    fn rebaseDiag(self: *EventReader, src: Diagnostic) Diagnostic {
+    fn rebaseDiag(self: *EventReader, src: Diagnostic) error{OutOfMemory}!Diagnostic {
+        const sa = self.seen_arena.allocator();
         var d = src;
-        d.message = self.seen_arena.allocator().dupe(u8, d.message) catch d.message;
+        d.message = try sa.dupe(u8, src.message);
+        if (src.path) |p| d.path = try sa.dupe(u8, p);
+        if (src.suggestion) |s| d.suggestion = try sa.dupe(u8, s);
+        if (src.notes.len > 0) {
+            const notes = try sa.alloc(Diagnostic.Note, src.notes.len);
+            for (src.notes, notes) |n, *out| {
+                out.* = .{
+                    .span = .{ .start = self.base + n.span.start, .end = self.base + n.span.end },
+                    .message = try sa.dupe(u8, n.message),
+                };
+            }
+            d.notes = notes;
+        }
         d.span = .{ .start = self.base + src.span.start, .end = self.base + src.span.end };
         return d;
     }
@@ -840,11 +864,18 @@ pub const ValueStream = struct {
         var root: Value = .makeTable();
         while (true) {
             const ev = self.er.next() catch |e| {
-                // A skipped unit (sink set): keep draining the rest. The event
-                // layer already forwarded its diagnostic. Without a sink the
-                // reader leaves the unit in place and re-raises terminally.
-                if (self.er.options.errors != null) continue;
-                return e;
+                // Only unit-level parse errors are recoverable, and only with
+                // a sink set: the event layer discarded the malformed unit and
+                // forwarded its diagnostic, so keep draining the rest. Every
+                // other error (reader failure, LineTooLong, OutOfMemory) does
+                // not consume input and must propagate.
+                switch (e) {
+                    error.TomlParseError, error.NestingTooDeep => {
+                        if (self.er.options.errors != null) continue;
+                        return e;
+                    },
+                    else => return e,
+                }
             } orelse break;
             switch (ev.kind) {
                 .end_of_input => break,
@@ -1909,6 +1940,85 @@ test "gate F: whole-shape recovers valid units past a skipped malformed unit" {
 
         try testing.expectError(error.TomlParseError, vs.next(a));
     }
+}
+
+test "stream: diagnostic borrowed fields survive continuing past an error" {
+    // The failing unit's diagnostic carries a suggestion ("flase" -> false).
+    // After the stream continues (per-unit arena reset + later units parsed
+    // over the reclaimed memory), every field of both the sink entry and
+    // `diagnostic()` must still read back intact.
+    const src =
+        "[a]\nx = flase\n" ++
+        "[b]\ny = \"a fairly long replacement string to reuse arena memory\"\n" ++
+        "z = \"another fairly long replacement string to reuse arena memory\"\n";
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var errors: std.ArrayList(Diagnostic) = .empty;
+    defer errors.deinit(testing.allocator);
+
+    var r: std.Io.Reader = .fixed(src);
+    var vs = ValueStream.fromReader(testing.allocator, &r, .{ .errors = &errors }, .tables);
+    defer vs.deinit();
+
+    try testing.expectError(error.TomlParseError, vs.next(a));
+    // Drain the rest of the stream so later units churn the unit arena.
+    const v1 = (try vs.next(a)).?;
+    try testing.expect(v1.get("y") != null);
+    try testing.expect((try vs.next(a)) == null);
+
+    try testing.expectEqual(@as(usize, 1), errors.items.len);
+    for ([_]Diagnostic{ errors.items[0], vs.diagnostic().? }) |d| {
+        try testing.expectEqualStrings("invalid value `flase`", d.message);
+        try testing.expectEqualStrings("false", d.suggestion.?);
+        try testing.expect(d.path == null);
+        try testing.expectEqual(@as(usize, 0), d.notes.len);
+        // Absolute stream offsets: the bad value sits past the [a] header.
+        try testing.expect(d.span.start >= 8);
+        try testing.expect(d.span.end <= src.len);
+    }
+}
+
+/// Reader that fails its first stream() call and reports end-of-stream after.
+/// The bounded shape matters for the regression test below: an error-swallowing
+/// retry loop TERMINATES (with a wrong success) instead of hanging.
+const FailOnceReader = struct {
+    failed: bool = false,
+    reader: std.Io.Reader,
+
+    fn init(buffer: []u8) FailOnceReader {
+        return .{ .reader = .{ .vtable = &.{ .stream = stream }, .buffer = buffer, .seek = 0, .end = 0 } };
+    }
+
+    fn stream(io_r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        _ = w;
+        _ = limit;
+        const self: *FailOnceReader = @fieldParentPtr("reader", io_r);
+        if (!self.failed) {
+            self.failed = true;
+            return error.ReadFailed;
+        }
+        return error.EndOfStream;
+    }
+};
+
+test "stream: whole shape propagates reader failure even with a sink" {
+    // Only unit-level parse errors are recoverable with a sink; a reader
+    // failure consumes no input and must propagate. If a regression swallows
+    // it, FailOnceReader's follow-up EOF makes next() return a bogus empty
+    // tree, which fails the assertion (bounded: no infinite retry loop).
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var errors: std.ArrayList(Diagnostic) = .empty;
+    defer errors.deinit(testing.allocator);
+
+    var rbuf: [64]u8 = undefined;
+    var fr = FailOnceReader.init(&rbuf);
+    var vs = ValueStream.fromReader(testing.allocator, &fr.reader, .{ .errors = &errors }, .whole);
+    defer vs.deinit();
+
+    try testing.expectError(error.ReadFailed, vs.next(arena.allocator()));
 }
 
 // --- Gate G: T-T1 resumable framing ------------------------------------------
