@@ -6,7 +6,7 @@
 //! underscores), booleans, datetimes (offset, local, date-only,
 //! time-only, fractional seconds), arrays (nesting, mixed types,
 //! trailing commas), tables (headers, dotted keys, super-tables,
-//! redefinition), inline tables, array of tables, comments, whitespace,
+//! redefinition), inline tables, arrays-of-tables, comments, whitespace,
 //! line endings, plus a regression group that pins past bugs.
 
 const std = @import("std");
@@ -88,7 +88,7 @@ test "doc: final newline optional" {
 }
 
 test "doc: leading BOM is rejected (require clean UTF-8)" {
-    // TOML 1.0 is ambiguous about BOM handling  -  this parser treats a
+    // TOML 1.0 is ambiguous about BOM handling -- this parser treats a
     // leading BOM as an unrecognized character at the start of a key.
     try expectParseFails("\xEF\xBB\xBFx = 1");
 }
@@ -1242,15 +1242,15 @@ test "inline: unterminated is error" {
     try expectParseFails("x = {a = 1\n");
 }
 
-test "inline: sealed  -  cannot extend via header" {
+test "inline: sealed -- cannot extend via header" {
     try expectParseFails("a = {}\n[a.b]\nx = 1\n");
 }
 
-test "inline: sealed  -  cannot extend via array of tables" {
+test "inline: sealed -- cannot extend via array of tables" {
     try expectParseFails("a = {}\n[[a.b]]\nx = 1\n");
 }
 
-test "inline: sealed  -  cannot extend via dotted key at top level" {
+test "inline: sealed -- cannot extend via dotted key at top level" {
     try expectParseFails("a = {b = 1}\na.c = 2\n");
 }
 
@@ -1445,7 +1445,7 @@ test "regression: leading-zero float -03.14 is rejected" {
 }
 
 test "regression: inline-table sealing blocks later header extension" {
-    // Bug 5: `a = {}` then `[a.b]` must fail  -  the inline table is sealed.
+    // Bug 5: `a = {}` then `[a.b]` must fail -- the inline table is sealed.
     try expectParseFails("a = {}\n[a.b]\nx = 1\n");
 }
 

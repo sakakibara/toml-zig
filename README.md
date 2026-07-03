@@ -2,13 +2,13 @@
 
 A complete TOML 1.1 implementation for Zig.
 
-- **100% spec compliance** - passes every test in the official [toml-lang/toml-test](https://github.com/toml-lang/toml-test) suite (decoder, encoder, and invalid) against TOML 1.1.0.
-- **Typed decoding** - `parseInto(Config, arena, src)` deserializes straight into your Zig struct via comptime reflection, in a single streaming pass with no intermediate value tree for most shapes. No annotations, no codegen.
+- **100% spec compliance** - passes every test in the official [toml-lang/toml-test](https://github.com/toml-lang/toml-test) suite (valid, invalid, and encoder) against TOML 1.1.0.
+- **Typed decoding** - `parseInto(Config, arena, src, .{})` deserializes straight into your Zig struct via comptime reflection, in a single streaming pass with no intermediate value tree for most shapes. No annotations, no codegen.
 - **Lossless document model** - edit a TOML file in place; comments, formatting, ordering preserved. Add/remove/reorder sections, edit sub-keys inside inline tables.
-- **Byte-precise spans** - every value (top-level or deeply nested) carries an exact byte range and line/col, populated on demand.
+- **Byte-precise spans** - every value (top-level or deeply nested) carries an exact u64 byte range; line/col are derived on demand.
 - **Streaming input** - parse from any `std.Io.Reader`. A separate token-stream API yields lex events for incremental tooling.
 - **Fast** - single-pass recursive-descent, arena-allocated, zero-copy strings/keys where possible. Run `zig build bench` to measure on your hardware.
-- **Portable** - builds on every target Zig supports (verified across 20+ in CI). No allocator surprises, no global state.
+- **Portable** - builds on every target Zig supports (verified across 20+ targets in CI). No allocator surprises, no global state.
 - **No dependencies** - pure Zig, libc-free.
 
 ```zig
@@ -209,7 +209,7 @@ Array elements use `[N]` index segments, e.g. `users[0].name`.
 
 ```zig
 var stdin_buf: [4096]u8 = undefined;
-var stdin_reader = std.Io.File.stdin().readerStreaming(&stdin_buf);
+var stdin_reader = std.Io.File.stdin().readerStreaming(io, &stdin_buf);
 const v = try toml.parseReader(arena, &stdin_reader.interface, .{});
 ```
 
@@ -344,7 +344,7 @@ while (t.next()) |tok| switch (tok.kind) {
 var errs: std.ArrayList(toml.Diagnostic) = .empty;
 defer errs.deinit(arena);
 const v = toml.parse(arena, src, .{ .errors = &errs }) catch {
-    if (errs.items.len > 0) std.debug.print("{f}\n", .{errs.items[0]});
+    if (errs.items.len > 0) try errs.items[0].format(w, src);
     return;
 };
 ```

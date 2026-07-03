@@ -8,7 +8,7 @@
 //! ```zig
 //! var t: toml.Tokenizer = .init(src);
 //! while (t.next()) |tok| switch (tok.kind) {
-//!     .key => std.debug.print("key {s}\n", .{src[tok.span.start..tok.span.end]}),
+//!     .key_segment => std.debug.print("key {s}\n", .{src[tok.span.start..tok.span.end]}),
 //!     .value_string => ...,
 //!     ...
 //! }

@@ -1,4 +1,4 @@
-//! Document model for TOML  -  lossless parse, edit, and emit.
+//! Document model for TOML -- lossless parse, edit, and emit.
 //!
 //! Unlike `toml.parse`, which throws away comments, formatting, and
 //! original byte representations, `Document.parse` keeps the input as a
@@ -399,7 +399,7 @@ pub const Document = struct {
             try self.kv_index.put(self.arena, new_item.kv.full_path, after_idx + 1);
             try self.section_end.put(self.arena, enclosing, after_idx + 1);
         } else if (enclosing.len == 0) {
-            // Root-level key but the document is empty  -  just append.
+            // Root-level key but the document is empty -- just append.
             const fmt = try formatKvLine(self.arena, path, raw_value);
             const new_item: Item = .{ .kv = .{
                 .raw = fmt.line,

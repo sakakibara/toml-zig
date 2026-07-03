@@ -6,7 +6,7 @@
 //! - Local date:       `YYYY-MM-DD`
 //! - Local time:       `HH:MM:SS[.fff]`
 //!
-//! Parsing is hand-rolled against a byte slice  -  no regex, no heap
+//! Parsing is hand-rolled against a byte slice -- no regex, no heap
 //! allocations, no errors beyond `InvalidDateTime`.
 
 const std = @import("std");
@@ -27,7 +27,7 @@ pub const Parsed = union(enum) {
 pub const Error = error{InvalidDateTime};
 
 /// Parse a single date/time/datetime literal from the entire slice.
-/// The slice must contain exactly the literal  -  no trailing whitespace
+/// The slice must contain exactly the literal -- no trailing whitespace
 /// or extra bytes.
 pub fn parseAny(s: []const u8) Error!Parsed {
     // Date-like: starts with `YYYY-`

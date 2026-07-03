@@ -1,4 +1,4 @@
-//! TOML 1.1 parser  -  single-pass recursive descent, arena-allocated.
+//! TOML 1.1 parser -- single-pass recursive descent, arena-allocated.
 //!
 //! Entry point: `parse(arena, input, options) -> Value` (always returns a table).
 //! On error: returns `error.TomlParseError`. Set `options.errors` to a
@@ -244,7 +244,7 @@ pub fn decodeKeyPath(arena: Allocator, raw: []const u8) Error![]const u8 {
 /// `'a\b'` decodes to) is escaped too, keeping the encoding reversible.
 ///
 /// The seen-sets are keyed on this encoding, so the sequence of decoded
-/// segments  -  not a lossy '.'-join  -  is what a lookup compares. Thus
+/// segments -- not a lossy '.'-join -- is what a lookup compares. Thus
 /// `[a."b.c"]` (segments `a`, `b.c` -> `a.b\.c`) is DISTINCT from `[a.b.c]`
 /// (segments `a`, `b`, `c` -> `a.b.c`), while `[a."b"]` and `[a.b]` still
 /// collide (both decode segment `b` -> `a.b`).
@@ -263,9 +263,9 @@ fn appendSeenSegment(arena: Allocator, out: *ArrayList(u8), segment: []const u8)
 /// reject decisions byte-identical to a whole-file buffered parse.
 ///
 /// Bounded by distinct-key-count x name-length, independent of value
-/// size  -  the same bookkeeping the buffered parser already carries.
+/// size -- the same bookkeeping the buffered parser already carries.
 pub const SeenState = struct {
-    /// Tables that were explicitly defined via `[header]`  -  redefining
+    /// Tables that were explicitly defined via `[header]` -- redefining
     /// one is an error. Header-defined tables cannot be extended via
     /// dotted-key from a different `[header]` scope.
     defined_tables: StringHashMap(void) = .empty,
@@ -275,7 +275,7 @@ pub const SeenState = struct {
     implicit_tables: StringHashMap(void) = .empty,
     /// Keys that are inline-defined (value of `key = {...}` or nested
     /// within an inline table literal). Any such key and its sub-paths
-    /// are permanently sealed  -  no header may re-open them, no dotted-key
+    /// are permanently sealed -- no header may re-open them, no dotted-key
     /// may extend them.
     inline_tables: StringHashMap(void) = .empty,
     /// Full paths of tables that were created as intermediates by a
@@ -316,7 +316,7 @@ pub const SeenState = struct {
     pub const empty: SeenState = .{};
 
     /// Entering a new `[header]` / `[[header]]` invalidates the
-    /// "dotted-created in the current header" scope  -  headers never
+    /// "dotted-created in the current header" scope -- headers never
     /// share dotted-created tables. Called at the top of header parsing.
     pub fn clearHeaderScope(self: *SeenState) void {
         self.dotted_current.clearRetainingCapacity();
@@ -544,7 +544,7 @@ pub fn ParserOf(comptime Sink: type) type {
     /// `SeenState`, leaving `current` wherever the last header pointed it.
     /// Used by the streaming reader to feed one statement-unit's bytes
     /// (constructed via `initUnit`). Runs the identical statement loop as
-    /// `parseDocument`, but does NOT own the value tree  -  the shared root
+    /// `parseDocument`, but does NOT own the value tree -- the shared root
     /// is the result and persists across units. Recovery semantics match
     /// the buffered path.
     pub fn parseStatements(self: *Self) Error!void {
@@ -784,7 +784,7 @@ pub fn ParserOf(comptime Sink: type) type {
         }
 
         // Entering a new header invalidates the "dotted in current header"
-        // scope  -  headers never share dotted-created tables.
+        // scope -- headers never share dotted-created tables.
         self.seen.clearHeaderScope();
 
         // Navigate / create intermediate tables. Two key builders run in
@@ -837,7 +837,7 @@ pub fn ParserOf(comptime Sink: type) type {
             // must outlive the per-unit value arena in the streaming path.
             const key_owned = try self.seen_arena.dupe(u8, seen_key.items);
 
-            // Inline-defined paths are sealed  -  never re-openable via
+            // Inline-defined paths are sealed -- never re-openable via
             // `[header]` (even for intermediates, you can't traverse
             // into an inline table's sub-structure).
             if (self.seen.inline_tables.contains(key_owned)) {
@@ -896,7 +896,7 @@ pub fn ParserOf(comptime Sink: type) type {
                     try self.current_seen_prefix.appendSlice(self.arena, indexed_seen_key.items);
                 }
             } else {
-                // Intermediate  -  walk or create, but forbid traversing
+                // Intermediate -- walk or create, but forbid traversing
                 // through scalars, inline tables, or arrays-of-tables
                 // (must target the last element of array-of-tables) or
                 // normal arrays.
@@ -1059,7 +1059,7 @@ pub fn ParserOf(comptime Sink: type) type {
         }
         // Slot absent. In the buffered path this is a first definition; in the
         // streaming path (fresh per-unit root) it may instead be an append to
-        // an array-of-tables defined in an earlier unit  -  the seen-set knows
+        // an array-of-tables defined in an earlier unit -- the seen-set knows
         // which. Either way one fresh element table is created in THIS unit's
         // tree; the streaming reader emits it as one `[[x]]` element and the
         // consumer appends across units.
@@ -1151,7 +1151,7 @@ pub fn ParserOf(comptime Sink: type) type {
         var t = target;
         for (parts.items[0 .. parts.items.len - 1], 0..) |part, i| {
             if (i >= self.max_depth) return self.setDepthError();
-            // Always emit a separator for joins  -  empty keys are valid
+            // Always emit a separator for joins -- empty keys are valid
             // in TOML (e.g. `""."x" = 1`) and would otherwise collapse.
             if (self.current_prefix.items.len > 0 or i > 0) try full_key.append(self.arena, '.');
             try full_key.appendSlice(self.arena, part);
@@ -1686,7 +1686,7 @@ pub fn ParserOf(comptime Sink: type) type {
         while (!self.eof()) {
             const c = self.peek();
             if (c == '\r' and self.peekAt(1) == '\n') {
-                // Zero-copy would preserve CR  -  TOML wants LF only here.
+                // Zero-copy would preserve CR -- TOML wants LF only here.
                 zero_copy_possible = false;
                 break;
             }
@@ -1929,7 +1929,7 @@ pub fn ParserOf(comptime Sink: type) type {
         const start = self.pos;
         var last_nonspace_end = start;
         // The space separator between date and time complicates this:
-        // `1979-05-27 07:32:00`  -  the space is content. We allow a single
+        // `1979-05-27 07:32:00` -- the space is content. We allow a single
         // space only if immediately followed by a digit (time section).
         while (self.pos < self.input.len) {
             const c = self.input[self.pos];
@@ -3282,8 +3282,8 @@ fn valuesEqual(a: Value, b: Value) bool {
 /// non-whitespace byte is `[`) up to but not including the next top-level
 /// header line. Any leading top-level key-value lines form the first unit.
 ///
-/// This is a deliberately minimal splitter (the real boundary oracle is a
-/// later task): it keys off line-leading `[`, so it does NOT handle a `[`
+/// This is a deliberately minimal splitter (the production boundary oracle
+/// is the EventReader framer): it keys off line-leading `[`, so it does NOT handle a `[`
 /// that opens a multi-line inline array spanning a line that itself starts
 /// with `[`. The equivalence fixtures avoid that shape on purpose.
 fn splitUnits(arena: Allocator, doc: []const u8) Error![][]const u8 {
@@ -3330,7 +3330,7 @@ test "streaming seam: statement-by-statement parse equals buffered parse" {
     // (ii) statement-unit-by-unit against ONE shared root + ONE shared
     // SeenState. Both must reach the IDENTICAL accept/reject decision, and
     // on accept the IDENTICAL Value tree. This proves duplicate detection
-    // survives across separately-parsed units  -  the core requirement for
+    // survives across separately-parsed units -- the core requirement for
     // streaming, where a unit's VALUES are discarded but its NAME stays
     // known in the shared SeenState.
     const cases = [_]struct {
