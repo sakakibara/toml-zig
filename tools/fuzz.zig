@@ -113,6 +113,13 @@ pub fn main(init: std.process.Init) !u8 {
                 failures += 1;
                 try reportFailure(ew, n, seed, input, err);
             }
+            // The generated stream is VALID [[record]] TOML, so the typed
+            // agreement check gets dense value-level coverage here (the
+            // biased/random modes mostly exercise the reject side).
+            if (try checkTypedStream(gpa, input)) |err| {
+                failures += 1;
+                try reportFailure(ew, n, seed, input, err);
+            }
             continue;
         }
 
@@ -149,9 +156,15 @@ const FuzzError = error{
     SpanOutOfBounds,
     DepthNotBounded,
     StreamingMismatch,
+    TypedDivergence,
 };
 
 fn fuzzOnce(gpa: std.mem.Allocator, input: []const u8) !?FuzzError {
+    // Typed streaming agreement runs on EVERY input: the divergence it
+    // hunts is the streaming pass accepting what the tree path rejects,
+    // which by definition needs inputs the tree path rejects.
+    if (try checkTypedStream(gpa, input)) |e| return e;
+
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
 
@@ -190,6 +203,80 @@ fn fuzzOnce(gpa: std.mem.Allocator, input: []const u8) !?FuzzError {
     }
 
     return null;
+}
+
+/// Typed streaming invariant: `parseInto` dispatches statements straight
+/// into eligible target types and falls back to parse+decode on any
+/// error, so the dangerous divergence is one-directional: the streaming
+/// pass succeeding where the tree path fails, or producing a different
+/// value. Decode a battery of permissive target types both ways and
+/// require agreement.
+fn checkTypedStream(gpa: std.mem.Allocator, input: []const u8) !?FuzzError {
+    const AllOpt = struct {
+        a: ?f64 = null,
+        b: ?[]const u8 = null,
+        c: ?bool = null,
+        tags: ?[]const []const u8 = null,
+        mode: ?enum { alpha, beta } = null,
+        renamed_field: ?f64 = null,
+        nested: struct { x: ?i64 = null, y: ?[]const f64 = null } = .{},
+        recs: []const struct { id: ?i64 = null, s: ?[]const u8 = null } = &.{},
+        ml: ?[]const u8 = null,
+        t: struct { z: ?i64 = null } = .{},
+        pub const toml_rename = .{ .renamed_field = "renamed" };
+    };
+    var s_arena: std.heap.ArenaAllocator = .init(gpa);
+    defer s_arena.deinit();
+    var t_arena: std.heap.ArenaAllocator = .init(gpa);
+    defer t_arena.deinit();
+
+    const opts: toml.ParseOptions = .{ .ignore_unknown_fields = true };
+    const streamed: ?AllOpt = toml.parseInto(AllOpt, s_arena.allocator(), input, opts) catch |err| blk: {
+        if (err == error.OutOfMemory) return err;
+        break :blk null;
+    };
+    const tree: ?AllOpt = treeParseInto(AllOpt, t_arena.allocator(), input, opts) catch |err| blk: {
+        if (err == error.OutOfMemory) return err;
+        break :blk null;
+    };
+    if ((streamed == null) != (tree == null)) return FuzzError.TypedDivergence;
+    if (streamed) |sv| {
+        if (!eqlT(AllOpt, sv, tree.?)) return FuzzError.TypedDivergence;
+    }
+    return null;
+}
+
+fn treeParseInto(comptime T: type, a: std.mem.Allocator, input: []const u8, opts: toml.ParseOptions) !T {
+    const value = try toml.parse(a, input, opts);
+    return toml.decode(T, a, value, opts);
+}
+
+/// Deep structural equality over a decoded target type.
+fn eqlT(comptime T: type, x: T, y: T) bool {
+    return switch (@typeInfo(T)) {
+        .bool, .int, .@"enum" => x == y,
+        .float => (std.math.isNan(x) and std.math.isNan(y)) or x == y,
+        .optional => |o| blk: {
+            if (x == null and y == null) break :blk true;
+            if (x == null or y == null) break :blk false;
+            break :blk eqlT(o.child, x.?, y.?);
+        },
+        .pointer => |p| blk: {
+            if (p.child == u8 and p.is_const) break :blk std.mem.eql(u8, x, y);
+            if (x.len != y.len) break :blk false;
+            for (x, y) |xe, ye| {
+                if (!eqlT(p.child, xe, ye)) break :blk false;
+            }
+            break :blk true;
+        },
+        .@"struct" => |st| blk: {
+            inline for (st.fields) |f| {
+                if (!eqlT(f.type, @field(x, f.name), @field(y, f.name))) break :blk false;
+            }
+            break :blk true;
+        },
+        else => @compileError("eqlT: unsupported type " ++ @typeName(T)),
+    };
 }
 
 /// Deep-nesting invariant: parse must RETURN (not stack-overflow) on
