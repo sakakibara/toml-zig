@@ -98,13 +98,24 @@ pub const Tokenizer = struct {
     /// The in-progress token scan to resume on the next next() call, or
     /// `.none` when the tokenizer is between tokens.
     pending: Pending = .none,
+    /// Container-nesting stack: which kind of inline container encloses the
+    /// current position, innermost last. Nesting deeper than the fixed
+    /// capacity keeps counting via `depth` but the untracked levels are
+    /// classified as arrays (lexical degradation, never a failure).
+    stack: [max_container_depth]Container = undefined,
+    depth: usize = 0,
+
+    const max_container_depth = 128;
+
+    const Container = enum { array, table };
 
     const State = enum {
-        top,           // statement start
-        after_eq,      // expecting a value
-        in_array,      // inside `[ ... ]` array
-        in_inline_tbl, // inside `{ ... }` inline table
-        after_value,   // expecting `,`, `]`, `}`, or EOL
+        top,         // statement start
+        after_eq,    // after a top-level `=`, expecting a value
+        array_value, // inside `[ ... ]`, expecting a value or `]`
+        table_key,   // inside `{ ... }`, expecting a key, `.`, or `=`
+        table_value, // inside `{ ... }` after `=`, expecting a value
+        after_value, // a value just ended; `,` / closer / EOL by context
     };
 
     /// A paused token scan, carrying just enough state to resume mid-token
@@ -167,10 +178,12 @@ pub const Tokenizer = struct {
         const start = self.mark();
         const c = self.input[self.pos];
 
-        // Newline: always EOL.
+        // Newline: always EOL. Inside an inline container the line break does
+        // not end the statement (arrays may span lines), so the state and
+        // container stack are kept.
         if (c == '\n') {
             self.advance();
-            self.state = .top;
+            if (self.depth == 0) self.state = .top;
             return self.token(.eol, start);
         }
         if (c == '\r') {
@@ -183,7 +196,7 @@ pub const Tokenizer = struct {
             }
             self.advance();
             if (self.pos < self.input.len and self.input[self.pos] == '\n') self.advance();
-            self.state = .top;
+            if (self.depth == 0) self.state = .top;
             return self.token(.eol, start);
         }
 
@@ -194,11 +207,26 @@ pub const Tokenizer = struct {
 
         return switch (self.state) {
             .top => self.tokTopOrKey(start),
-            .after_eq => self.tokValue(start),
-            .in_array => self.tokInArray(start),
-            .in_inline_tbl => self.tokInInlineTable(start),
+            .after_eq, .table_value => self.tokValue(start),
+            .array_value => self.tokInArray(start),
+            .table_key => self.tokInInlineTable(start),
             .after_value => self.tokAfterValue(start),
         };
+    }
+
+    fn pushContainer(self: *Tokenizer, c: Container) void {
+        if (self.depth < max_container_depth) self.stack[self.depth] = c;
+        self.depth += 1;
+    }
+
+    fn popContainer(self: *Tokenizer) void {
+        if (self.depth > 0) self.depth -= 1;
+    }
+
+    fn containerTop(self: *const Tokenizer) ?Container {
+        if (self.depth == 0) return null;
+        if (self.depth > max_container_depth) return .array;
+        return self.stack[self.depth - 1];
     }
 
     fn tokTopOrKey(self: *Tokenizer, start: usize) ?Token {
@@ -267,12 +295,14 @@ pub const Tokenizer = struct {
         const c = self.input[self.pos];
         if (c == '[') {
             self.advance();
-            self.state = .in_array;
+            self.pushContainer(.array);
+            self.state = .array_value;
             return self.token(.array_punct, start);
         }
         if (c == '{') {
             self.advance();
-            self.state = .in_inline_tbl;
+            self.pushContainer(.table);
+            self.state = .table_key;
             return self.token(.inline_table_punct, start);
         }
         return self.tokScalar(start);
@@ -282,6 +312,7 @@ pub const Tokenizer = struct {
         const c = self.input[self.pos];
         if (c == ']') {
             self.advance();
+            self.popContainer();
             self.state = .after_value;
             return self.token(.array_punct, start);
         }
@@ -289,24 +320,14 @@ pub const Tokenizer = struct {
             self.advance();
             return self.token(.array_punct, start);
         }
-        if (c == '[') {
-            self.advance();
-            // Nested array; keep state as in_array (depth not tracked
-            // in this minimal tokenizer; consumers can count tokens).
-            return self.token(.array_punct, start);
-        }
-        if (c == '{') {
-            self.advance();
-            self.state = .in_inline_tbl;
-            return self.token(.inline_table_punct, start);
-        }
-        return self.tokScalar(start);
+        return self.tokValue(start);
     }
 
     fn tokInInlineTable(self: *Tokenizer, start: usize) ?Token {
         const c = self.input[self.pos];
         if (c == '}') {
             self.advance();
+            self.popContainer();
             self.state = .after_value;
             return self.token(.inline_table_punct, start);
         }
@@ -316,6 +337,7 @@ pub const Tokenizer = struct {
         }
         if (c == '=') {
             self.advance();
+            self.state = .table_value;
             return self.token(.equals, start);
         }
         if (c == '.') {
@@ -325,8 +347,41 @@ pub const Tokenizer = struct {
         return self.tokKeyOrSegment(start);
     }
 
+    /// A value just ended. What follows depends on the innermost container:
+    /// `,` or the matching closer inside one, or a fresh statement at top
+    /// level. Unexpected bytes are lexed leniently as the next element.
     fn tokAfterValue(self: *Tokenizer, start: usize) ?Token {
-        // Same as top-level - expect comment, EOL, or next statement.
+        const c = self.input[self.pos];
+        if (self.containerTop()) |top| switch (top) {
+            .array => {
+                if (c == ',') {
+                    self.advance();
+                    self.state = .array_value;
+                    return self.token(.array_punct, start);
+                }
+                if (c == ']') {
+                    self.advance();
+                    self.popContainer();
+                    return self.token(.array_punct, start);
+                }
+                return self.tokValue(start);
+            },
+            .table => {
+                if (c == ',') {
+                    self.advance();
+                    self.state = .table_key;
+                    return self.token(.inline_table_punct, start);
+                }
+                if (c == '}') {
+                    self.advance();
+                    self.popContainer();
+                    return self.token(.inline_table_punct, start);
+                }
+                self.state = .table_key;
+                return self.tokKeyOrSegment(start);
+            },
+        };
+        // Top-level value ended - expect comment, EOL, or next statement.
         self.state = .top;
         return self.tokTopOrKey(start);
     }
@@ -365,6 +420,14 @@ pub const Tokenizer = struct {
                 // if the bytes before look like YYYY-MM-DD and next byte
                 // is a digit, it's part of the datetime.
                 if (self.pos - num_start == 10 and looksLikeDate(self.input[num_start..self.pos])) {
+                    // Deciding needs the byte after the space; in resumable
+                    // mode pause until it is buffered so the token is not
+                    // split at the space.
+                    if (self.resumable and self.pos + 1 >= self.input.len) {
+                        self.pending = .{ .scalar = .{ .start = start, .num_start = num_start } };
+                        self.incomplete = true;
+                        return null;
+                    }
                     if (self.pos + 1 < self.input.len and isDigit(self.input[self.pos + 1])) {
                         self.advance();
                         continue;
@@ -382,7 +445,22 @@ pub const Tokenizer = struct {
         }
         self.pending = .none;
         const slice = self.input[num_start..self.pos];
-        const kind: Kind = if (looksLikeDateOrTime(slice))
+        // A value position whose first byte is already a terminator (e.g.
+        // `x = }` or a bare `,`) yields an empty scalar. Never emit it
+        // zero-width: consume the offending byte as .err so the lex always
+        // makes progress (a zero-width token here loops the state machine).
+        if (slice.len == 0) {
+            if (self.pos >= self.input.len) return null;
+            self.advance();
+            self.state = .after_value;
+            return self.token(.err, start);
+        }
+        // Bools normally short-circuit in tokScalar, but a scan that paused
+        // mid-word resumes here; classify them so the kind matches the
+        // whole-input lex.
+        const kind: Kind = if (std.mem.eql(u8, slice, "true") or std.mem.eql(u8, slice, "false"))
+            .value_bool
+        else if (looksLikeDateOrTime(slice))
             .value_datetime
         else if (std.mem.indexOfScalar(u8, slice, '.') != null or
             std.mem.indexOfAny(u8, slice, "eE") != null or
@@ -608,6 +686,71 @@ test "tokenizer: datetime" {
     try testing.expectEqual(Kind.value_datetime, t.next().?.kind);
 }
 
+fn expectKinds(src: []const u8, want: []const Kind) !void {
+    var t: Tokenizer = .init(src);
+    var i: usize = 0;
+    while (t.next()) |tok| : (i += 1) {
+        if (i >= want.len) return error.TestExpectedEqual;
+        testing.expectEqual(want[i], tok.kind) catch |e| {
+            std.debug.print("kind mismatch at token {d} in: {s}\n", .{ i, src });
+            return e;
+        };
+    }
+    try testing.expectEqual(want.len, i);
+}
+
+test "tokenizer: multi-element array" {
+    try expectKinds("k = [1, 2]\n", &.{
+        .key_segment, .equals,
+        .array_punct, .value_integer, .array_punct, .value_integer, .array_punct,
+        .eol,
+    });
+}
+
+test "tokenizer: nested arrays" {
+    try expectKinds("k = [[1], [2, 3]]\n", &.{
+        .key_segment,   .equals,
+        .array_punct,   .array_punct,
+        .value_integer, .array_punct,
+        .array_punct,   .array_punct,
+        .value_integer, .array_punct,
+        .value_integer, .array_punct,
+        .array_punct,   .eol,
+    });
+}
+
+test "tokenizer: inline table with multiple pairs" {
+    try expectKinds("p = { x = 1, y = \"s\" }\n", &.{
+        .key_segment,        .equals,
+        .inline_table_punct, .key_segment,
+        .equals,             .value_integer,
+        .inline_table_punct, .key_segment,
+        .equals,             .value_string,
+        .inline_table_punct, .eol,
+    });
+}
+
+test "tokenizer: inline table inside array" {
+    try expectKinds("k = [{ a = true }, 2]\n", &.{
+        .key_segment,        .equals,
+        .array_punct,        .inline_table_punct,
+        .key_segment,        .equals,
+        .value_bool,         .inline_table_punct,
+        .array_punct,        .value_integer,
+        .array_punct,        .eol,
+    });
+}
+
+test "tokenizer: array spanning lines keeps container context" {
+    try expectKinds("k = [\n  1,\n  [2],\n]\nx = 3\n", &.{
+        .key_segment, .equals, .array_punct, .eol,
+        .value_integer, .array_punct, .eol,
+        .array_punct, .value_integer, .array_punct, .array_punct, .eol,
+        .array_punct, .eol,
+        .key_segment, .equals, .value_integer, .eol,
+    });
+}
+
 test "tokenizer: Token.span carries exact u64 byte offsets" {
     const src = "title = \"hello\"\n";
     var t: Tokenizer = .init(src);
@@ -639,6 +782,9 @@ test "tokenizer: resumable lex of a growing buffer matches whole-input lex" {
         "key = \"\"\"line1\n[not a header]\nk = v\nline\\\"end\"\"\"\n" ++
         "s = \"a [b] \\\" c\"  # trailing [x] comment\n" ++
         "n = 1979-05-27T07:32:00Z\n" ++
+        "d = 1979-05-27 07:32:00\n" ++
+        "flag = true\n" ++
+        "arr = [1, { x = 2 }]\n" ++
         "[real]\nx = 42\n";
 
     // Oracle: whole-input, non-resumable.
@@ -746,6 +892,34 @@ test "tokenizer: resumable CRLF at buffer boundary emits one EOL matching whole-
                 std.debug.print("CRLF span.end mismatch on: {s}\n", .{src});
                 return e;
             };
+        }
+    }
+}
+
+test "tokenizer: always makes progress, even on terminator bytes in value position" {
+    // A value position whose first byte is a terminator used to emit a
+    // zero-width scalar token, looping the state machine forever. Bound
+    // the walk by input length so a regression fails instead of hanging.
+    const cases = [_][]const u8{
+        "x = }",
+        "x = [1}",
+        "x = [,]",
+        "x = { k = }",
+        "x = [1, ]#",
+        "= }",
+    };
+    for (cases) |src| {
+        var t: Tokenizer = .init(src);
+        var last_pos: usize = 0;
+        var stuck: usize = 0;
+        while (t.next()) |_| {
+            if (t.pos == last_pos) {
+                stuck += 1;
+                try std.testing.expect(stuck <= 2);
+            } else {
+                stuck = 0;
+                last_pos = t.pos;
+            }
         }
     }
 }
