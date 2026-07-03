@@ -64,6 +64,8 @@ pub const Error = error{
     InvalidValue,
     InvalidComment,
     UnsupportedPath,
+    /// A Zig integer value cannot be represented as a TOML integer (i64).
+    /// Distinct from decode's `Overflow` (target-Zig-type overflow).
     IntegerOverflow,
     PathTooDeep,
     OutOfMemory,
@@ -178,6 +180,11 @@ pub const Document = struct {
     /// Header path -> item index of last kv in that section (or header
     /// itself if section is empty). Used to append new keys.
     section_end: StringArrayHashMap(usize),
+    /// Decoded paths of `[[x]]` array-of-tables headers. Keys through these
+    /// are ambiguous without an element index (kv_index would silently
+    /// resolve to the LAST element), so the editors refuse them; `get`
+    /// requires an explicit `[N]` for the same reason.
+    aot_paths: StringArrayHashMap(void),
     parsed: Value,
 
     pub fn parse(arena: Allocator, input: []const u8, options: parser_mod.ParseOptions) !Document {
@@ -188,6 +195,7 @@ pub const Document = struct {
             .items = .empty,
             .kv_index = .empty,
             .section_end = .empty,
+            .aot_paths = .empty,
             .parsed = undefined,
         };
         try tokenize(&doc, source);
@@ -219,11 +227,33 @@ pub const Document = struct {
     /// library validates by re-parsing; on failure returns InvalidValue.
     /// Use `set` (comptime-dispatched) for native values; this is the escape
     /// hatch for splicing in already-formatted TOML source.
+    /// True when `path` is, or descends through, an array-of-tables. Such a
+    /// path needs an `[N]` element index to be readable via `get`, and the
+    /// editors support no `[N]` syntax at all, so they refuse it outright
+    /// (rather than silently editing the LAST element).
+    fn pathThroughArrayOfTables(self: *const Document, path: []const u8) bool {
+        var it = self.aot_paths.iterator();
+        while (it.next()) |e| {
+            const p = e.key_ptr.*;
+            if (std.mem.eql(u8, path, p)) return true;
+            if (path.len > p.len and std.mem.startsWith(u8, path, p) and path[p.len] == '.') return true;
+        }
+        return false;
+    }
+
+    /// kv_index lookup for the comment editors: refuses ambiguous paths
+    /// (through an array-of-tables) before consulting the index.
+    fn editableKvIndex(self: *const Document, path: []const u8) Error!usize {
+        if (self.pathThroughArrayOfTables(path)) return error.UnsupportedPath;
+        return self.kv_index.get(path) orelse error.PathNotFound;
+    }
+
     pub fn setLiteral(self: *Document, path: []const u8, raw: []const u8) Error!void {
         // `get` reads `arr[0]` as array element 0; setLiteral cannot edit
         // array elements, so reject the syntax rather than silently mint a
         // literal `"arr[0]"` key that disagrees with the read path.
         if (pathHasArrayIndex(path)) return error.UnsupportedPath;
+        if (self.pathThroughArrayOfTables(path)) return error.UnsupportedPath;
         try validateValueLiteral(self.arena, raw);
 
         if (self.kv_index.get(path)) |idx| {
@@ -393,6 +423,7 @@ pub const Document = struct {
     pub fn setValue(self: *Document, path: []const u8, value: Value) Error!void {
         const raw = formatValue(self.arena, value) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
+            error.NestingTooDeep => return error.NestingTooDeep,
             else => return error.InvalidValue,
         };
         try self.setLiteral(path, raw);
@@ -419,10 +450,13 @@ pub const Document = struct {
         // Mirror setLiteral: `arr[0]` is array-element access, which remove
         // does not support. Erroring keeps it consistent with `get`.
         if (pathHasArrayIndex(path)) return error.UnsupportedPath;
+        if (self.pathThroughArrayOfTables(path)) return error.UnsupportedPath;
         if (self.kv_index.get(path)) |idx| {
             _ = self.items.orderedRemove(idx);
-            _ = self.kv_index.swapRemove(path);
-            self.shiftIndices(idx, -1);
+            // section_end may point exactly at the removed kv (last item of
+            // its section); a plain index shift would underflow or leave a
+            // stale entry, so rebuild both indices from the item list.
+            try self.rebuildIndices();
             try self.refreshParsed();
             return;
         }
@@ -465,7 +499,7 @@ pub const Document = struct {
     /// `text` is the comment body without the leading `#` or trailing
     /// newline; both are added automatically.
     pub fn addCommentBefore(self: *Document, path: []const u8, text: []const u8) Error!void {
-        const idx = self.kv_index.get(path) orelse return error.PathNotFound;
+        const idx = try self.editableKvIndex(path);
         try rejectMultilineComment(text);
         const raw = try std.fmt.allocPrint(self.arena, "# {s}\n", .{text});
         try self.items.insert(self.arena, idx, .{ .comment = raw });
@@ -479,7 +513,7 @@ pub const Document = struct {
 
     /// Insert a comment line immediately after the kv at `path`.
     pub fn addCommentAfter(self: *Document, path: []const u8, text: []const u8) Error!void {
-        const idx = self.kv_index.get(path) orelse return error.PathNotFound;
+        const idx = try self.editableKvIndex(path);
         try rejectMultilineComment(text);
         try self.ensureItemEndsWithNewline(idx);
         const raw = try std.fmt.allocPrint(self.arena, "# {s}\n", .{text});
@@ -495,7 +529,7 @@ pub const Document = struct {
     /// Remove the comment line immediately preceding the kv at `path`,
     /// if there is one. No-op when the previous item isn't a comment.
     pub fn removeCommentBefore(self: *Document, path: []const u8) Error!void {
-        const idx = self.kv_index.get(path) orelse return error.PathNotFound;
+        const idx = try self.editableKvIndex(path);
         if (idx == 0) return;
         const prev = self.items.items[idx - 1];
         if (prev != .comment) return;
@@ -506,7 +540,7 @@ pub const Document = struct {
     /// Remove the comment line immediately following the kv at `path`,
     /// if there is one. No-op when the next item isn't a comment.
     pub fn removeCommentAfter(self: *Document, path: []const u8) Error!void {
-        const idx = self.kv_index.get(path) orelse return error.PathNotFound;
+        const idx = try self.editableKvIndex(path);
         if (idx + 1 >= self.items.items.len) return;
         const next = self.items.items[idx + 1];
         if (next != .comment) return;
@@ -517,7 +551,7 @@ pub const Document = struct {
     /// Set or replace the trailing comment on a kv line. Pass `null` to
     /// remove an existing trailing comment.
     pub fn setTrailingComment(self: *Document, path: []const u8, text: ?[]const u8) Error!void {
-        const idx = self.kv_index.get(path) orelse return error.PathNotFound;
+        const idx = try self.editableKvIndex(path);
         if (text) |t| try rejectMultilineComment(t);
         const old_item = self.items.items[idx];
         const old = old_item.kv;
@@ -749,15 +783,15 @@ fn formatValue(arena: Allocator, value: Value) ![]const u8 {
     return arena.dupe(u8, aw.written());
 }
 
-fn writeInlineValue(w: *Io.Writer, value: Value) Io.Writer.Error!void {
+fn writeInlineValue(w: *Io.Writer, value: Value) (Io.Writer.Error || error{ NestingTooDeep, OutOfMemory })!void {
     encoder.writeInlineValue(w, value) catch |err| switch (err) {
         // encoder.writeInlineValue delegates to writeValue, which encodes
         // Value.integer (always i64) and never calls writeTypedValue, so
-        // IntegerOverflow cannot arise here. The other branches are
-        // unreachable for the same reason as before.
+        // IntegerOverflow / UnsupportedType cannot arise here; ExpectedTable
+        // is only raised by top-level document encoding. A caller-supplied
+        // Value CAN exceed the encoder's depth cap, so NestingTooDeep is a
+        // real error and must propagate.
         error.ExpectedTable,
-        error.OutOfMemory,
-        error.NestingTooDeep,
         error.IntegerOverflow,
         error.UnsupportedType,
         => unreachable,
@@ -866,16 +900,42 @@ fn appendInlineEntry(arena: Allocator, layout: *InlineTableLayout, key: []const 
     // Inter-entry pattern: the bytes that appear between one entry's value
     // and the next entry's key. We copy this from the next-to-last entry's
     // trailing (which already encodes the user's style: ", " loose, "," tight,
-    // ",\n  " multi-line). When only one entry exists, synthesize from open's
-    // trailing whitespace (the bytes after `{`).
+    // ",\n  " multi-line), with any inline comment stripped: a comment
+    // belongs to its own entry and must never be copied to another one.
+    // When only one entry exists, synthesize from open's trailing whitespace
+    // (the bytes after `{`).
     const inter_pattern: []const u8 = blk: {
         if (layout.entries.items.len >= 2) {
-            break :blk try arena.dupe(u8, layout.entries.items[last_idx - 1].trailing);
+            break :blk try stripInlineComment(arena, layout.entries.items[last_idx - 1].trailing);
         }
-        // Single existing entry: build "," + open's trailing ws.
         const open_trail = layout.open[1..]; // bytes after `{`
         break :blk try std.mem.concat(arena, u8, &.{ ",", open_trail });
     };
+
+    if (std.mem.indexOfScalar(u8, last.trailing, '#')) |hash| {
+        // The old last entry carries an inline comment. Keep the comment on
+        // its entry: add the separating comma before it when missing, end
+        // the comment's line, and indent the new entry like its siblings.
+        // The bytes after the comment's line break (close-side padding)
+        // move to the new entry.
+        const nl = std.mem.indexOfScalarPos(u8, last.trailing, hash, '\n');
+        const new_entry_trailing: []const u8 = if (nl) |n|
+            try arena.dupe(u8, last.trailing[n..])
+        else
+            "";
+        const comma: []const u8 = if (std.mem.indexOfScalar(u8, last.trailing, ',') == null) "," else "";
+        const head = if (nl) |n| last.trailing[0..n] else last.trailing;
+        const sep = try arena.dupe(u8, last.sep);
+        last.trailing = try std.mem.concat(arena, u8, &.{ comma, head, "\n", wsTail(inter_pattern) });
+        try layout.entries.append(arena, .{
+            .key_raw = key_raw,
+            .key = try arena.dupe(u8, key),
+            .sep = sep,
+            .value = .{ .raw = try arena.dupe(u8, raw_value) },
+            .trailing = new_entry_trailing,
+        });
+        return;
+    }
 
     // The new (last) entry needs a trailing that continues the close-side
     // pattern. Reuse the old last.trailing when non-empty (it carries either
@@ -902,6 +962,23 @@ fn appendInlineEntry(arena: Allocator, layout: *InlineTableLayout, key: []const 
         .value = .{ .raw = try arena.dupe(u8, raw_value) },
         .trailing = new_entry_trailing,
     });
+}
+
+/// Drop an inline `# ...` comment from a trailing-bytes pattern, keeping the
+/// comma and the line-break/indent structure around it.
+fn stripInlineComment(arena: Allocator, t: []const u8) Error![]const u8 {
+    const hash = std.mem.indexOfScalar(u8, t, '#') orelse return arena.dupe(u8, t);
+    var head_end = hash;
+    while (head_end > 0 and (t[head_end - 1] == ' ' or t[head_end - 1] == '\t')) head_end -= 1;
+    const nl = std.mem.indexOfScalarPos(u8, t, hash, '\n') orelse t.len;
+    return std.mem.concat(arena, u8, &.{ t[0..head_end], t[nl..] });
+}
+
+/// The indentation bytes after the last line break of `pattern`, or an
+/// empty slice for a single-line pattern.
+fn wsTail(pattern: []const u8) []const u8 {
+    if (std.mem.lastIndexOfScalar(u8, pattern, '\n')) |n| return pattern[n + 1 ..];
+    return "";
 }
 
 /// Render a decoded dotted path as a TOML header body, re-encoding each
@@ -1038,15 +1115,14 @@ fn tokenize(doc: *Document, src: []const u8) !void {
             const raw = src[line_start..line_end];
             const is_array = src.len > next_significant + 1 and src[next_significant + 1] == '[';
             const path_start = next_significant + (if (is_array) @as(usize, 2) else @as(usize, 1));
-            const path_end = blk: {
-                var i = path_start;
-                var depth: usize = if (is_array) 2 else 1;
-                while (i < src.len and depth > 0) : (i += 1) {
-                    if (src[i] == ']') depth -= 1;
-                }
-                // i now points one past the last ']'
-                break :blk i - (if (is_array) @as(usize, 2) else @as(usize, 1));
-            };
+            // scanHeader already found the closing bracket(s) quote-aware
+            // (a quoted segment may contain `]`); derive the path end from
+            // it instead of rescanning naively.
+            const closer_len: usize = if (is_array) 2 else 1;
+            const path_end = if (after_header >= path_start + closer_len)
+                after_header - closer_len
+            else
+                path_start;
             const header_path = std.mem.trim(u8, src[path_start..path_end], " \t");
             // Index headers by their decoded dotted path so kv full_paths,
             // section lookups, and `get` all share one key identity.
@@ -1061,6 +1137,7 @@ fn tokenize(doc: *Document, src: []const u8) !void {
             try doc.items.append(doc.arena, header_item);
             current_section = owned_path;
             try doc.section_end.put(doc.arena, owned_path, doc.items.items.len - 1);
+            if (is_array) try doc.aot_paths.put(doc.arena, owned_path, {});
 
             tok.pos = line_end;
             continue;
@@ -1574,6 +1651,58 @@ test "document: quoted header path indexes kv by decoded identity" {
     try testing.expectEqual(@as(i64, 2), doc.get("a b.k").?.integer);
 }
 
+test "document: header with a bracket inside a quoted segment is editable" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var doc = try Document.parse(arena.allocator(),
+        \\["a]b"]
+        \\x = 1
+        \\
+    , .{});
+
+    try testing.expectEqual(@as(i64, 1), doc.get("a]b.x").?.integer);
+    try doc.setLiteral("a]b.x", "2");
+    try testing.expectEqual(@as(i64, 2), doc.get("a]b.x").?.integer);
+
+    var aw: Io.Writer.Allocating = .init(arena.allocator());
+    defer aw.deinit();
+    try doc.emit(&aw.writer);
+    try testing.expectEqualStrings("[\"a]b\"]\nx = 2\n", aw.written());
+}
+
+test "document: editors refuse paths through arrays-of-tables" {
+    const src =
+        \\[[users]]
+        \\name = "a"
+        \\[[users]]
+        \\name = "b"
+        \\
+    ;
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var doc = try Document.parse(arena.allocator(), src, .{});
+
+    // Direction 1: `get` cannot address through the array without an index,
+    // so the editors must refuse rather than silently edit the LAST element.
+    try testing.expect(doc.get("users.name") == null);
+    try testing.expectError(error.UnsupportedPath, doc.setLiteral("users.name", "\"c\""));
+    try testing.expectError(error.UnsupportedPath, doc.remove("users.name"));
+    try testing.expectError(error.UnsupportedPath, doc.setTrailingComment("users.name", "hm"));
+    try testing.expectError(error.UnsupportedPath, doc.addCommentBefore("users.name", "hm"));
+
+    // Direction 2: the indexed form IS readable, and the editors reject it
+    // explicitly as unsupported (no silent misdirection either way).
+    try testing.expectEqualStrings("a", doc.get("users[0].name").?.string);
+    try testing.expectEqualStrings("b", doc.get("users[1].name").?.string);
+    try testing.expectError(error.UnsupportedPath, doc.setLiteral("users[1].name", "\"c\""));
+
+    // Nothing was modified.
+    var aw: Io.Writer.Allocating = .init(arena.allocator());
+    defer aw.deinit();
+    try doc.emit(&aw.writer);
+    try testing.expectEqualStrings(src, aw.written());
+}
+
 test "document: set over a quoted-string value replaces the whole token" {
     var arena = ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1645,6 +1774,49 @@ test "document: remove drops the line" {
     defer aw.deinit();
     try doc.emit(&aw.writer);
     try testing.expectEqualStrings("[server]\nport = 8080\n", aw.written());
+}
+
+test "document: remove first, middle, last, and only kv" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    // Only kv in the document (section_end for "" points at index 0).
+    var only = try Document.parse(arena.allocator(), "x = 1\n", .{});
+    try only.remove("x");
+    var aw: Io.Writer.Allocating = .init(arena.allocator());
+    defer aw.deinit();
+    try only.emit(&aw.writer);
+    try testing.expectEqualStrings("", aw.written());
+    try testing.expect(only.get("x") == null);
+
+    var doc = try Document.parse(arena.allocator(),
+        \\a = 1
+        \\b = 2
+        \\c = 3
+        \\
+    , .{});
+    try doc.remove("a");
+    try doc.remove("b");
+    try doc.remove("c");
+    var aw2: Io.Writer.Allocating = .init(arena.allocator());
+    defer aw2.deinit();
+    try doc.emit(&aw2.writer);
+    try testing.expectEqualStrings("", aw2.written());
+
+    // Middle then last, checking survivors stay addressable/editable.
+    var doc2 = try Document.parse(arena.allocator(),
+        \\a = 1
+        \\b = 2
+        \\c = 3
+        \\
+    , .{});
+    try doc2.remove("b");
+    try doc2.remove("c");
+    try doc2.set("d", @as(i64, 4));
+    var aw3: Io.Writer.Allocating = .init(arena.allocator());
+    defer aw3.deinit();
+    try doc2.emit(&aw3.writer);
+    try testing.expectEqualStrings("a = 1\nd = 4\n", aw3.written());
 }
 
 test "document: round-trip preserves comments and blank lines" {
@@ -1808,6 +1980,36 @@ test "document: setLiteral adds new key inside an inline table" {
     try doc.emit(&aw.writer);
     const out = aw.written();
     try testing.expect(std.mem.indexOf(u8, out, "z = 3") != null);
+}
+
+test "document: append to inline table does not duplicate entry comments" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var doc = try Document.parse(arena.allocator(), "p = {\n  a = 1, # note\n  b = 2\n}\n", .{});
+
+    try doc.setLiteral("p.c", "3");
+
+    var aw: Io.Writer.Allocating = .init(arena.allocator());
+    defer aw.deinit();
+    try doc.emit(&aw.writer);
+    const out = aw.written();
+    try testing.expectEqualStrings("p = {\n  a = 1, # note\n  b = 2,\n  c = 3\n}\n", out);
+    try testing.expectEqual(@as(i64, 3), doc.get("p.c").?.integer);
+}
+
+test "document: append after a commented last inline entry keeps its comment" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var doc = try Document.parse(arena.allocator(), "q = {\n  a = 1, # note\n}\n", .{});
+
+    try doc.setLiteral("q.b", "2");
+
+    var aw: Io.Writer.Allocating = .init(arena.allocator());
+    defer aw.deinit();
+    try doc.emit(&aw.writer);
+    const out = aw.written();
+    try testing.expectEqualStrings("q = {\n  a = 1, # note\n  b = 2\n}\n", out);
+    try testing.expectEqual(@as(i64, 2), doc.get("q.b").?.integer);
 }
 
 test "document: moveSection swaps section order" {
@@ -1976,6 +2178,27 @@ test "Document.parse: deeply nested inline table errors instead of overflowing" 
     i = 0;
     while (i < 12000) : (i += 1) try src.append(a, '}');
     try testing.expectError(error.NestingTooDeep, Document.parse(a, src.items, .{}));
+}
+
+test "Document.setValue: value deeper than the encoder cap errors, no panic" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var doc = try Document.parse(a, "x = 1\n", .{});
+
+    // 200 nested single-element arrays (past the encoder's depth cap).
+    var deep: Value = .{ .integer = 1 };
+    var i: usize = 0;
+    while (i < 200) : (i += 1) {
+        var arr: std.ArrayList(Value) = .empty;
+        try arr.append(a, deep);
+        deep = .{ .array = arr };
+    }
+    try testing.expectError(error.NestingTooDeep, doc.setValue("x", deep));
+
+    // The document is unchanged and still editable.
+    try testing.expectEqual(@as(i64, 1), doc.get("x").?.integer);
 }
 
 test "parseInlineLayout: empty table" {
