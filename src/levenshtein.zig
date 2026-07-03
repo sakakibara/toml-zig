@@ -4,9 +4,10 @@
 const std = @import("std");
 const testing = std.testing;
 
-/// Edit distance between `a` and `b`, capped at `cap`. Returns `cap + 1`
-/// if the true distance is > `cap`. O(a.len * b.len) DP, no allocation
-/// (uses two stack rows up to 256 chars).
+/// Edit distance between `a` and `b`, capped at `cap`: returns `cap + 1`
+/// when the true distance exceeds `cap`. Exception: when either input is
+/// empty the other input's length is returned uncapped. O(a.len * b.len)
+/// DP, no allocation (uses two stack rows up to 256 chars).
 pub fn levenshtein(a: []const u8, b: []const u8, cap: usize) usize {
     if (a.len == 0) return b.len;
     if (b.len == 0) return a.len;

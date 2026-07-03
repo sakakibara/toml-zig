@@ -126,7 +126,9 @@ pub const Value = union(enum) {
     array: Array,
     table: Table,
 
-    /// Deep equality. Order-sensitive for tables.
+    /// Deep equality. Tables compare by key set and per-key value,
+    /// regardless of entry order; arrays compare element-by-element in
+    /// order. Floats compare bitwise (NaN == NaN, +0 != -0).
     pub fn eql(a: Value, b: Value) bool {
         if (@as(std.meta.Tag(Value), a) != @as(std.meta.Tag(Value), b)) return false;
         return switch (a) {
@@ -382,8 +384,9 @@ pub const Value = union(enum) {
 /// Convert a native Zig value into a `Value`, comptime-dispatched on
 /// `@TypeOf(value)`. Used by `Value.set` and `Document.set`.
 /// Supported: Value passthrough, Date/Time/DateTime, bool, integer
-/// (runtime i64 range check; returns IntegerOverflow for values that do
-/// not fit), float, []const u8, string literal pointers
+/// (runtime i64 range check; returns IntegerOverflow for values not
+/// representable as a TOML i64 -- distinct from decode's `Overflow`,
+/// which is target-Zig-type overflow), float, []const u8, string literal pointers
 /// (`*const [N:0]u8` and `*const [N]u8`). Unsupported types compile-error.
 pub fn fromAny(arena: Allocator, comptime T: type, value: T) (Allocator.Error || error{IntegerOverflow})!Value {
     if (T == Value) return value;

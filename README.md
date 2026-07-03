@@ -23,6 +23,10 @@ const Config = struct {
     },
 };
 
+var arena_state = std.heap.ArenaAllocator.init(gpa);
+defer arena_state.deinit();
+const arena = arena_state.allocator();
+
 const cfg = try toml.parseInto(Config, arena, src, .{});
 ```
 
@@ -52,10 +56,11 @@ exe.root_module.addImport("toml", toml.module("toml"));
 const std = @import("std");
 const toml = @import("toml");
 
-var arena: std.heap.ArenaAllocator = .init(gpa);
-defer arena.deinit();
+var arena_state = std.heap.ArenaAllocator.init(gpa);
+defer arena_state.deinit();
+const arena = arena_state.allocator();
 
-const v = try toml.parse(arena.allocator(),
+const v = try toml.parse(arena,
     \\title = "example"
     \\
     \\[server]
@@ -132,10 +137,10 @@ decode as `HttpConfig`. For variant-name overrides, use `toml_rename`
 on the union itself.
 
 For symmetric encoding of typed values (consulting the same
-annotations), use `toml.encodeTyped(T, value, w, arena)`:
+annotations), use `toml.encodeTyped(w, T, value, arena)`:
 
 ```zig
-try toml.encodeTyped(Config, cfg, w, arena);
+try toml.encodeTyped(w, Config, cfg, arena);
 ```
 
 The existing `toml.encode(w, value: Value)` still applies for

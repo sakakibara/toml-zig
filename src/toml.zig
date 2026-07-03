@@ -80,6 +80,14 @@ pub const ValueStream = stream.ValueStream;
 /// Parse a TOML document from a byte slice. See `ParseOptions` for the
 /// option fields.
 ///
+/// Zero-copy: string values and table keys in the returned tree may slice
+/// directly into `src` (only strings needing unescaping are copied into the
+/// arena). Keep `src` alive and unmodified for as long as the returned
+/// `Value` is used.
+///
+/// Integers are `i64` (`Value.integer`); TOML integers outside the i64
+/// range are a parse error, not silently truncated.
+///
 /// Inputs of any in-memory size parse fine: tokenizer/parser offsets and
 /// `Span` byte offsets are u64, so there is no 4 GiB cap on plain parses,
 /// the opt-in spans map (`ParseOptions.spans`), or the document model.
