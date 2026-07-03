@@ -17,7 +17,7 @@
 //!
 //! The framing oracle is the real `Tokenizer` (`frameNextUnit`): it drives the
 //! lexer over the buffer so a `[` inside a string / comment / inline array /
-//! multi-line string is never mistaken for a unit boundary  -  only a true
+//! multi-line string is never mistaken for a unit boundary -- only a true
 //! line-leading header token cuts a unit.
 //!
 //! Borrow contract: an `Event`'s payload slices (`table_header`, `key`,
@@ -108,7 +108,7 @@ pub const FrameResult = union(enum) {
 /// `Tokenizer` is the oracle: a `[` inside a string, a comment, a multi-line
 /// string, or an inline array/table is tokenized as its true kind (never a
 /// header token), so it never cuts a unit. `need_more` is returned when no
-/// boundary header has appeared yet AND more bytes are coming  -  including
+/// boundary header has appeared yet AND more bytes are coming -- including
 /// the case where a string/value runs to buffer end mid-token.
 pub fn frameNextUnit(bytes: []const u8, ended: bool) FrameResult {
     if (bytes.len == 0) {
@@ -199,7 +199,7 @@ pub const EventReader = struct {
     /// Shared accumulating root. Only the leaf table of the unit being emitted
     /// is walked; intermediate tables it created are not re-walked. Its values
     /// live in `unit_arena` and are reset per unit, so `root` is NOT a stable
-    /// whole-document tree  -  it is scratch for the current unit.
+    /// whole-document tree -- it is scratch for the current unit.
     root: parser.Value.Table = .empty,
 
     /// PER-UNIT arena: owns the current unit's VALUES. Reset after the unit's
@@ -981,7 +981,7 @@ fn reassembleFrom(gpa: std.mem.Allocator, arena: std.mem.Allocator, er: *EventRe
     _ = gpa;
     var root: Value = .makeTable();
     // Current table prefix (dotted) the events land under. All scratch uses
-    // the test arena, freed at the end of the test  -  this is a test oracle,
+    // the test arena, freed at the end of the test -- this is a test oracle,
     // not production code.
     var header: std.ArrayList(u8) = .empty;
     var is_array_header = false;
@@ -1209,7 +1209,7 @@ test "gate B: accept/reject decision matches buffered parse" {
         // later index-free header / dotted-key that targets the SAME element
         // must reject, mirroring the buffered tree-walk. Earlier-element
         // leaves are shadowed (a fresh `[[w]]` makes `[w.a]` address a new
-        // element) and must NOT block  -  see the accept cases below.
+        // element) and must NOT block -- see the accept cases below.
         .{ .src = "[[w]]\na = 1\n[w.a]\nb = 2\n", .ok = false },
         .{ .src = "[[w]]\na = 1\n[w.a.b]\nx = 2\n", .ok = false },
         .{ .src = "[[w]]\na = [1,2]\n[w.a]\nb = 2\n", .ok = false },
@@ -1220,7 +1220,7 @@ test "gate B: accept/reject decision matches buffered parse" {
         .{ .src = "[[w]]\nb = 1\n[[w]]\na = 1\n[w.a]\nc = 2\n", .ok = false },
 
         // Shadowing: `[w.a]` after a second `[[w]]` targets the NEW element,
-        // which has no `a`  -  the earlier element's `a` leaf is unreachable
+        // which has no `a` -- the earlier element's `a` leaf is unreachable
         // and must not false-positive. Buffered accepts; streaming must too.
         .{ .src = "[[w]]\na = 1\n[[w]]\nb = 2\n[w.a]\nc = 3\n", .ok = true },
         // Header into a different child key of the aot element: accept.
@@ -1970,7 +1970,7 @@ test "stream: diagnostic borrowed fields survive continuing past an error" {
 
     try testing.expectEqual(@as(usize, 1), errors.items.len);
     for ([_]Diagnostic{ errors.items[0], vs.diagnostic().? }) |d| {
-        try testing.expectEqualStrings("invalid value `flase`", d.message);
+        try testing.expectEqualStrings("invalid value 'flase'", d.message);
         try testing.expectEqualStrings("false", d.suggestion.?);
         try testing.expect(d.path == null);
         try testing.expectEqual(@as(usize, 0), d.notes.len);

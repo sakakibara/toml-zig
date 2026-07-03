@@ -705,7 +705,7 @@ pub fn ParserOf(comptime Sink: type) type {
             return;
         }
         if (self.peek() == '\r') {
-            if (self.peekAt(1) != '\n') return self.setError("bare CR");
+            if (self.peekAt(1) != '\n') return self.setError("bare CR is invalid");
             self.advance();
             self.advance();
             return;
@@ -1586,7 +1586,7 @@ pub fn ParserOf(comptime Sink: type) type {
                 return slice;
             }
             if (c == '\n' or c == '\r') return self.setError("newline in literal string");
-            if (c < 0x20 and c != 0x09) return self.setError("control in literal string");
+            if (c < 0x20 and c != 0x09) return self.setError("control character in literal string");
             if (c == 0x7F) return self.setError("DEL in literal string");
             if (c >= 0x80) {
                 try self.validateUtf8();
@@ -1715,7 +1715,7 @@ pub fn ParserOf(comptime Sink: type) type {
             }
             // Lone CR (not followed by LF) is invalid per TOML 1.1.
             if (c == 0x0D and self.peekAt(1) != '\n') return self.setError("lone CR in literal string");
-            if (c < 0x20 and c != 0x09 and c != 0x0A and c != 0x0D) return self.setError("control in literal string");
+            if (c < 0x20 and c != 0x09 and c != 0x0A and c != 0x0D) return self.setError("control character in literal string");
             if (c == 0x7F) return self.setError("DEL in literal string");
             if (c >= 0x80) {
                 try self.validateUtf8();
@@ -1755,7 +1755,7 @@ pub fn ParserOf(comptime Sink: type) type {
                 // CRLF was consumed above, so any remaining CR is lone and
                 // invalid per TOML 1.1, exactly as in the zero-copy scan.
                 if (c == 0x0D) return self.setError("lone CR in literal string");
-                if (c < 0x20 and c != 0x09 and c != 0x0A and c != 0x0D) return self.setError("control in literal string");
+                if (c < 0x20 and c != 0x09 and c != 0x0A and c != 0x0D) return self.setError("control character in literal string");
                 if (c == 0x7F) return self.setError("DEL in literal string");
                 if (c >= 0x80) {
                     const before = self.pos;
@@ -1788,7 +1788,7 @@ pub fn ParserOf(comptime Sink: type) type {
         const word = self.input[word_start..self.pos];
         const known = [_][]const u8{ "true", "false", "inf", "nan" };
         const suggestion = lev.closestMatch(word, &known, lev.suggestionThreshold(word.len));
-        const msg = std.fmt.allocPrint(self.arena, "invalid value `{s}`", .{word}) catch return error.OutOfMemory;
+        const msg = std.fmt.allocPrint(self.arena, "invalid value '{s}'", .{word}) catch return error.OutOfMemory;
         return self.setErrorWithSuggestion(msg, suggestion);
     }
 
