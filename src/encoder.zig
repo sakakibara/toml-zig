@@ -18,6 +18,9 @@ const v = @import("value.zig");
 
 pub const Value = v.Value;
 
+/// `IntegerOverflow`: a Zig integer value cannot be represented as a TOML
+/// integer (i64). Distinct from decode's `Overflow`, which means a TOML
+/// value does not fit the target Zig type.
 pub const EncodeError = std.Io.Writer.Error || error{ ExpectedTable, NestingTooDeep, OutOfMemory, IntegerOverflow, UnsupportedType };
 
 const max_path_depth = 256;
@@ -46,7 +49,7 @@ pub fn encode(w: *Io.Writer, value: Value) EncodeError!void {
 ///
 /// Use this when the source is a typed Zig struct. Use `encode` when
 /// you have a hand-built `Value` tree.
-pub fn encodeTyped(comptime T: type, value: T, w: *std.Io.Writer, arena: std.mem.Allocator) EncodeError!void {
+pub fn encodeTyped(w: *std.Io.Writer, comptime T: type, value: T, arena: std.mem.Allocator) EncodeError!void {
     if (@typeInfo(T) != .@"struct") @compileError("encodeTyped: root must be a struct, got " ++ @typeName(T));
 
     var path_buf: [max_path_depth * @sizeOf([]const u8)]u8 = undefined;
@@ -239,32 +242,10 @@ fn emitFlatScalars(
     }
 }
 
-fn renamedKey(comptime T: type, comptime field_name: []const u8) []const u8 {
-    if (!@hasDecl(T, "toml_rename")) return field_name;
-    const renames = T.toml_rename;
-    if (@hasField(@TypeOf(renames), field_name)) {
-        return @field(renames, field_name);
-    }
-    return field_name;
-}
-
-fn isFlattened(comptime T: type, comptime field_name: []const u8) bool {
-    if (!@hasDecl(T, "toml_flatten")) return false;
-    const flat = T.toml_flatten;
-    inline for (flat) |name| {
-        if (comptime std.mem.eql(u8, name, field_name)) return true;
-    }
-    return false;
-}
-
-fn isSkipped(comptime T: type, comptime field_name: []const u8) bool {
-    if (!@hasDecl(T, "toml_skip")) return false;
-    const skip = T.toml_skip;
-    inline for (skip) |name| {
-        if (comptime std.mem.eql(u8, name, field_name)) return true;
-    }
-    return false;
-}
+const annotations = @import("annotations.zig");
+const renamedKey = annotations.renamedKey;
+const isFlattened = annotations.isFlattened;
+const isSkipped = annotations.isSkipped;
 
 fn fieldHasSubTable(comptime FT: type) bool {
     return switch (@typeInfo(FT)) {
@@ -836,7 +817,7 @@ test "encodeTyped: un-annotated struct matches encode output" {
 
     var buf: [256]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try encodeTyped(Config, cfg, &aw, a);
+    try encodeTyped(&aw, Config, cfg, a);
     const out = aw.buffered();
 
     try testing.expect(std.mem.indexOf(u8, out, "name = \"ef\"") != null);
@@ -855,7 +836,7 @@ test "encodeTyped: toml_rename emits renamed key" {
 
     var buf: [256]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try encodeTyped(Config, cfg, &aw, arena.allocator());
+    try encodeTyped(&aw, Config, cfg, arena.allocator());
     const out = aw.buffered();
     try testing.expect(std.mem.indexOf(u8, out, "listen-addr = \"0.0.0.0\"") != null);
     try testing.expect(std.mem.indexOf(u8, out, "listen_addr") == null);
@@ -874,7 +855,7 @@ test "encodeTyped: toml_flatten inlines sub-fields at parent level" {
 
     var buf: [256]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try encodeTyped(Outer, cfg, &aw, arena.allocator());
+    try encodeTyped(&aw, Outer, cfg, arena.allocator());
     const out = aw.buffered();
 
     try testing.expect(std.mem.indexOf(u8, out, "name = \"foo\"") != null);
@@ -896,7 +877,7 @@ test "encodeTyped: toml_skip omits field from output" {
 
     var buf: [256]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try encodeTyped(Config, cfg, &aw, arena.allocator());
+    try encodeTyped(&aw, Config, cfg, arena.allocator());
     const out = aw.buffered();
     try testing.expect(std.mem.indexOf(u8, out, "name = \"foo\"") != null);
     try testing.expect(std.mem.indexOf(u8, out, "internal") == null);
@@ -924,7 +905,7 @@ test "encodeTyped: toToml hook bypasses built-in encoding" {
 
     var buf: [256]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try encodeTyped(Config, cfg, &aw, arena.allocator());
+    try encodeTyped(&aw, Config, cfg, arena.allocator());
     const out = aw.buffered();
     try testing.expect(std.mem.indexOf(u8, out, "v = \"1.2.3\"") != null);
 }
@@ -945,7 +926,7 @@ test "encodeTyped: tagged union writes discriminator + payload" {
 
     var buf: [512]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try encodeTyped(Wrapper, cfg, &aw, arena.allocator());
+    try encodeTyped(&aw, Wrapper, cfg, arena.allocator());
     const out = aw.buffered();
 
     try testing.expect(std.mem.indexOf(u8, out, "kind = \"http\"") != null);
@@ -1040,7 +1021,7 @@ test "encodeTyped: toml_flatten with nested sub-table round-trips" {
 
     var buf: [512]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try encodeTyped(Outer, cfg, &aw, a);
+    try encodeTyped(&aw, Outer, cfg, a);
     const out = aw.buffered();
 
     // Flat scalars from inner must appear at the root level.
@@ -1075,7 +1056,7 @@ test "encodeTyped: toml_flatten scalars-only still works after refactor" {
 
     var buf: [256]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try encodeTyped(Outer, cfg, &aw, arena.allocator());
+    try encodeTyped(&aw, Outer, cfg, arena.allocator());
     const out = aw.buffered();
 
     try testing.expect(std.mem.indexOf(u8, out, "name = \"foo\"") != null);
@@ -1111,7 +1092,7 @@ test "encodeTyped: tagged union payload with nested sub-table round-trips" {
 
     var buf: [512]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try encodeTyped(Wrapper, cfg, &aw, a);
+    try encodeTyped(&aw, Wrapper, cfg, a);
     const out = aw.buffered();
 
     // Discriminator and flat scalar from the union payload.
@@ -1150,7 +1131,7 @@ test "encodeTyped: tagged union scalars-only still works after refactor" {
 
     var buf: [512]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try encodeTyped(Wrapper, cfg, &aw, arena.allocator());
+    try encodeTyped(&aw, Wrapper, cfg, arena.allocator());
     const out = aw.buffered();
 
     try testing.expect(std.mem.indexOf(u8, out, "kind = \"http\"") != null);
@@ -1180,7 +1161,7 @@ test "encodeTyped: toml_flatten two levels deep merges all scalars at root" {
 
     var buf: [256]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try encodeTyped(Outer, cfg, &aw, arena.allocator());
+    try encodeTyped(&aw, Outer, cfg, arena.allocator());
     const out = aw.buffered();
 
     // All scalars from all three struct types must appear at the root level.
@@ -1200,7 +1181,7 @@ test "encodeTyped: u64 field exceeding i64 max -> IntegerOverflow" {
     const cfg = Config{ .n = @as(u64, std.math.maxInt(i64)) + 1 };
     var buf: [64]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try testing.expectError(error.IntegerOverflow, encodeTyped(Config, cfg, &aw, arena.allocator()));
+    try testing.expectError(error.IntegerOverflow, encodeTyped(&aw, Config, cfg, arena.allocator()));
 }
 
 test "encodeTyped: u64 within i64 range round-trips" {
@@ -1210,7 +1191,7 @@ test "encodeTyped: u64 within i64 range round-trips" {
     const cfg = Config{ .n = 100 };
     var buf: [64]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try encodeTyped(Config, cfg, &aw, arena.allocator());
+    try encodeTyped(&aw, Config, cfg, arena.allocator());
     const out = aw.buffered();
     try testing.expect(std.mem.indexOf(u8, out, "n = 100") != null);
 }
@@ -1224,7 +1205,7 @@ test "encodeTyped: []const i64 emits TOML array and round-trips" {
     const cfg = Config{ .nums = nums };
     var buf: [128]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try encodeTyped(Config, cfg, &aw, a);
+    try encodeTyped(&aw, Config, cfg, a);
     const out = aw.buffered();
     try testing.expect(std.mem.indexOf(u8, out, "nums = [1, 2, 3]") != null);
     const decode_mod = @import("decode.zig");
@@ -1242,7 +1223,7 @@ test "encodeTyped: []const f64 emits TOML array and round-trips" {
     const cfg = Config{ .vals = vals };
     var buf: [256]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try encodeTyped(Config, cfg, &aw, a);
+    try encodeTyped(&aw, Config, cfg, a);
     const out = aw.buffered();
     const decode_mod = @import("decode.zig");
     const v1 = try parser.parse(a, out, .{});
@@ -1262,7 +1243,7 @@ test "encodeTyped: [3]u8 fixed array is array of ints (not string)" {
     const cfg = Config{ .bytes = .{ 1, 2, 3 } };
     var buf: [128]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try encodeTyped(Config, cfg, &aw, a);
+    try encodeTyped(&aw, Config, cfg, a);
     const out = aw.buffered();
     try testing.expect(std.mem.indexOf(u8, out, "bytes = [1, 2, 3]") != null);
     const decode_mod = @import("decode.zig");
@@ -1279,7 +1260,7 @@ test "encodeTyped: [3]i64 fixed array round-trips" {
     const cfg = Config{ .vals = .{ 10, 20, 30 } };
     var buf: [128]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try encodeTyped(Config, cfg, &aw, a);
+    try encodeTyped(&aw, Config, cfg, a);
     const out = aw.buffered();
     try testing.expect(std.mem.indexOf(u8, out, "vals = [10, 20, 30]") != null);
     const decode_mod = @import("decode.zig");
@@ -1296,7 +1277,7 @@ test "encodeTyped: [0]i64 emits empty TOML array and round-trips" {
     const cfg = Config{ .empty = .{} };
     var buf: [64]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try encodeTyped(Config, cfg, &aw, a);
+    try encodeTyped(&aw, Config, cfg, a);
     const out = aw.buffered();
     try testing.expect(std.mem.indexOf(u8, out, "empty = []") != null);
     const decode_mod = @import("decode.zig");
@@ -1313,7 +1294,7 @@ test "encodeTyped: ?i64 non-null emits key and round-trips" {
     const cfg = Config{ .x = 5 };
     var buf: [64]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try encodeTyped(Config, cfg, &aw, a);
+    try encodeTyped(&aw, Config, cfg, a);
     const out = aw.buffered();
     try testing.expect(std.mem.indexOf(u8, out, "x = 5") != null);
     const decode_mod = @import("decode.zig");
@@ -1330,7 +1311,7 @@ test "encodeTyped: ?i64 null omits key entirely; decode yields null" {
     const cfg = Config{ .x = null, .y = 7 };
     var buf: [64]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try encodeTyped(Config, cfg, &aw, a);
+    try encodeTyped(&aw, Config, cfg, a);
     const out = aw.buffered();
     // x must be absent from the TOML output.
     try testing.expect(std.mem.indexOf(u8, out, "x") == null);
@@ -1351,7 +1332,7 @@ test "encodeTyped: enum field emits tag name as string and round-trips" {
     const cfg = Config{ .color = .red };
     var buf: [64]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try encodeTyped(Config, cfg, &aw, a);
+    try encodeTyped(&aw, Config, cfg, a);
     const out = aw.buffered();
     try testing.expect(std.mem.indexOf(u8, out, "color = \"red\"") != null);
     const decode_mod = @import("decode.zig");
@@ -1369,7 +1350,7 @@ test "encodeTyped: []const []const u8 emits array of strings and round-trips" {
     const cfg = Config{ .tags = tags };
     var buf: [128]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try encodeTyped(Config, cfg, &aw, a);
+    try encodeTyped(&aw, Config, cfg, a);
     const out = aw.buffered();
     try testing.expect(std.mem.indexOf(u8, out, "tags = [\"foo\", \"bar\", \"baz\"]") != null);
     const decode_mod = @import("decode.zig");
@@ -1481,7 +1462,7 @@ test "encodeTyped: optional sub-table present round-trips" {
     const cfg = S{ .name = "hello", .sub = .{ .x = 1, .y = 2 } };
     var buf: [256]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try encodeTyped(S, cfg, &aw, a);
+    try encodeTyped(&aw, S, cfg, a);
     const out = aw.buffered();
 
     try testing.expect(std.mem.indexOf(u8, out, "[sub]") != null);
@@ -1508,7 +1489,7 @@ test "encodeTyped: optional sub-table null emits no header" {
     const cfg = S{ .name = "hello", .sub = null };
     var buf: [256]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try encodeTyped(S, cfg, &aw, a);
+    try encodeTyped(&aw, S, cfg, a);
     const out = aw.buffered();
 
     // No [sub] section header when the optional sub-table is null.
@@ -1536,7 +1517,7 @@ test "encodeTyped: nested optional sub-tables round-trip" {
         const cfg = Root{ .a = .{ .b = .{ .v = 42 } } };
         var buf: [256]u8 = undefined;
         var aw: std.Io.Writer = .fixed(&buf);
-        try encodeTyped(Root, cfg, &aw, a);
+        try encodeTyped(&aw, Root, cfg, a);
         const out = aw.buffered();
         try testing.expect(std.mem.indexOf(u8, out, "[a]") != null);
         try testing.expect(std.mem.indexOf(u8, out, "[a.b]") != null);
@@ -1553,7 +1534,7 @@ test "encodeTyped: nested optional sub-tables round-trip" {
         const cfg = Root{ .a = .{ .b = null } };
         var buf: [256]u8 = undefined;
         var aw: std.Io.Writer = .fixed(&buf);
-        try encodeTyped(Root, cfg, &aw, a);
+        try encodeTyped(&aw, Root, cfg, a);
         const out = aw.buffered();
         try testing.expect(std.mem.indexOf(u8, out, "[a]") != null);
         // Inner null means no [a.b] section.
@@ -1570,7 +1551,7 @@ test "encodeTyped: nested optional sub-tables round-trip" {
         const cfg = Root{ .a = null };
         var buf: [256]u8 = undefined;
         var aw: std.Io.Writer = .fixed(&buf);
-        try encodeTyped(Root, cfg, &aw, a);
+        try encodeTyped(&aw, Root, cfg, a);
         const out = aw.buffered();
         try testing.expect(std.mem.indexOf(u8, out, "[a]") == null);
         const decode_mod = @import("decode.zig");
@@ -1597,7 +1578,7 @@ test "encodeTyped: slice-of-struct emits [[array-of-tables]] and round-trips" {
 
     var buf: [1024]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try encodeTyped(Config, cfg, &aw, a);
+    try encodeTyped(&aw, Config, cfg, a);
     const out = aw.buffered();
 
     // Three [[items]] headers, one per element.
@@ -1631,7 +1612,7 @@ test "encodeTyped: ?[]const struct null emits nothing, present emits blocks" {
         const cfg = Config{ .name = "n", .items = null };
         var buf: [512]u8 = undefined;
         var aw: std.Io.Writer = .fixed(&buf);
-        try encodeTyped(Config, cfg, &aw, a);
+        try encodeTyped(&aw, Config, cfg, a);
         const out = aw.buffered();
         try testing.expect(std.mem.indexOf(u8, out, "[[items]]") == null);
         const v1 = try parser.parse(a, out, .{});
@@ -1645,7 +1626,7 @@ test "encodeTyped: ?[]const struct null emits nothing, present emits blocks" {
         const cfg = Config{ .name = "n", .items = items };
         var buf: [512]u8 = undefined;
         var aw: std.Io.Writer = .fixed(&buf);
-        try encodeTyped(Config, cfg, &aw, a);
+        try encodeTyped(&aw, Config, cfg, a);
         const out = aw.buffered();
         try testing.expect(std.mem.indexOf(u8, out, "[[items]]") != null);
         const v1 = try parser.parse(a, out, .{});
@@ -1670,7 +1651,7 @@ test "encodeTyped: empty slice-of-struct emits no blocks, round-trips empty" {
     const cfg = Config{ .items = &.{} };
     var buf: [256]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try encodeTyped(Config, cfg, &aw, a);
+    try encodeTyped(&aw, Config, cfg, a);
     const out = aw.buffered();
     try testing.expect(std.mem.indexOf(u8, out, "[[items]]") == null);
 
@@ -1696,7 +1677,7 @@ test "encodeTyped: nested array-of-tables emits [[a]] + [[a.b]] and round-trips"
 
     var buf: [1024]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try encodeTyped(Config, cfg, &aw, a);
+    try encodeTyped(&aw, Config, cfg, a);
     const out = aw.buffered();
 
     try testing.expect(std.mem.indexOf(u8, out, "[[a]]") != null);
@@ -1734,7 +1715,7 @@ test "encodeTyped: array-of-tables element mixing scalar and sub-table field" {
 
     var buf: [1024]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try encodeTyped(Config, cfg, &aw, a);
+    try encodeTyped(&aw, Config, cfg, a);
     const out = aw.buffered();
 
     // Two [[items]] element headers, each with its own scalar and [items.sub].
@@ -1765,7 +1746,7 @@ test "encodeTyped: [N]struct fixed array emits [[array-of-tables]] and round-tri
     const cfg = Config{ .items = .{ .{ .v = 7 }, .{ .v = 8 } } };
     var buf: [512]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try encodeTyped(Config, cfg, &aw, a);
+    try encodeTyped(&aw, Config, cfg, a);
     const out = aw.buffered();
     try testing.expect(std.mem.indexOf(u8, out, "[[items]]") != null);
 
