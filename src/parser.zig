@@ -114,11 +114,21 @@ pub const ParseOptions = struct {
     /// skip-to-next-newline). Returns `error.TomlParseError` if any errors
     /// were collected. When null, parser bails on the first error with no
     /// error info captured.
+    ///
+    /// Ownership: the list's entries AND their string payloads (message,
+    /// suggestion, ...) are allocated from the parse arena. Deinit the list
+    /// with that arena's allocator, or simply drop it when the arena is
+    /// freed; do not deinit it with another allocator. (The streaming
+    /// readers differ: they copy diagnostics into stream-lifetime memory
+    /// and append with their own gpa.)
     errors: ?*std.ArrayList(Diagnostic) = null,
 
     /// If non-null, populated with one Span per emitted Value, keyed by
     /// dotted path. Array elements use `[N]` index segments. Spans store
     /// u64 byte offsets, so any in-memory buffer can be recorded.
+    /// Buffered parsing only: the streaming readers (`EventReader` /
+    /// `ValueStream`) never populate a caller-provided map; use each
+    /// `Event.span` instead.
     spans: ?*v.Spans = null,
 
     /// Decode-only. When true, TOML keys absent from the target struct
@@ -209,7 +219,8 @@ pub fn parse(arena: Allocator, input: []const u8, options: ParseOptions) Error!V
 /// tree decodes keys, joined by '.'. This is the identity used by
 /// `Value.get`, so the document model uses it to index editable kv lines
 /// under the same key `get` resolves. `raw` must be exactly the key bytes
-/// (no surrounding `=` or value). Returns InvalidValue on a malformed key.
+/// (no surrounding `=` or value). Returns `error.TomlParseError` on a
+/// malformed key.
 pub fn decodeKeyPath(arena: Allocator, raw: []const u8) Error![]const u8 {
     var p = Parser.init(arena, raw);
     var parts: ArrayList([]const u8) = .empty;
@@ -1741,6 +1752,9 @@ pub fn ParserOf(comptime Sink: type) type {
                         return buf.items;
                     }
                 }
+                // CRLF was consumed above, so any remaining CR is lone and
+                // invalid per TOML 1.1, exactly as in the zero-copy scan.
+                if (c == 0x0D) return self.setError("lone CR in literal string");
                 if (c < 0x20 and c != 0x09 and c != 0x0A and c != 0x0D) return self.setError("control in literal string");
                 if (c == 0x7F) return self.setError("DEL in literal string");
                 if (c >= 0x80) {
@@ -2132,11 +2146,9 @@ fn parseDecIntRaw(s: []const u8) error{InvalidInteger}!i64 {
     }
     if (i >= s.len) return error.InvalidInteger;
 
-    // No leading zeros (except for literal 0).
-    if (s[i] == '0' and i + 1 < s.len) {
-        // Allow "0" only; "00", "01" etc. invalid.
-        if (s[i + 1] != 0) return error.InvalidInteger;
-    }
+    // No leading zeros (except for literal 0): a '0' first digit must be
+    // the entire number, so ANY following byte is invalid.
+    if (s[i] == '0' and i + 1 < s.len) return error.InvalidInteger;
 
     var last_underscore = true; // require digit first
     var acc: u64 = 0;
@@ -2360,6 +2372,23 @@ test "multiline literal string: lone leading CR is rejected" {
     try testing.expectError(error.TomlParseError, parse(arena.allocator(), src, .{}));
 }
 
+test "multiline literal string: lone CR after an earlier CRLF is rejected" {
+    // The first CRLF routes the string through the copy path; a later lone
+    // CR must still be rejected there, never leaked as a raw 0x0D byte.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const src = "a = '''x\r\ny\rz'''";
+    try testing.expectError(error.TomlParseError, parse(arena.allocator(), src, .{}));
+}
+
+test "multiline literal string: CRLF-only body normalizes to LF (valid)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const src = "a = '''x\r\ny'''";
+    const val = try parse(arena.allocator(), src, .{});
+    try testing.expectEqualStrings("x\ny", val.table.get("a").?.string);
+}
+
 test "multiline basic string: leading CRLF is trimmed (valid)" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -2374,6 +2403,18 @@ test "multiline basic string: leading LF is trimmed (valid)" {
     const src = "a = \"\"\"\nx\"\"\"";
     const val = try parse(arena.allocator(), src, .{});
     try testing.expectEqualStrings("x", val.table.get("a").?.string);
+}
+
+test "decimal integers: leading zero rejected, bare zero accepted" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectError(error.TomlParseError, parse(a, "x = 00", .{}));
+    try testing.expectError(error.TomlParseError, parse(a, "x = 01", .{}));
+    try testing.expectError(error.TomlParseError, parse(a, "x = -01", .{}));
+    try testing.expectError(error.TomlParseError, parse(a, "x = 0_1", .{}));
+    try testing.expectEqual(@as(i64, 0), (try parse(a, "x = 0", .{})).table.get("x").?.integer);
+    try testing.expectEqual(@as(i64, 0), (try parse(a, "x = -0", .{})).table.get("x").?.integer);
 }
 
 test "parse integers all radixes" {
