@@ -154,7 +154,6 @@ const FuzzError = error{
     RoundTripMismatch,
     LosslessFailure,
     SpanOutOfBounds,
-    DepthNotBounded,
     StreamingMismatch,
     TypedDivergence,
 };
@@ -280,11 +279,11 @@ fn eqlT(comptime T: type, x: T, y: T) bool {
 }
 
 /// Deep-nesting invariant: parse must RETURN (not stack-overflow) on
-/// pathologically nested input. Surviving the call is the primary
+/// pathologically nested input. Surviving the call is the whole
 /// assertion -- a regression of the depth bound crashes the process here
-/// instead of reaching the return below. When the nesting actually
-/// exceeds the parser's default ceiling, the error must be the distinct
-/// `error.NestingTooDeep`.
+/// instead of reaching the return below. Every member of the parse error
+/// set is an acceptable way to return; the exhaustive switch (no `else`)
+/// forces a re-audit here if that set ever grows.
 fn fuzzDeep(gpa: std.mem.Allocator, input: []const u8) !?FuzzError {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
@@ -294,9 +293,7 @@ fn fuzzDeep(gpa: std.mem.Allocator, input: []const u8) !?FuzzError {
         return null;
     } else |err| {
         return switch (err) {
-            error.NestingTooDeep, error.TomlParseError => null,
-            error.OutOfMemory => null,
-            else => FuzzError.DepthNotBounded,
+            error.NestingTooDeep, error.TomlParseError, error.OutOfMemory => null,
         };
     }
 }

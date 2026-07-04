@@ -26,20 +26,11 @@ const value_mod = @import("value.zig");
 const datetime_mod = @import("datetime.zig");
 const decode_mod = @import("decode.zig");
 
-/// Unified error set spanning parse + decode. Encode has its own set
-/// (`EncodeError`) since it operates on already-built Values.
-pub const Error = error{
-    // From parser
-    TomlParseError,
-    NestingTooDeep,
-    OutOfMemory,
-    // From decode
-    TypeMismatch,
-    MissingField,
-    UnknownField,
-    InvalidEnumValue,
-    Overflow,
-};
+/// Errors `parse` / `parseReader` can return. Decode failures are
+/// `DecodeError`; the typed entry points (`parseInto` / `parseIntoReader`)
+/// return the union of both. Encode has its own set (`EncodeError`) since
+/// it operates on already-built Values.
+pub const Error = parser_mod.Error;
 
 /// Reader-input variants additionally surface the reader's allocation
 /// failure path.
@@ -118,7 +109,7 @@ pub const decode = decode_mod.decode;
 /// any error the input is re-decoded through the tree path, so
 /// diagnostics and error selection are always the canonical ones.
 /// Callers requesting `options.spans` use the tree path unconditionally.
-pub fn parseInto(comptime T: type, arena: std.mem.Allocator, src: []const u8, options: ParseOptions) Error!T {
+pub fn parseInto(comptime T: type, arena: std.mem.Allocator, src: []const u8, options: ParseOptions) (Error || DecodeError)!T {
     if (comptime decode_mod.needsTree(T)) return parseIntoTree(T, arena, src, options);
     if (options.spans != null) return parseIntoTree(T, arena, src, options);
     return decode_mod.streamParseInto(T, arena, src, options) catch |err| switch (err) {
@@ -127,13 +118,13 @@ pub fn parseInto(comptime T: type, arena: std.mem.Allocator, src: []const u8, op
     };
 }
 
-fn parseIntoTree(comptime T: type, arena: std.mem.Allocator, src: []const u8, options: ParseOptions) Error!T {
+fn parseIntoTree(comptime T: type, arena: std.mem.Allocator, src: []const u8, options: ParseOptions) (Error || DecodeError)!T {
     const value = try parse(arena, src, options);
     return decode(T, arena, value, options);
 }
 
 /// Reader-input variant of `parseInto`.
-pub fn parseIntoReader(comptime T: type, arena: std.mem.Allocator, reader: *std.Io.Reader, options: ParseOptions) ReaderError!T {
+pub fn parseIntoReader(comptime T: type, arena: std.mem.Allocator, reader: *std.Io.Reader, options: ParseOptions) (ReaderError || DecodeError)!T {
     const input = try reader.allocRemaining(arena, .unlimited);
     return parseInto(T, arena, input, options);
 }

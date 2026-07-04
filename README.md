@@ -137,11 +137,16 @@ decode as `HttpConfig`. For variant-name overrides, use `toml_rename`
 on the union itself.
 
 For symmetric encoding of typed values (consulting the same
-annotations), use `toml.encodeTyped(w, T, value, arena)`:
+annotations), use `toml.encodeTyped(w, value, arena)`:
 
 ```zig
-try toml.encodeTyped(w, Config, cfg, arena);
+const cfg: Config = .{ .listen_addr = "0.0.0.0" };
+try toml.encodeTyped(w, cfg, arena);
 ```
+
+Annotations are looked up on `@TypeOf(value)`, so bind anonymous
+literals to a typed const as above; a bare `.{ ... }` literal carries
+no `toml_*` decls.
 
 The existing `toml.encode(w, value: Value)` still applies for
 hand-built `Value` trees.
@@ -344,7 +349,7 @@ while (t.next()) |tok| switch (tok.kind) {
 var errs: std.ArrayList(toml.Diagnostic) = .empty;
 defer errs.deinit(arena);
 const v = toml.parse(arena, src, .{ .errors = &errs }) catch {
-    if (errs.items.len > 0) try errs.items[0].format(w, src);
+    if (errs.items.len > 0) try errs.items[0].render(w, src);
     return;
 };
 ```
@@ -353,7 +358,7 @@ For rustc-style multi-line output with source-line excerpts, caret
 underlines, and `did you mean` suggestions:
 
 ```zig
-for (errs.items) |d| try d.formatRich(stderr_writer, src);
+for (errs.items) |d| try d.renderRich(stderr_writer, src);
 ```
 
 The parser collects every error in one pass when `errors` is set, up
@@ -372,6 +377,7 @@ to 100 diagnostics per parse. Set it to `null` for single-error mode
 | `parseIntoReader(T, arena, reader, options)` | Reader-input variant of `parseInto`. |
 | `decode(T, arena, value, options)` | Decode an existing `Value` into `T`. |
 | `encode(w, value)` | Emit canonical TOML to `*std.Io.Writer`. |
+| `encodeTyped(w, value, arena)` | Emit TOML from a typed Zig struct, consulting `toml_*` annotations. |
 | `Document.parse(arena, src, options)` | Lossless parse for the document model. |
 | `DateTime.parse(literal)` | Parse a single date/time/datetime literal. |
 | `Date.parse(literal)` / `Time.parse(literal)` | Parse a date or time literal. |
@@ -392,7 +398,8 @@ to 100 diagnostics per parse. Set it to `null` for single-error mode
 ### Types
 
 `Value`, `Date`, `Time`, `DateTime`, `Span`, `Spans`, `Diagnostic`,
-`ParseOptions`, `Error`, `ReaderError`, `EncodeError`, `Document`,
+`ParseOptions`, `Error`, `ReaderError`, `DecodeError`, `EncodeError`,
+`Document`,
 `Document.Position`, `document.Error`, `Tokenizer`, `Token`, `TokenKind`,
 `EventReader`, `ValueStream`, `ValueStream.Shape`, `Event`, `Event.Kind`,
 `StreamError`.

@@ -44,8 +44,10 @@ pub const Diagnostic = struct {
     };
 
     /// Single-line summary. Line/col are computed from `span` against `src`
-    /// (the same slice passed to `parse`).
-    pub fn format(self: Diagnostic, writer: *std.Io.Writer, src: []const u8) !void {
+    /// (the same slice passed to `parse`). Named `render` rather than
+    /// `format` because `format` is the magic `{f}` method name in
+    /// std formatting, with an incompatible signature.
+    pub fn render(self: Diagnostic, writer: *std.Io.Writer, src: []const u8) !void {
         const lc = self.span.lineCol(src);
         try writer.print("TOML parse error at {d}:{d}: {s}", .{ lc.line, lc.col, self.message });
     }
@@ -54,7 +56,7 @@ pub const Diagnostic = struct {
     /// source-line with caret underline, notes, suggestion.
     /// Caller provides the original source bytes (the same slice passed
     /// to `parse`). ASCII only -- no terminal color escapes.
-    pub fn formatRich(self: Diagnostic, w: *std.Io.Writer, source: []const u8) !void {
+    pub fn renderRich(self: Diagnostic, w: *std.Io.Writer, source: []const u8) !void {
         const lc = self.span.lineCol(source);
         try w.print("error at {d}:{d}: {s}\n", .{ lc.line, lc.col, self.message });
         if (self.path) |p| try w.print("  at {s}\n", .{p});
@@ -3039,7 +3041,7 @@ test "parser: typo'd keyword suggests correct form" {
     try testing.expectEqualStrings("true", errs.items[0].suggestion.?);
 }
 
-test "Diagnostic.formatRich: basic shape" {
+test "Diagnostic.renderRich: basic shape" {
     const src =
         \\title = "x"
         \\port = "8080"
@@ -3052,7 +3054,7 @@ test "Diagnostic.formatRich: basic shape" {
 
     var buf: [1024]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try d.formatRich(&aw, src);
+    try d.renderRich(&aw, src);
     const out = aw.buffered();
 
     try testing.expect(std.mem.indexOf(u8, out, "error at 2:8") != null);
@@ -3061,7 +3063,7 @@ test "Diagnostic.formatRich: basic shape" {
     try testing.expect(std.mem.indexOf(u8, out, "^") != null);
 }
 
-test "Diagnostic.formatRich: includes path and suggestion" {
+test "Diagnostic.renderRich: includes path and suggestion" {
     const src = "prt = 8080\n";
     const d: Diagnostic = .{
         .message = "unknown field `prt`",
@@ -3071,14 +3073,14 @@ test "Diagnostic.formatRich: includes path and suggestion" {
 
     var buf: [1024]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try d.formatRich(&aw, src);
+    try d.renderRich(&aw, src);
     const out = aw.buffered();
 
     try testing.expect(std.mem.indexOf(u8, out, "at config.prt") != null);
     try testing.expect(std.mem.indexOf(u8, out, "did you mean `port`?") != null);
 }
 
-test "Diagnostic.formatRich: emits notes" {
+test "Diagnostic.renderRich: emits notes" {
     const src = "[server]\n[server]\n";
     const d: Diagnostic = .{
         .message = "redefinition of section [server]",
@@ -3090,7 +3092,7 @@ test "Diagnostic.formatRich: emits notes" {
 
     var buf: [1024]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try d.formatRich(&aw, src);
+    try d.renderRich(&aw, src);
     const out = aw.buffered();
 
     try testing.expect(std.mem.indexOf(u8, out, "previously declared here") != null);
@@ -3120,7 +3122,7 @@ test "end-to-end: multi-error parse + rich rendering of each" {
     var buf: [4096]u8 = undefined;
     for (errs.items) |d| {
         var aw: std.Io.Writer = .fixed(&buf);
-        try d.formatRich(&aw, src);
+        try d.renderRich(&aw, src);
         try testing.expect(aw.buffered().len > 0);
     }
 }
