@@ -6,6 +6,23 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING:** `encode` and `encodeTyped` take an `EncodeOptions` argument.
+  Migrate `encode(w, v)` to `encode(w, v, .{})` and `encodeTyped(w, v, arena)`
+  to `encodeTyped(w, v, arena, .{})`. Default options reproduce the prior
+  output byte-for-byte.
+
+### Added
+
+- `EncodeOptions.sort_keys`: emit keys in ascending byte-lexicographic order
+  within each structural group (a table's key/values sorted, then its
+  sub-table headers sorted), recursively, on both the `Value` and typed
+  paths. TOML's key-values-before-headers rule is preserved. Default `false`
+  keeps insertion / declaration order. Ordering only, not RFC 8785 (JCS)
+  canonicalization. A flattened struct field's members sort within their own
+  group, not interleaved with the parent's fields.
+
 ## [0.3.1] - 2026-07-05
 
 ### Fixed

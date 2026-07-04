@@ -29,7 +29,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     var stdout_writer = Io.File.stdout().writerStreaming(io, &stdout_buffer);
     const w = &stdout_writer.interface;
-    toml.encode(w, value) catch |err| {
+    toml.encode(w, value, .{}) catch |err| {
         return reportFail(io, "encode: {t}", .{err});
     };
     try w.flush();

@@ -156,6 +156,7 @@ const FuzzError = error{
     SpanOutOfBounds,
     StreamingMismatch,
     TypedDivergence,
+    SortNotStable,
 };
 
 fn fuzzOnce(gpa: std.mem.Allocator, input: []const u8) !?FuzzError {
@@ -173,11 +174,24 @@ fn fuzzOnce(gpa: std.mem.Allocator, input: []const u8) !?FuzzError {
     // Round-trip: encode -> parse -> must equal.
     var aw: Io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
-    toml.encode(&aw.writer, v1) catch return null;
+    toml.encode(&aw.writer, v1, .{}) catch return null;
     var arena2: std.heap.ArenaAllocator = .init(gpa);
     defer arena2.deinit();
     const v2 = toml.parse(arena2.allocator(), aw.written(), .{}) catch return error.RoundTripMismatch;
     if (!toml.Value.eql(v1, v2)) return error.RoundTripMismatch;
+
+    // sort_keys is stable: encoding with sort_keys, re-parsing, and re-encoding
+    // with sort_keys must be byte-identical (a deterministic, idempotent order).
+    var s1: Io.Writer.Allocating = .init(gpa);
+    defer s1.deinit();
+    toml.encode(&s1.writer, v1, .{ .sort_keys = true }) catch return null;
+    var arena_s: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_s.deinit();
+    const vs = toml.parse(arena_s.allocator(), s1.written(), .{}) catch return error.SortNotStable;
+    var s2: Io.Writer.Allocating = .init(gpa);
+    defer s2.deinit();
+    toml.encode(&s2.writer, vs, .{ .sort_keys = true }) catch return error.SortNotStable;
+    if (!std.mem.eql(u8, s1.written(), s2.written())) return error.SortNotStable;
 
     // Document model: parse + emit unmodified must be byte-identical.
     var arena3: std.heap.ArenaAllocator = .init(gpa);

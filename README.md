@@ -137,19 +137,20 @@ decode as `HttpConfig`. For variant-name overrides, use `toml_rename`
 on the union itself.
 
 For symmetric encoding of typed values (consulting the same
-annotations), use `toml.encodeTyped(w, value, arena)`:
+annotations), use `toml.encodeTyped(w, value, arena, options)`:
 
 ```zig
 const cfg: Config = .{ .listen_addr = "0.0.0.0" };
-try toml.encodeTyped(w, cfg, arena);
+try toml.encodeTyped(w, cfg, arena, .{});
 ```
 
 Annotations are looked up on `@TypeOf(value)`, so bind anonymous
 literals to a typed const as above; a bare `.{ ... }` literal carries
 no `toml_*` decls.
 
-The existing `toml.encode(w, value: Value)` still applies for
-hand-built `Value` trees.
+The existing `toml.encode(w, value, options)` still applies for
+hand-built `Value` trees. `options.sort_keys` emits keys in ascending
+order within each structural group (default keeps insertion order).
 
 ### Editing (lossless document model)
 
@@ -376,8 +377,8 @@ to 100 diagnostics per parse. Set it to `null` for single-error mode
 | `parseInto(T, arena, src, options)` | Decode straight into an instance of `T`. |
 | `parseIntoReader(T, arena, reader, options)` | Reader-input variant of `parseInto`. |
 | `decode(T, arena, value, options)` | Decode an existing `Value` into `T`. |
-| `encode(w, value)` | Emit canonical TOML to `*std.Io.Writer`. |
-| `encodeTyped(w, value, arena)` | Emit TOML from a typed Zig struct, consulting `toml_*` annotations. |
+| `encode(w, value, options)` | Emit canonical TOML to `*std.Io.Writer` (`options.sort_keys` to sort keys). |
+| `encodeTyped(w, value, arena, options)` | Emit TOML from a typed Zig struct, consulting `toml_*` annotations. |
 | `Document.parse(arena, src, options)` | Lossless parse for the document model. |
 | `DateTime.parse(literal)` | Parse a single date/time/datetime literal. |
 | `Date.parse(literal)` / `Time.parse(literal)` | Parse a date or time literal. |

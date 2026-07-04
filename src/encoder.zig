@@ -23,6 +23,46 @@ pub const Value = v.Value;
 /// value does not fit the target Zig type.
 pub const EncodeError = std.Io.Writer.Error || error{ ExpectedTable, NestingTooDeep, OutOfMemory, IntegerOverflow, UnsupportedType };
 
+/// Encoder options. `sort_keys` emits keys in ascending byte-lexicographic
+/// order within each structural group (a table's key/values sorted, then its
+/// sub-table headers sorted), recursively; the key-values-before-headers rule
+/// is preserved. Default false keeps insertion / declaration order, so output
+/// is unchanged unless set. Byte-lexicographic, not RFC 8785-style canonical
+/// ordering: only the order changes, never value formatting or quoting.
+pub const EncodeOptions = struct {
+    sort_keys: bool = false,
+};
+
+/// Walks a table's entries in insertion order, or ascending byte-lexicographic
+/// key order when `sort` is set. Keys in a `StringArrayHashMap` are unique, so
+/// sorted order is "the smallest key strictly greater than the previous" -- an
+/// O(n^2) scan that keeps the Value encode path allocation-free (sort_keys
+/// targets human-scale documents).
+const KeyCursor = struct {
+    tbl: StringArrayHashMap(Value),
+    sort: bool,
+    idx: usize = 0,
+    prev: ?[]const u8 = null,
+
+    fn next(self: *KeyCursor) ?usize {
+        if (!self.sort) {
+            if (self.idx >= self.tbl.count()) return null;
+            defer self.idx += 1;
+            return self.idx;
+        }
+        const keys = self.tbl.keys();
+        var best: ?usize = null;
+        for (keys, 0..) |k, i| {
+            if (self.prev) |p| if (!std.mem.lessThan(u8, p, k)) continue;
+            if (best) |b| {
+                if (std.mem.lessThan(u8, k, keys[b])) best = i;
+            } else best = i;
+        }
+        if (best) |b| self.prev = keys[b];
+        return best;
+    }
+};
+
 const max_path_depth = 256;
 
 /// Maximum table / array / inline-table nesting depth. Parsed trees are
@@ -31,8 +71,10 @@ const max_path_depth = 256;
 /// returning `error.NestingTooDeep` rather than overflowing the stack.
 const max_encode_depth = 128;
 
-/// Encode `value` as TOML to `w`. `value` must be `.table`.
-pub fn encode(w: *Io.Writer, value: Value) EncodeError!void {
+/// Encode `value` as TOML to `w`. `value` must be `.table`. `options.sort_keys`
+/// emits keys in ascending order (within each structural group); default keeps
+/// insertion order.
+pub fn encode(w: *Io.Writer, value: Value, options: EncodeOptions) EncodeError!void {
     if (value != .table) return error.ExpectedTable;
 
     var path_buf: [max_path_depth * @sizeOf([]const u8)]u8 = undefined;
@@ -40,7 +82,7 @@ pub fn encode(w: *Io.Writer, value: Value) EncodeError!void {
     var path: ArrayList([]const u8) = .empty;
     defer path.deinit(fba.allocator());
 
-    try encodeTable(w, value.table, &path, fba.allocator(), true, 0);
+    try encodeTable(w, value.table, &path, fba.allocator(), true, 0, options);
 }
 
 /// Encode a typed Zig value as TOML, consulting any `toml_*`
@@ -54,7 +96,7 @@ pub fn encode(w: *Io.Writer, value: Value) EncodeError!void {
 /// the annotated struct type: bind anonymous literals to a typed const
 /// first, or their `toml_rename` / `toml_flatten` / `toml_skip` decls
 /// are not seen.
-pub fn encodeTyped(w: *std.Io.Writer, value: anytype, arena: std.mem.Allocator) EncodeError!void {
+pub fn encodeTyped(w: *std.Io.Writer, value: anytype, arena: std.mem.Allocator, options: EncodeOptions) EncodeError!void {
     const T = @TypeOf(value);
     if (@typeInfo(T) != .@"struct") @compileError("encodeTyped: root must be a struct, got " ++ @typeName(T));
 
@@ -63,7 +105,31 @@ pub fn encodeTyped(w: *std.Io.Writer, value: anytype, arena: std.mem.Allocator) 
     var path: ArrayList([]const u8) = .empty;
     defer path.deinit(fba.allocator());
 
-    try encodeTypedTable(T, value, w, &path, fba.allocator(), arena, true);
+    try encodeTypedTable(T, value, w, &path, fba.allocator(), arena, true, options);
+}
+
+/// Comptime field indices of `T` in ascending emitted-key order (after any
+/// `toml_rename`). Insertion sort: field counts are small and it is stable, so
+/// a rename collision keeps declaration order. `sort_keys` iterates this order
+/// per structural pass; a flattened field's members sort within their own
+/// group at the flattened field's position, not interleaved with siblings.
+fn sortedFieldOrder(comptime T: type) [@typeInfo(T).@"struct".fields.len]usize {
+    const fields = @typeInfo(T).@"struct".fields;
+    var order: [fields.len]usize = undefined;
+    for (0..fields.len) |i| order[i] = i;
+    for (1..fields.len) |i| {
+        var j = i;
+        while (j > 0 and std.mem.lessThan(
+            u8,
+            renamedKey(T, fields[order[j]].name),
+            renamedKey(T, fields[order[j - 1]].name),
+        )) : (j -= 1) {
+            const tmp = order[j];
+            order[j] = order[j - 1];
+            order[j - 1] = tmp;
+        }
+    }
+    return order;
 }
 
 fn encodeTaggedUnion(
@@ -74,6 +140,7 @@ fn encodeTaggedUnion(
     path_alloc: std.mem.Allocator,
     arena: std.mem.Allocator,
     is_root: bool,
+    options: EncodeOptions,
 ) EncodeError!void {
     const tag_field = T.toml_tag;
     const active_tag = std.meta.activeTag(value);
@@ -98,8 +165,8 @@ fn encodeTaggedUnion(
                 // above, so emitStructSubTables must insert a blank line
                 // before any sub-table section header.
                 var has: bool = true;
-                try emitFlatScalars(PayloadType, payload, w, arena, &has);
-                try emitStructSubTables(PayloadType, payload, w, path, path_alloc, arena, is_root, &has);
+                try emitFlatScalars(PayloadType, payload, w, arena, &has, options);
+                try emitStructSubTables(PayloadType, payload, w, path, path_alloc, arena, is_root, &has, options);
             }
             return;
         }
@@ -115,14 +182,15 @@ fn encodeTypedTable(
     path_alloc: std.mem.Allocator,
     arena: std.mem.Allocator,
     is_root: bool,
+    options: EncodeOptions,
 ) EncodeError!void {
     var has_any_kv = false;
 
     // Pass 1: scalars (recursively expanding flattened fields).
-    try emitFlatScalars(T, value, w, arena, &has_any_kv);
+    try emitFlatScalars(T, value, w, arena, &has_any_kv, options);
 
     // Pass 2: sub-tables (descending into flattened fields, skipping skipped fields).
-    try emitStructSubTables(T, value, w, path, path_alloc, arena, is_root, &has_any_kv);
+    try emitStructSubTables(T, value, w, path, path_alloc, arena, is_root, &has_any_kv, options);
 }
 
 // emitStructSubTables is the shared pass-2 body: walks `T`'s fields and
@@ -138,42 +206,62 @@ fn emitStructSubTables(
     arena: std.mem.Allocator,
     is_root: bool,
     has_any_kv: *bool,
+    options: EncodeOptions,
 ) EncodeError!void {
     const s = @typeInfo(T).@"struct";
-    inline for (s.fields) |field| {
-        if (comptime isSkipped(T, field.name)) continue;
-        const fv = @field(value, field.name);
-        if (comptime isFlattened(T, field.name)) {
-            // Descend into the flattened struct's sub-tables at the current
-            // path level (do NOT push the flattened field's own key).
-            try emitStructSubTables(field.type, fv, w, path, path_alloc, arena, is_root, has_any_kv);
-            continue;
+    if (options.sort_keys) {
+        inline for (comptime sortedFieldOrder(T)) |fi| {
+            try emitSubTableField(T, s.fields[fi], value, w, path, path_alloc, arena, is_root, has_any_kv, options);
         }
-        if (comptime fieldHasSubTable(field.type)) {
-            const eff_key = comptime renamedKey(T, field.name);
-            const is_opt = comptime @typeInfo(field.type) == .optional;
-            const ActualType = comptime if (is_opt) @typeInfo(field.type).optional.child else field.type;
-            // Unwrap ?T: null -> absent section (mirrors decode's absent-table -> null).
-            const should_emit: bool = if (comptime is_opt) fv != null else true;
-            if (should_emit) {
-                const actual_val: ActualType = if (comptime is_opt) fv.? else fv;
-                if (comptime arrayOfTablesChild(ActualType)) |Elem| {
-                    try emitArrayOfTables(Elem, actual_val, eff_key, w, path, path_alloc, arena, is_root, has_any_kv);
-                } else {
-                    try path.append(path_alloc, eff_key);
-                    defer _ = path.pop();
-                    if (has_any_kv.* or !is_root) try w.writeByte('\n');
-                    has_any_kv.* = true;
-                    try w.writeByte('[');
-                    try writePath(w, path.items);
-                    try w.writeAll("]\n");
-                    if (comptime (@typeInfo(ActualType) == .@"union" and @hasDecl(ActualType, "toml_tag"))) {
-                        try encodeTaggedUnion(ActualType, actual_val, w, path, path_alloc, arena, false);
-                    } else {
-                        try encodeTypedTable(ActualType, actual_val, w, path, path_alloc, arena, false);
-                    }
-                }
-            }
+    } else {
+        inline for (s.fields) |field| {
+            try emitSubTableField(T, field, value, w, path, path_alloc, arena, is_root, has_any_kv, options);
+        }
+    }
+}
+
+fn emitSubTableField(
+    comptime T: type,
+    comptime field: std.builtin.Type.StructField,
+    value: T,
+    w: *std.Io.Writer,
+    path: *ArrayList([]const u8),
+    path_alloc: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    is_root: bool,
+    has_any_kv: *bool,
+    options: EncodeOptions,
+) EncodeError!void {
+    if (comptime isSkipped(T, field.name)) return;
+    const fv = @field(value, field.name);
+    if (comptime isFlattened(T, field.name)) {
+        // Descend into the flattened struct's sub-tables at the current path
+        // level (do NOT push the flattened field's own key).
+        try emitStructSubTables(field.type, fv, w, path, path_alloc, arena, is_root, has_any_kv, options);
+        return;
+    }
+    if (comptime !fieldHasSubTable(field.type)) return;
+    const eff_key = comptime renamedKey(T, field.name);
+    const is_opt = comptime @typeInfo(field.type) == .optional;
+    const ActualType = comptime if (is_opt) @typeInfo(field.type).optional.child else field.type;
+    // Unwrap ?T: null -> absent section (mirrors decode's absent-table -> null).
+    const should_emit: bool = if (comptime is_opt) fv != null else true;
+    if (!should_emit) return;
+    const actual_val: ActualType = if (comptime is_opt) fv.? else fv;
+    if (comptime arrayOfTablesChild(ActualType)) |Elem| {
+        try emitArrayOfTables(Elem, actual_val, eff_key, w, path, path_alloc, arena, is_root, has_any_kv, options);
+    } else {
+        try path.append(path_alloc, eff_key);
+        defer _ = path.pop();
+        if (has_any_kv.* or !is_root) try w.writeByte('\n');
+        has_any_kv.* = true;
+        try w.writeByte('[');
+        try writePath(w, path.items);
+        try w.writeAll("]\n");
+        if (comptime (@typeInfo(ActualType) == .@"union" and @hasDecl(ActualType, "toml_tag"))) {
+            try encodeTaggedUnion(ActualType, actual_val, w, path, path_alloc, arena, false, options);
+        } else {
+            try encodeTypedTable(ActualType, actual_val, w, path, path_alloc, arena, false, options);
         }
     }
 }
@@ -193,6 +281,7 @@ fn emitArrayOfTables(
     arena: std.mem.Allocator,
     is_root: bool,
     has_any_kv: *bool,
+    options: EncodeOptions,
 ) EncodeError!void {
     const is_elem_opt = comptime @typeInfo(Elem) == .optional;
     const ElemActual = comptime if (is_elem_opt) @typeInfo(Elem).optional.child else Elem;
@@ -207,9 +296,9 @@ fn emitArrayOfTables(
         try writePath(w, path.items);
         try w.writeAll("]]\n");
         if (comptime (@typeInfo(ElemActual) == .@"union" and @hasDecl(ElemActual, "toml_tag"))) {
-            try encodeTaggedUnion(ElemActual, item, w, path, path_alloc, arena, false);
+            try encodeTaggedUnion(ElemActual, item, w, path, path_alloc, arena, false, options);
         } else {
-            try encodeTypedTable(ElemActual, item, w, path, path_alloc, arena, false);
+            try encodeTypedTable(ElemActual, item, w, path, path_alloc, arena, false, options);
         }
     }
 }
@@ -220,31 +309,45 @@ fn emitFlatScalars(
     w: *std.Io.Writer,
     arena: std.mem.Allocator,
     has_any_kv: *bool,
+    options: EncodeOptions,
 ) EncodeError!void {
     const s = @typeInfo(T).@"struct";
-    inline for (s.fields) |field| {
-        if (comptime isSkipped(T, field.name)) continue;
-        const fv = @field(value, field.name);
-        if (comptime isFlattened(T, field.name)) {
-            try emitFlatScalars(field.type, fv, w, arena, has_any_kv);
-            continue;
+    if (options.sort_keys) {
+        inline for (comptime sortedFieldOrder(T)) |fi| {
+            try emitScalarField(T, s.fields[fi], value, w, arena, has_any_kv, options);
         }
-        if (!comptime fieldHasSubTable(field.type)) {
-            // Null optional fields are omitted entirely; decode treats an
-            // absent key as null for optional fields, so this round-trips.
-            const emit: bool = if (comptime @typeInfo(field.type) == .optional)
-                fv != null
-            else
-                true;
-            if (emit) {
-                const eff_key = comptime renamedKey(T, field.name);
-                try writeKey(w, eff_key);
-                try w.writeAll(" = ");
-                try writeTypedValue(field.type, fv, w, arena);
-                try w.writeByte('\n');
-                has_any_kv.* = true;
-            }
+    } else {
+        inline for (s.fields) |field| {
+            try emitScalarField(T, field, value, w, arena, has_any_kv, options);
         }
+    }
+}
+
+fn emitScalarField(
+    comptime T: type,
+    comptime field: std.builtin.Type.StructField,
+    value: T,
+    w: *std.Io.Writer,
+    arena: std.mem.Allocator,
+    has_any_kv: *bool,
+    options: EncodeOptions,
+) EncodeError!void {
+    if (comptime isSkipped(T, field.name)) return;
+    const fv = @field(value, field.name);
+    if (comptime isFlattened(T, field.name)) {
+        try emitFlatScalars(field.type, fv, w, arena, has_any_kv, options);
+        return;
+    }
+    if (comptime fieldHasSubTable(field.type)) return;
+    // Null optional fields are omitted entirely; decode treats an absent key
+    // as null for optional fields, so this round-trips.
+    const emit: bool = if (comptime @typeInfo(field.type) == .optional) fv != null else true;
+    if (emit) {
+        try writeKey(w, comptime renamedKey(T, field.name));
+        try w.writeAll(" = ");
+        try writeTypedValue(field.type, fv, w, arena);
+        try w.writeByte('\n');
+        has_any_kv.* = true;
     }
 }
 
@@ -342,21 +445,23 @@ fn encodeTable(
     path_alloc: std.mem.Allocator,
     is_root: bool,
     depth: usize,
+    options: EncodeOptions,
 ) EncodeError!void {
     if (depth > max_encode_depth) return error.NestingTooDeep;
     var has_any_kv = false;
+    const keys = tbl.keys();
+    const vals = tbl.values();
 
     // Pass 1: scalars, arrays of non-tables.
-    var it = tbl.iterator();
-    while (it.next()) |entry| {
-        const k = entry.key_ptr.*;
-        const val = entry.value_ptr.*;
+    var scalars: KeyCursor = .{ .tbl = tbl, .sort = options.sort_keys };
+    while (scalars.next()) |i| {
+        const val = vals[i];
         switch (val) {
             .table => continue,
             .array => |arr| if (isArrayOfTables(arr)) continue,
             else => {},
         }
-        try writeKey(w, k);
+        try writeKey(w, keys[i]);
         try w.writeAll(" = ");
         try writeValue(w, val, depth);
         try w.writeByte('\n');
@@ -364,11 +469,10 @@ fn encodeTable(
     }
 
     // Pass 2: sub-tables and arrays-of-tables as headers.
-    it = tbl.iterator();
-    while (it.next()) |entry| {
-        const k = entry.key_ptr.*;
-        const val = entry.value_ptr.*;
-        switch (val) {
+    var tables: KeyCursor = .{ .tbl = tbl, .sort = options.sort_keys };
+    while (tables.next()) |i| {
+        const k = keys[i];
+        switch (vals[i]) {
             .table => |sub| {
                 try path.append(path_alloc, k);
                 defer _ = path.pop();
@@ -377,7 +481,7 @@ fn encodeTable(
                 try w.writeByte('[');
                 try writePath(w, path.items);
                 try w.writeAll("]\n");
-                try encodeTable(w, sub, path, path_alloc, false, depth + 1);
+                try encodeTable(w, sub, path, path_alloc, false, depth + 1, options);
             },
             .array => |arr| {
                 if (!isArrayOfTables(arr)) continue;
@@ -389,7 +493,7 @@ fn encodeTable(
                     try w.writeAll("[[");
                     try writePath(w, path.items);
                     try w.writeAll("]]\n");
-                    try encodeTable(w, elem.table, path, path_alloc, false, depth + 1);
+                    try encodeTable(w, elem.table, path, path_alloc, false, depth + 1, options);
                 }
             },
             else => {},
@@ -645,7 +749,7 @@ const parser = @import("parser.zig");
 fn allocEncode(alloc: std.mem.Allocator, val: Value) ![]u8 {
     var aw: Io.Writer.Allocating = .init(alloc);
     defer aw.deinit();
-    try encode(&aw.writer, val);
+    try encode(&aw.writer, val, .{});
     return aw.toOwnedSlice();
 }
 
@@ -823,7 +927,7 @@ test "encodeTyped: un-annotated struct matches encode output" {
 
     var buf: [256]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try encodeTyped(&aw, cfg, a);
+    try encodeTyped(&aw, cfg, a, .{});
     const out = aw.buffered();
 
     try testing.expect(std.mem.indexOf(u8, out, "name = \"ef\"") != null);
@@ -842,7 +946,7 @@ test "encodeTyped: toml_rename emits renamed key" {
 
     var buf: [256]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try encodeTyped(&aw, cfg, arena.allocator());
+    try encodeTyped(&aw, cfg, arena.allocator(), .{});
     const out = aw.buffered();
     try testing.expect(std.mem.indexOf(u8, out, "listen-addr = \"0.0.0.0\"") != null);
     try testing.expect(std.mem.indexOf(u8, out, "listen_addr") == null);
@@ -861,7 +965,7 @@ test "encodeTyped: toml_flatten inlines sub-fields at parent level" {
 
     var buf: [256]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try encodeTyped(&aw, cfg, arena.allocator());
+    try encodeTyped(&aw, cfg, arena.allocator(), .{});
     const out = aw.buffered();
 
     try testing.expect(std.mem.indexOf(u8, out, "name = \"foo\"") != null);
@@ -883,7 +987,7 @@ test "encodeTyped: toml_skip omits field from output" {
 
     var buf: [256]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try encodeTyped(&aw, cfg, arena.allocator());
+    try encodeTyped(&aw, cfg, arena.allocator(), .{});
     const out = aw.buffered();
     try testing.expect(std.mem.indexOf(u8, out, "name = \"foo\"") != null);
     try testing.expect(std.mem.indexOf(u8, out, "internal") == null);
@@ -911,7 +1015,7 @@ test "encodeTyped: toToml hook bypasses built-in encoding" {
 
     var buf: [256]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try encodeTyped(&aw, cfg, arena.allocator());
+    try encodeTyped(&aw, cfg, arena.allocator(), .{});
     const out = aw.buffered();
     try testing.expect(std.mem.indexOf(u8, out, "v = \"1.2.3\"") != null);
 }
@@ -932,7 +1036,7 @@ test "encodeTyped: tagged union writes discriminator + payload" {
 
     var buf: [512]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try encodeTyped(&aw, cfg, arena.allocator());
+    try encodeTyped(&aw, cfg, arena.allocator(), .{});
     const out = aw.buffered();
 
     try testing.expect(std.mem.indexOf(u8, out, "kind = \"http\"") != null);
@@ -962,7 +1066,7 @@ test "encode nesting depth guard: deep array tree errors, shallow succeeds" {
     {
         var aw: Io.Writer.Allocating = .init(a);
         defer aw.deinit();
-        try testing.expectError(error.NestingTooDeep, encode(&aw.writer, .{ .table = over_tbl }));
+        try testing.expectError(error.NestingTooDeep, encode(&aw.writer, .{ .table = over_tbl }, .{}));
     }
 
     // A shallow chain (well under the ceiling) encodes without error.
@@ -978,7 +1082,7 @@ test "encode nesting depth guard: deep array tree errors, shallow succeeds" {
     {
         var aw: Io.Writer.Allocating = .init(a);
         defer aw.deinit();
-        try encode(&aw.writer, .{ .table = ok_tbl }); // must not error
+        try encode(&aw.writer, .{ .table = ok_tbl }, .{}); // must not error
     }
 }
 
@@ -999,7 +1103,7 @@ test "encode nesting depth guard: deep table tree errors" {
     }
     var aw: Io.Writer.Allocating = .init(a);
     defer aw.deinit();
-    try testing.expectError(error.NestingTooDeep, encode(&aw.writer, .{ .table = inner }));
+    try testing.expectError(error.NestingTooDeep, encode(&aw.writer, .{ .table = inner }, .{}));
 }
 
 test "encodeTyped: toml_flatten with nested sub-table round-trips" {
@@ -1027,7 +1131,7 @@ test "encodeTyped: toml_flatten with nested sub-table round-trips" {
 
     var buf: [512]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try encodeTyped(&aw, cfg, a);
+    try encodeTyped(&aw, cfg, a, .{});
     const out = aw.buffered();
 
     // Flat scalars from inner must appear at the root level.
@@ -1062,7 +1166,7 @@ test "encodeTyped: toml_flatten scalars-only still works after refactor" {
 
     var buf: [256]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try encodeTyped(&aw, cfg, arena.allocator());
+    try encodeTyped(&aw, cfg, arena.allocator(), .{});
     const out = aw.buffered();
 
     try testing.expect(std.mem.indexOf(u8, out, "name = \"foo\"") != null);
@@ -1098,7 +1202,7 @@ test "encodeTyped: tagged union payload with nested sub-table round-trips" {
 
     var buf: [512]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try encodeTyped(&aw, cfg, a);
+    try encodeTyped(&aw, cfg, a, .{});
     const out = aw.buffered();
 
     // Discriminator and flat scalar from the union payload.
@@ -1137,7 +1241,7 @@ test "encodeTyped: tagged union scalars-only still works after refactor" {
 
     var buf: [512]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try encodeTyped(&aw, cfg, arena.allocator());
+    try encodeTyped(&aw, cfg, arena.allocator(), .{});
     const out = aw.buffered();
 
     try testing.expect(std.mem.indexOf(u8, out, "kind = \"http\"") != null);
@@ -1167,7 +1271,7 @@ test "encodeTyped: toml_flatten two levels deep merges all scalars at root" {
 
     var buf: [256]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try encodeTyped(&aw, cfg, arena.allocator());
+    try encodeTyped(&aw, cfg, arena.allocator(), .{});
     const out = aw.buffered();
 
     // All scalars from all three struct types must appear at the root level.
@@ -1187,7 +1291,7 @@ test "encodeTyped: u64 field exceeding i64 max -> IntegerOverflow" {
     const cfg = Config{ .n = @as(u64, std.math.maxInt(i64)) + 1 };
     var buf: [64]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try testing.expectError(error.IntegerOverflow, encodeTyped(&aw, cfg, arena.allocator()));
+    try testing.expectError(error.IntegerOverflow, encodeTyped(&aw, cfg, arena.allocator(), .{}));
 }
 
 test "encodeTyped: u64 within i64 range round-trips" {
@@ -1197,7 +1301,7 @@ test "encodeTyped: u64 within i64 range round-trips" {
     const cfg = Config{ .n = 100 };
     var buf: [64]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try encodeTyped(&aw, cfg, arena.allocator());
+    try encodeTyped(&aw, cfg, arena.allocator(), .{});
     const out = aw.buffered();
     try testing.expect(std.mem.indexOf(u8, out, "n = 100") != null);
 }
@@ -1211,7 +1315,7 @@ test "encodeTyped: []const i64 emits TOML array and round-trips" {
     const cfg = Config{ .nums = nums };
     var buf: [128]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try encodeTyped(&aw, cfg, a);
+    try encodeTyped(&aw, cfg, a, .{});
     const out = aw.buffered();
     try testing.expect(std.mem.indexOf(u8, out, "nums = [1, 2, 3]") != null);
     const decode_mod = @import("decode.zig");
@@ -1229,7 +1333,7 @@ test "encodeTyped: []const f64 emits TOML array and round-trips" {
     const cfg = Config{ .vals = vals };
     var buf: [256]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try encodeTyped(&aw, cfg, a);
+    try encodeTyped(&aw, cfg, a, .{});
     const out = aw.buffered();
     const decode_mod = @import("decode.zig");
     const v1 = try parser.parse(a, out, .{});
@@ -1249,7 +1353,7 @@ test "encodeTyped: [3]u8 fixed array is array of ints (not string)" {
     const cfg = Config{ .bytes = .{ 1, 2, 3 } };
     var buf: [128]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try encodeTyped(&aw, cfg, a);
+    try encodeTyped(&aw, cfg, a, .{});
     const out = aw.buffered();
     try testing.expect(std.mem.indexOf(u8, out, "bytes = [1, 2, 3]") != null);
     const decode_mod = @import("decode.zig");
@@ -1266,7 +1370,7 @@ test "encodeTyped: [3]i64 fixed array round-trips" {
     const cfg = Config{ .vals = .{ 10, 20, 30 } };
     var buf: [128]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try encodeTyped(&aw, cfg, a);
+    try encodeTyped(&aw, cfg, a, .{});
     const out = aw.buffered();
     try testing.expect(std.mem.indexOf(u8, out, "vals = [10, 20, 30]") != null);
     const decode_mod = @import("decode.zig");
@@ -1283,7 +1387,7 @@ test "encodeTyped: [0]i64 emits empty TOML array and round-trips" {
     const cfg = Config{ .empty = .{} };
     var buf: [64]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try encodeTyped(&aw, cfg, a);
+    try encodeTyped(&aw, cfg, a, .{});
     const out = aw.buffered();
     try testing.expect(std.mem.indexOf(u8, out, "empty = []") != null);
     const decode_mod = @import("decode.zig");
@@ -1300,7 +1404,7 @@ test "encodeTyped: ?i64 non-null emits key and round-trips" {
     const cfg = Config{ .x = 5 };
     var buf: [64]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try encodeTyped(&aw, cfg, a);
+    try encodeTyped(&aw, cfg, a, .{});
     const out = aw.buffered();
     try testing.expect(std.mem.indexOf(u8, out, "x = 5") != null);
     const decode_mod = @import("decode.zig");
@@ -1317,7 +1421,7 @@ test "encodeTyped: ?i64 null omits key entirely; decode yields null" {
     const cfg = Config{ .x = null, .y = 7 };
     var buf: [64]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try encodeTyped(&aw, cfg, a);
+    try encodeTyped(&aw, cfg, a, .{});
     const out = aw.buffered();
     // x must be absent from the TOML output.
     try testing.expect(std.mem.indexOf(u8, out, "x") == null);
@@ -1338,7 +1442,7 @@ test "encodeTyped: enum field emits tag name as string and round-trips" {
     const cfg = Config{ .color = .red };
     var buf: [64]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try encodeTyped(&aw, cfg, a);
+    try encodeTyped(&aw, cfg, a, .{});
     const out = aw.buffered();
     try testing.expect(std.mem.indexOf(u8, out, "color = \"red\"") != null);
     const decode_mod = @import("decode.zig");
@@ -1356,7 +1460,7 @@ test "encodeTyped: []const []const u8 emits array of strings and round-trips" {
     const cfg = Config{ .tags = tags };
     var buf: [128]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try encodeTyped(&aw, cfg, a);
+    try encodeTyped(&aw, cfg, a, .{});
     const out = aw.buffered();
     try testing.expect(std.mem.indexOf(u8, out, "tags = [\"foo\", \"bar\", \"baz\"]") != null);
     const decode_mod = @import("decode.zig");
@@ -1468,7 +1572,7 @@ test "encodeTyped: optional sub-table present round-trips" {
     const cfg = S{ .name = "hello", .sub = .{ .x = 1, .y = 2 } };
     var buf: [256]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try encodeTyped(&aw, cfg, a);
+    try encodeTyped(&aw, cfg, a, .{});
     const out = aw.buffered();
 
     try testing.expect(std.mem.indexOf(u8, out, "[sub]") != null);
@@ -1495,7 +1599,7 @@ test "encodeTyped: optional sub-table null emits no header" {
     const cfg = S{ .name = "hello", .sub = null };
     var buf: [256]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try encodeTyped(&aw, cfg, a);
+    try encodeTyped(&aw, cfg, a, .{});
     const out = aw.buffered();
 
     // No [sub] section header when the optional sub-table is null.
@@ -1523,7 +1627,7 @@ test "encodeTyped: nested optional sub-tables round-trip" {
         const cfg = Root{ .a = .{ .b = .{ .v = 42 } } };
         var buf: [256]u8 = undefined;
         var aw: std.Io.Writer = .fixed(&buf);
-        try encodeTyped(&aw, cfg, a);
+        try encodeTyped(&aw, cfg, a, .{});
         const out = aw.buffered();
         try testing.expect(std.mem.indexOf(u8, out, "[a]") != null);
         try testing.expect(std.mem.indexOf(u8, out, "[a.b]") != null);
@@ -1540,7 +1644,7 @@ test "encodeTyped: nested optional sub-tables round-trip" {
         const cfg = Root{ .a = .{ .b = null } };
         var buf: [256]u8 = undefined;
         var aw: std.Io.Writer = .fixed(&buf);
-        try encodeTyped(&aw, cfg, a);
+        try encodeTyped(&aw, cfg, a, .{});
         const out = aw.buffered();
         try testing.expect(std.mem.indexOf(u8, out, "[a]") != null);
         // Inner null means no [a.b] section.
@@ -1557,7 +1661,7 @@ test "encodeTyped: nested optional sub-tables round-trip" {
         const cfg = Root{ .a = null };
         var buf: [256]u8 = undefined;
         var aw: std.Io.Writer = .fixed(&buf);
-        try encodeTyped(&aw, cfg, a);
+        try encodeTyped(&aw, cfg, a, .{});
         const out = aw.buffered();
         try testing.expect(std.mem.indexOf(u8, out, "[a]") == null);
         const decode_mod = @import("decode.zig");
@@ -1584,7 +1688,7 @@ test "encodeTyped: slice-of-struct emits [[array-of-tables]] and round-trips" {
 
     var buf: [1024]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try encodeTyped(&aw, cfg, a);
+    try encodeTyped(&aw, cfg, a, .{});
     const out = aw.buffered();
 
     // Three [[items]] headers, one per element.
@@ -1618,7 +1722,7 @@ test "encodeTyped: ?[]const struct null emits nothing, present emits blocks" {
         const cfg = Config{ .name = "n", .items = null };
         var buf: [512]u8 = undefined;
         var aw: std.Io.Writer = .fixed(&buf);
-        try encodeTyped(&aw, cfg, a);
+        try encodeTyped(&aw, cfg, a, .{});
         const out = aw.buffered();
         try testing.expect(std.mem.indexOf(u8, out, "[[items]]") == null);
         const v1 = try parser.parse(a, out, .{});
@@ -1632,7 +1736,7 @@ test "encodeTyped: ?[]const struct null emits nothing, present emits blocks" {
         const cfg = Config{ .name = "n", .items = items };
         var buf: [512]u8 = undefined;
         var aw: std.Io.Writer = .fixed(&buf);
-        try encodeTyped(&aw, cfg, a);
+        try encodeTyped(&aw, cfg, a, .{});
         const out = aw.buffered();
         try testing.expect(std.mem.indexOf(u8, out, "[[items]]") != null);
         const v1 = try parser.parse(a, out, .{});
@@ -1657,7 +1761,7 @@ test "encodeTyped: empty slice-of-struct emits no blocks, round-trips empty" {
     const cfg = Config{ .items = &.{} };
     var buf: [256]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try encodeTyped(&aw, cfg, a);
+    try encodeTyped(&aw, cfg, a, .{});
     const out = aw.buffered();
     try testing.expect(std.mem.indexOf(u8, out, "[[items]]") == null);
 
@@ -1683,7 +1787,7 @@ test "encodeTyped: nested array-of-tables emits [[a]] + [[a.b]] and round-trips"
 
     var buf: [1024]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try encodeTyped(&aw, cfg, a);
+    try encodeTyped(&aw, cfg, a, .{});
     const out = aw.buffered();
 
     try testing.expect(std.mem.indexOf(u8, out, "[[a]]") != null);
@@ -1721,7 +1825,7 @@ test "encodeTyped: array-of-tables element mixing scalar and sub-table field" {
 
     var buf: [1024]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try encodeTyped(&aw, cfg, a);
+    try encodeTyped(&aw, cfg, a, .{});
     const out = aw.buffered();
 
     // Two [[items]] element headers, each with its own scalar and [items.sub].
@@ -1752,7 +1856,7 @@ test "encodeTyped: [N]struct fixed array emits [[array-of-tables]] and round-tri
     const cfg = Config{ .items = .{ .{ .v = 7 }, .{ .v = 8 } } };
     var buf: [512]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
-    try encodeTyped(&aw, cfg, a);
+    try encodeTyped(&aw, cfg, a, .{});
     const out = aw.buffered();
     try testing.expect(std.mem.indexOf(u8, out, "[[items]]") != null);
 
@@ -1784,4 +1888,89 @@ test "encode float: NaN sign bit preserved; inf spellings correct" {
     var aw_neg_inf: Io.Writer = .fixed(&buf);
     try writeFloat(&aw_neg_inf, -std.math.inf(f64));
     try testing.expectEqualStrings("-inf", aw_neg_inf.buffered());
+}
+
+// sort_keys
+
+test "sort_keys: Value scalars then sub-tables, each sorted; structural rule kept" {
+    var arena: ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tree = try parser.parse(a,
+        \\z = 1
+        \\a = 2
+        \\m = 3
+        \\[sub]
+        \\y = 10
+        \\x = 20
+    , .{});
+    var aw: Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+    try encode(&aw.writer, tree, .{ .sort_keys = true });
+    try testing.expectEqualStrings(
+        \\a = 2
+        \\m = 3
+        \\z = 1
+        \\
+        \\[sub]
+        \\x = 20
+        \\y = 10
+        \\
+    , aw.written());
+}
+
+test "sort_keys: byte-lexicographic order (uppercase before lowercase)" {
+    var arena: ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tree = try parser.parse(a, "b = 1\nA = 2\na = 3\nB = 4\n", .{});
+    var aw: Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+    try encode(&aw.writer, tree, .{ .sort_keys = true });
+    // ASCII bytes: 'A'(65) 'B'(66) 'a'(97) 'b'(98). Not JCS UTF-16 order.
+    try testing.expectEqualStrings("A = 2\nB = 4\na = 3\nb = 1\n", aw.written());
+}
+
+test "sort_keys: typed struct fields sorted, default keeps declaration order" {
+    const C = struct { zebra: i64, apple: i64, mango: i64 };
+    var arena: ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var aw: Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+    const c: C = .{ .zebra = 1, .apple = 2, .mango = 3 };
+    try encodeTyped(&aw.writer, c, a, .{ .sort_keys = true });
+    try testing.expectEqualStrings("apple = 2\nmango = 3\nzebra = 1\n", aw.written());
+
+    aw.clearRetainingCapacity();
+    try encodeTyped(&aw.writer, c, a, .{});
+    try testing.expectEqualStrings("zebra = 1\napple = 2\nmango = 3\n", aw.written());
+}
+
+test "sort_keys: typed sub-tables sorted after scalars, by renamed key" {
+    const Sub = struct { yy: i64, xx: i64 };
+    const C = struct {
+        pub const toml_rename = .{ .zed = "aaa" };
+        zed: i64,
+        sub: Sub,
+        b: i64,
+    };
+    var arena: ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var aw: Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+    const c: C = .{ .zed = 1, .sub = .{ .yy = 10, .xx = 20 }, .b = 2 };
+    try encodeTyped(&aw.writer, c, a, .{ .sort_keys = true });
+    // Scalars first, sorted by emitted key ("aaa" from zed, then "b"); then the
+    // [sub] header; inner scalars sorted xx before yy.
+    try testing.expectEqualStrings(
+        \\aaa = 1
+        \\b = 2
+        \\
+        \\[sub]
+        \\xx = 20
+        \\yy = 10
+        \\
+    , aw.written());
 }

@@ -1100,7 +1100,7 @@ test "round-trip: annotated config decode + encode" {
     var buf: [1024]u8 = undefined;
     var aw: std.Io.Writer = .fixed(&buf);
     const encoder = @import("encoder.zig");
-    try encoder.encodeTyped(&aw, cfg1, a);
+    try encoder.encodeTyped(&aw, cfg1, a, .{});
     const encoded = aw.buffered();
 
     // Re-parse the encoded output and decode again -- should produce equivalent struct.

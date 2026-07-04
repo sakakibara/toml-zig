@@ -15,7 +15,7 @@
 //! // Encode
 //! var aw: std.Io.Writer.Allocating = .init(gpa);
 //! defer aw.deinit();
-//! try toml.encode(&aw.writer, v);
+//! try toml.encode(&aw.writer, v, .{});
 //! const out = aw.written();
 //! ```
 
@@ -94,6 +94,7 @@ pub fn parseReader(arena: std.mem.Allocator, reader: *std.Io.Reader, options: Pa
 }
 
 pub const EncodeError = encoder_mod.EncodeError;
+pub const EncodeOptions = encoder_mod.EncodeOptions;
 pub const encode = encoder_mod.encode;
 pub const encodeTyped = encoder_mod.encodeTyped;
 

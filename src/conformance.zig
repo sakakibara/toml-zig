@@ -1493,7 +1493,7 @@ fn encodeToOwned(val: toml.Value) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(testing.allocator);
     var aw = std.Io.Writer.Allocating.fromArrayList(testing.allocator, &buf);
-    try toml.encode(&aw.writer, val);
+    try toml.encode(&aw.writer, val, .{});
     return aw.toOwnedSlice();
 }
 
