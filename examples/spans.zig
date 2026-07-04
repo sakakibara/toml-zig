@@ -38,7 +38,7 @@ pub fn main() !void {
             lc.line, lc.col, port,
         });
         std.debug.print("  bytes [{d}..{d}]: {s}\n", .{
-            port_at.span.start, port_at.span.end, src[port_at.span.start..port_at.span.end],
+            port_at.span.start, port_at.span.end, src[@intCast(port_at.span.start)..@intCast(port_at.span.end)],
         });
         return;
     }
