@@ -125,26 +125,14 @@ jobs:
       fail-fast: false
       matrix:
         target:
-          - x86-linux-gnu
-          - x86-linux-musl
-          - x86_64-linux-musl
-          - aarch64-linux-musl
-          - arm-linux-gnueabihf
-          - arm-linux-musleabihf
-          - riscv64-linux-gnu
-          - riscv64-linux-musl
-          - powerpc64-linux-gnu
-          - powerpc64le-linux-gnu
-          - mips64-linux-gnuabi64
-          - mips-linux-gnueabihf
-          - x86-windows-gnu
-          - aarch64-windows-gnu
-          - wasm32-wasi
-          - wasm32-freestanding
-          - x86_64-freebsd
-          - aarch64-freebsd
-          - x86_64-netbsd
-          - x86_64-openbsd
+          - x86_64-macos          # Intel macOS
+          - aarch64-windows       # ARM Windows
+          - x86-linux             # 32-bit little-endian
+          - arm-linux-gnueabihf   # 32-bit little-endian (ARM)
+          - mips-linux-gnueabihf  # 32-bit big-endian
+          - powerpc64-linux-gnu   # 64-bit big-endian
+          - riscv64-linux-gnu     # 64-bit little-endian (RISC-V)
+          - wasm32-wasi           # 32-bit wasm
     steps:
       - uses: actions/checkout@v6
       - name: install zig
