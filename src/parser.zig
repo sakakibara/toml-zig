@@ -577,7 +577,7 @@ pub fn ParserOf(comptime Sink: type) type {
         if (had_error) return error.TomlParseError;
     }
 
-    // ----- location / lookahead primitives -----
+    // Location / lookahead primitives
 
     inline fn eof(self: *Self) bool {
         return self.pos >= self.input.len;
@@ -763,7 +763,7 @@ pub fn ParserOf(comptime Sink: type) type {
         return error.TomlParseError;
     }
 
-    // ----- header / array-of-tables parsing -----
+    // Header / array-of-tables parsing
 
     fn parseHeader(self: *Self) Error!void {
         // Already saw `[`
@@ -1121,7 +1121,7 @@ pub fn ParserOf(comptime Sink: type) type {
         }
     }
 
-    // ----- key/value parsing -----
+    // Key/value parsing
 
     fn parseKeyValue(self: *Self, target: Sink.TableRef) Error!void {
         self.skipWs();
@@ -1348,7 +1348,7 @@ pub fn ParserOf(comptime Sink: type) type {
         return self.input[start..self.pos];
     }
 
-    // ----- values -----
+    // Values
 
     fn parseValue(self: *Self) Error!Value {
         if (self.eof()) return self.setError("expected value");
@@ -1400,7 +1400,7 @@ pub fn ParserOf(comptime Sink: type) type {
         });
     }
 
-    // ----- strings -----
+    // Strings
 
     fn parseBasicString(self: *Self) Error![]const u8 {
         self.token_start = self.pos;
@@ -1773,7 +1773,7 @@ pub fn ParserOf(comptime Sink: type) type {
         return self.setError("unterminated multiline literal string");
     }
 
-    // ----- booleans -----
+    // Booleans
 
     fn parseBoolean(self: *Self) Error!Value {
         self.token_start = self.pos;
@@ -1794,7 +1794,7 @@ pub fn ParserOf(comptime Sink: type) type {
         return self.setErrorWithSuggestion(msg, suggestion);
     }
 
-    // ----- numbers / datetimes -----
+    // Numbers / datetimes
 
     /// Unified entry point for unquoted values: integers, floats, inf/nan,
     /// and datetimes. Needs lookahead because `1979-05-27` looks like a
@@ -3241,7 +3241,7 @@ test "spans map: byte offsets past 4 GiB record without a cap (boundary injected
     try testing.expectEqual(@as(u64, over + 5), s.end);
 }
 
-// ----- statement-by-statement (shared SeenState) equivalence -----
+// Statement-by-statement (shared SeenState) equivalence
 
 /// Deep structural equality over the parser's Value tree. Compares
 /// scalars by value and tables/arrays recursively. Table key ORDER is

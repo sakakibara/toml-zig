@@ -247,7 +247,7 @@ fn mbPerSec(bytes: usize, per_op_ns: u64) f64 {
     return bytes_per_op_f * 1_000.0 / ns_f / 1.048576;
 }
 
-// ---- benchmark bodies ----
+// Benchmark bodies
 
 fn benchParse(gpa: std.mem.Allocator, io: Io, fixture: []const u8, iters: usize) !u64 {
     // Fresh arena per iteration: matches the typical "parse a config file

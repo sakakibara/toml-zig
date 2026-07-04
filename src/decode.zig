@@ -1115,7 +1115,7 @@ test "round-trip: annotated config decode + encode" {
     try testing.expectEqual(cfg1.plugin.http.port, cfg2.plugin.http.port);
 }
 
-// ----- streaming typed decode (no Value tree) -----
+// Streaming typed decode (no Value tree)
 
 // The machinery below implements the streaming side of `parseInto`: a
 // comptime sink for the parser's statement executor that dispatches

@@ -959,7 +959,7 @@ fn mergeTableEntries(arena: std.mem.Allocator, dest: *parser.Value.Table, src: p
     }
 }
 
-// --- Tests ----------------------------------------------------------------
+// Tests
 
 const testing = std.testing;
 
@@ -1131,7 +1131,7 @@ fn parseBuffered(arena: std.mem.Allocator, src: []const u8) !Value {
     return parser.parse(arena, src, .{});
 }
 
-// --- Gate A: empty / whitespace-only input --------------------------------
+// Gate A: empty / whitespace-only input
 
 test "gate A: empty reader yields end_of_input then null" {
     for ([_][]const u8{ "", "   ", "\n\n", "  \t\n  \n", "# comment only\n" }) |src| {
@@ -1144,7 +1144,7 @@ test "gate A: empty reader yields end_of_input then null" {
     }
 }
 
-// --- Gate B: cross-check reassembled tree vs buffered parser --------------
+// Gate B: cross-check reassembled tree vs buffered parser
 
 const cross_cases = [_][]const u8{
     "x = 1\ny = 2\n",
@@ -1270,7 +1270,7 @@ test "gate B: non-table-leaf conflicts keep their buffered error message" {
     }
 }
 
-// --- Gate C: duplicate detection across units after value-discard ---------
+// Gate C: duplicate detection across units after value-discard
 
 test "gate C: redefinition across 1000 lines errors in streaming (value-discard proof)" {
     var src_arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -1315,7 +1315,7 @@ test "gate C: [[x]] append across units succeeds in streaming" {
     try testing.expectEqual(@as(i64, 3), v.get("x[2].a").?.integer);
 }
 
-// --- Gate D: chunk-boundary equivalence -----------------------------------
+// Gate D: chunk-boundary equivalence
 
 /// Snapshot of an event's kind + payload, comparable across chunk sizes.
 const EvSnap = struct {
@@ -1510,7 +1510,7 @@ fn reassembleReader(gpa: std.mem.Allocator, arena: std.mem.Allocator, reader: *s
     return reassembleFrom(gpa, arena, &er);
 }
 
-// --- Gate E: no dangling SeenState keys (runs under testing.allocator) -----
+// Gate E: no dangling SeenState keys (runs under testing.allocator)
 
 test "gate E: late duplicate still rejected after many unit-arena resets" {
     var src_arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -1547,7 +1547,7 @@ test "frameNextUnit: need_more until boundary appears" {
     try testing.expect(frameNextUnit(partial, true) == .complete);
 }
 
-// --- Gate F: materialize + ValueStream value composition -------------------
+// Gate F: materialize + ValueStream value composition
 
 /// Drive a `ValueStream` of the given shape over `src` (fixed reader) and
 /// collect every yielded Value into `arena` (one shared arena, NOT reset per
@@ -2021,7 +2021,7 @@ test "stream: whole shape propagates reader failure even with a sink" {
     try testing.expectError(error.ReadFailed, vs.next(arena.allocator()));
 }
 
-// --- Gate G: T-T1 resumable framing ------------------------------------------
+// Gate G: T-T1 resumable framing
 
 test "T-T1: 2 MiB single-unit input completes (O(N) framing regression)" {
     // A unit with no headers; the whole input is one frame. With O(N^2)
@@ -2064,7 +2064,7 @@ test "T-T1: unit exceeding max_unit_bytes returns LineTooLong (not a hang)" {
     try testing.expectError(error.LineTooLong, er.next());
 }
 
-// --- Gate H: T-T2 per-event comment reset ------------------------------------
+// Gate H: T-T2 per-event comment reset
 
 test "T-T2: each event's comment reflects only its own line" {
     // First key has a trailing comment; second key does not.
@@ -2106,7 +2106,7 @@ test "T-T2: header trailing comment is attached to header event" {
     try testing.expectEqualStrings("", kev.comment);
 }
 
-// --- Gate I: T-T3 real header and key spans ----------------------------------
+// Gate I: T-T3 real header and key spans
 
 test "T-T3: header event span covers [section] bytes; key event span covers key bytes" {
     const src = "[section]\nkey = 42\n";
@@ -2142,7 +2142,7 @@ test "T-T3: array-of-tables header span is non-zero and on the right line" {
     try testing.expectEqual(@as(u32, 1), hev.span.lineCol(src).line);
 }
 
-// --- Gate J: tokens truncated across a pull boundary -------------------------
+// Gate J: tokens truncated across a pull boundary
 //
 // A single `Tokenizer` is kept alive across `pull()` refills. A token that
 // runs past the current buffer end (multi-line string, string, comment, long

@@ -1885,7 +1885,7 @@ test "pos: negative float near zero" {
     try testing.expect(p.get("x").?.float < 0);
 }
 
-// ----- quoted vs dotted table-header key segments (segment-aware bookkeeping) -----
+// Quoted vs dotted table-header key segments (segment-aware bookkeeping)
 
 test "table: quoted dotted segment is distinct from dotted path" {
     // `[a."b.c"]` is table a with a child whose single key is "b.c"; it must
