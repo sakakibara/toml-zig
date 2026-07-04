@@ -6,13 +6,141 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-03
+
+### Changed
+
+- **BREAKING:** `encodeTyped(w, value, arena)` takes the writer first,
+  matching `encode`, and takes the value as `anytype` (the type is
+  `@TypeOf(value)`). Bind anonymous literals to a typed const before
+  calling, or the type's `toml_*` annotation decls are not seen.
+- **BREAKING:** `Diagnostic.format` / `Diagnostic.formatRich` are now
+  `render` / `renderRich`, and both take the source bytes to derive
+  line/col from the span. The renderer cannot keep the name `format`:
+  that is the magic `{f}` method name in std formatting, whose required
+  signature cannot carry `src`.
+- **BREAKING:** `toml.Error` is exactly the parse error set
+  (`TomlParseError`, `NestingTooDeep`, `OutOfMemory`); `parseInto` /
+  `parseIntoReader` return `(Error || DecodeError)` /
+  `(ReaderError || DecodeError)`. Code matching on error literals is
+  unaffected.
+
+- **BREAKING:** `Span` is now `{ start: u64, end: u64 }` -- byte offsets only,
+  no stored `line`/`col`. The struct stays 16 bytes, and the 4 GiB cap is gone:
+  spans address any in-memory buffer. Line and column are derived on demand
+  from a span and the source via `span.lineCol(src) -> LineCol{ line, col }`
+  (1-indexed; O(start), intended for occasional human-facing display, not
+  bulk per-value use). This affects `Span`, the opt-in spans map
+  (`ParseOptions.spans`), `Value.locate`, the public tokenizer `Token.span`,
+  and the streaming `Event.span`, all of which now expose u64 offsets and no
+  longer cap at 4 GiB. `Diagnostic` carries the offending `Span` instead of
+  stored `line`/`col`/`range`; `Diagnostic.render`/`renderRich` now take the
+  source bytes and derive line/col from the span. Plain parses, the spans
+  map, and the document model are all uncapped.
+
 ### Added
 
+- Reader-backed, table-at-a-time streaming API: `EventReader`, `ValueStream`
+  (and the `StreamError` error set), all exported from the top-level `toml`
+  module. The unit of streaming is one TOML statement-unit: the leading
+  top-level key-values, a `[table]` section with its key-values, or a
+  `[[array-of-tables]]` element with its key-values. `EventReader.fromReader`
+  / `next` / `materialize` walk a `std.Io.Reader` event-by-event, framing one
+  unit at a time and re-basing spans to absolute stream offsets.
+  `ValueStream.fromReader` takes a `Shape` argument controlling what each
+  `next(item_arena)` yields: `tables` (one `Value` per unit in document order,
+  including the leading root-table unit); `array_of_tables` (one `Value` per
+  `[[array-of-tables]]` element only -- the streaming analog of NDJSON);
+  `whole` (exactly one `Value` holding the full reconstructed document tree,
+  then null -- a convenience, not a bounded-memory stream). Memory is bounded
+  to one unit plus a small pull buffer (4 KiB chunks) for the `tables` and
+  `array_of_tables` shapes; the caller resets `item_arena` between calls to
+  release the previous unit's allocation. The `whole` shape retains the entire
+  reconstructed tree in `item_arena` throughout the drain -- its memory is
+  proportional to the whole document, not one unit. Whole-stream duplicate
+  detection (`[a]...[a]` and scalar/array-vs-table conflicts, including through
+  array-of-tables) is threaded across every unit so streaming rejects exactly
+  what buffered `parse` rejects. `EventReader.materialize(arena)` (valid
+  immediately after a `table_header` or `array_of_tables_header` event)
+  composes the whole current unit into a `Value` without stepping through its
+  individual key/value events. `EventReader.bufCapacity()` exposes the internal
+  buffer capacity for bounded-memory benchmarks and tests.
+  `EventReader.diagnostic()` returns the most recent per-unit error diagnostic.
+  Per-unit error recovery: with `options.errors` set, a malformed unit's
+  diagnostic is appended to the sink and the unit is skipped, so `next()`
+  continues to the following unit; without a sink the first error is terminal.
+- `examples/event_stream.zig`: runnable walk-through of `EventReader`,
+  `ValueStream` (shape `.array_of_tables`), and `materialize` against
+  in-program TOML buffers.
+- Bounded-memory streaming bench (`zig build bench`): streams 100 000 small
+  `[[record]]` elements via `ValueStream` shape `.array_of_tables`, asserts the
+  internal buffer peak `bufCapacity()` stays below 64 KiB (a few pull chunks),
+  and prints peak capacity alongside throughput.
 - Single-pass typed decode: `parseInto` dispatches parsed statements
   straight into the target type (no intermediate `Value` tree) for types
   without `Value` fields, `fromToml` hooks, tagged unions, optional
   sub-tables, or nested arrays-of-tables; on any error it re-decodes
   through the tree path so diagnostics are identical either way.
+
+### Fixed
+
+- Document editor: removing the first key-value no longer corrupts the
+  editor index; setValue propagates nesting-depth errors instead of
+  panicking; inline-table appends no longer duplicate trailing comments;
+  quoted header keys containing `]` stay editable; edit addressability
+  through arrays-of-tables matches `get`.
+- Multi-line literal strings reject a lone CR (only CRLF pairs are
+  valid breaks), matching the basic-string path.
+- The standalone `Tokenizer` lexes commas, closers, and values inside
+  inline arrays and tables with the documented kinds, and always makes
+  progress on invalid input.
+- `Value.set` / `Document.set`: narrowing an integer to the TOML i64 domain
+  is checked (`error.IntegerOverflow`) instead of a safety panic (UB in
+  ReleaseFast), and dotted-path recursion is bounded (`error.PathTooDeep`,
+  limit 128, matching the parser) instead of overflowing the stack. Both
+  errors are added to `Value.SetError` and `Document.Error`.
+- Encoder: flattened fields and tagged-union payloads whose type contains a
+  nested struct now emit their sub-tables; previously they were silently
+  dropped from the output.
+- Document model: the editor indexes key-value lines and headers by their
+  DECODED dotted path, so quoted, literal, dotted, and escape-bearing keys
+  are editable under the same identity `get` resolves; special keys are
+  re-quoted on emit instead of written as raw decoded bytes; replace and
+  insert are atomic (rolled back on a failed reparse); and the reparse
+  buffer stays in the document arena, fixing a use-after-free under a
+  non-arena allocator.
+- Parser: a lone CR that is not part of a CRLF pair is rejected inside
+  multi-line strings instead of being absorbed.
+- Typed codec: decoding a finite float into a narrower float field that would
+  overflow now returns `error.Overflow` (and `Value.getT` returns null)
+  instead of silently yielding infinity; zero-length array fields (`[0]T`)
+  compile; `encodeTyped` range-checks integer fields to the TOML i64 domain
+  (`error.IntegerOverflow`) rather than emitting an out-of-range literal.
+  `encodeTyped` now also handles optionals, enums (by tag name), fixed-size
+  and non-`u8` slice arrays, optional sub-table fields, and slice/array of
+  struct fields (emitted as `[[array-of-tables]]`), making typed encode TOTAL
+  over the decoder's type surface: any type `parseInto` accepts now compiles
+  and encodes, round-tripping when representable.
+- Encoder: carriage returns in multi-line strings are escaped for byte-exact
+  round-trip; keys are never emitted with multi-line quoting; negative NaN
+  keeps its sign.
+- Document model: comment and literal edits reject embedded newlines and
+  terminators (injection guard); the parsed cache stays consistent, rolling
+  back on a failed edit (including inline-table sub-key edits); array-index
+  paths are guarded.
+- Parser conformance: a sub-table defined under an array-of-tables element
+  (`[a.sub]` after `[[a]]`) now scopes to the current element instead of being
+  rejected as a redefinition; a quoted header key containing dots
+  (`[a."b.c"]`) stays distinct from the dotted path (`[a.b.c]`); and a leading
+  empty quoted key no longer collapses distinct paths. toml-zig passes the
+  full toml-test 1.1 suite (214 valid, 467 invalid, 214 encoder).
+
+### Security
+
+- Bounded dotted-key, table-header, and inline-table/array nesting depth in
+  both the parser and the document builder (`error.NestingTooDeep`), so deeply
+  nested untrusted input fails cleanly instead of overflowing the stack.
+  Hardened under multi-seed ReleaseSafe fuzzing.
 
 ## [0.2.0] - 2026-06-21
 
@@ -99,6 +227,7 @@ hand-rolled fast-path decimal integer parser (`parseDecFast`), and
 inlined parser primitives (`peek`, `peekAt`, `advance`, `match`,
 `eof`).
 
-[Unreleased]: https://github.com/sakakibara/toml-zig/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/sakakibara/toml-zig/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/sakakibara/toml-zig/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/sakakibara/toml-zig/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/sakakibara/toml-zig/releases/tag/v0.1.0
