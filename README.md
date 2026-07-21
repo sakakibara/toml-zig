@@ -193,6 +193,24 @@ point = { x = 1, y = 2 }
 point = { x = 99, y = 2 }
 ```
 
+`Document.empty(arena, options)` bootstraps a document with no source
+bytes at all -- the "file doesn't exist yet" case. And `setValueSegments`
+/ `setSegments` / `removeSegments` take a path as pre-split,
+already-unescaped key segments instead of a dotted string, so a key
+containing a literal `.` is addressed unambiguously:
+
+```zig
+var doc = try toml.Document.empty(arena, .{});
+try doc.setSegments(&.{ "host", "example.com" }, "1.2.3.4");
+// "host".example.com is unambiguous: one literal key "example.com"
+// under table "host", not "example" -> "com" nested two levels deep.
+```
+
+Missing intermediate tables along a path are created too, whichever
+setter is used: `set("a.b.c", v)` on a document lacking `a` or `a.b`
+creates them as one combined `[a.b]` header (TOML's implicit-super-table
+rule). Array elements are still only ever replaced, never created.
+
 ### Source spans
 
 A `Span` stores u64 byte offsets (`start`, `end`); line and column are
@@ -380,6 +398,7 @@ to 100 diagnostics per parse. Set it to `null` for single-error mode
 | `encode(w, value, options)` | Emit canonical TOML to `*std.Io.Writer` (`options.sort_keys` to sort keys). |
 | `encodeTyped(w, value, arena, options)` | Emit TOML from a typed Zig struct, consulting `toml_*` annotations. |
 | `Document.parse(arena, src, options)` | Lossless parse for the document model. |
+| `Document.empty(arena, options)` | Bootstrap a document with no source bytes. |
 | `DateTime.parse(literal)` | Parse a single date/time/datetime literal. |
 | `Date.parse(literal)` / `Time.parse(literal)` | Parse a date or time literal. |
 | `Tokenizer.init(src)` / `.next()` | Lexer-level token stream for tooling. |

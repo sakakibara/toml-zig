@@ -217,23 +217,36 @@ pub fn parse(arena: Allocator, input: []const u8, options: ParseOptions) Error!V
 }
 
 /// Decode a TOML key (bare, basic-quoted, literal-quoted, or dotted) into
-/// its canonical decoded form: each segment decoded the same way the value
-/// tree decodes keys, joined by '.'. This is the identity used by
-/// `Value.get`, so the document model uses it to index editable kv lines
-/// under the same key `get` resolves. `raw` must be exactly the key bytes
-/// (no surrounding `=` or value). Returns `error.TomlParseError` on a
-/// malformed key.
-pub fn decodeKeyPath(arena: Allocator, raw: []const u8) Error![]const u8 {
+/// its individual decoded segments, in order, WITHOUT joining them: `a."b.c"`
+/// decodes to `&.{ "a", "b.c" }`, distinct from `a.b.c`'s `&.{ "a", "b", "c"
+/// }`. `raw` must be exactly the key bytes (no surrounding `=` or value).
+/// Returns `error.TomlParseError` on a malformed key. This is the
+/// collision-free form callers needing segment identity (not a lossy
+/// '.'-joined string) should use; `decodeKeyPath` is built on top of it.
+pub fn decodeKeyPathSegments(arena: Allocator, raw: []const u8) Error![]const []const u8 {
     var p = Parser.init(arena, raw);
     var parts: ArrayList([]const u8) = .empty;
-    defer parts.deinit(arena);
     p.parseKeyPath(&parts) catch return error.TomlParseError;
     p.skipWs();
     if (!p.eof()) return error.TomlParseError;
     if (parts.items.len == 0) return error.TomlParseError;
+    return parts.toOwnedSlice(arena);
+}
 
+/// Decode a TOML key (bare, basic-quoted, literal-quoted, or dotted) into
+/// its canonical decoded form: each segment decoded the same way the value
+/// tree decodes keys, joined by '.'. This is the identity used by
+/// `Value.get`, so the document model uses it to index editable kv lines
+/// under the same key `get` resolves. Joining is lossy -- `a."b.c"` and
+/// `a.b.c` both decode to the string `"a.b.c"` -- so code that must tell
+/// them apart (the document model's segment-based editors) uses
+/// `decodeKeyPathSegments` instead. `raw` must be exactly the key bytes (no
+/// surrounding `=` or value). Returns `error.TomlParseError` on a malformed
+/// key.
+pub fn decodeKeyPath(arena: Allocator, raw: []const u8) Error![]const u8 {
+    const parts = try decodeKeyPathSegments(arena, raw);
     var out: ArrayList(u8) = .empty;
-    for (parts.items, 0..) |part, i| {
+    for (parts, 0..) |part, i| {
         if (i > 0) try out.append(arena, '.');
         try out.appendSlice(arena, part);
     }

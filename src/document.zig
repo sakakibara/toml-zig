@@ -39,10 +39,25 @@
 //!   The surrounding document (other lines, comments, header order) is
 //!   untouched.
 //! - Setting a key whose enclosing section header does not yet exist
-//!   appends the header and the new key at the end of the document.
+//!   creates the missing table header (covering every missing segment
+//!   in one `[a.b.c]`-style line, TOML's implicit-super-table rule) and
+//!   appends the leaf key under it, at the end of the document.
 //! - Adding a new key to an existing section appends it as the last
 //!   entry of that section; surrounding formatting (other keys,
 //!   blank lines, comments) is preserved.
+//! - `Document.empty` bootstraps a document with no source bytes at
+//!   all. TOML already treats empty input as a valid (empty) document,
+//!   so this is a thin, explicitly-named alias for `Document.parse(arena,
+//!   "", options)` -- the "file may not exist yet" entry point.
+//! - `setValueSegments` / `setSegments` / `removeSegments` take a path
+//!   as pre-split, already-unescaped key segments (`&.{ "a", "b.c" }`)
+//!   instead of a dotted string, so a key containing a literal `.` is
+//!   addressed unambiguously: each segment is one literal key, never
+//!   re-split on `.`. A segment that isn't a valid bare TOML key is
+//!   quoted on emit. `set` / `setValue` / `setLiteral` / `remove` still
+//!   take dotted string paths and split them into segments the same way
+//!   as before (naive `.`-splitting, quote-unaware) before doing the
+//!   same work, so a dot-free path behaves identically either way.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -98,8 +113,15 @@ pub const Item = union(enum) {
 pub const Header = struct {
     /// The full source line (including trailing newline).
     raw: []const u8,
-    /// Resolved dotted path (e.g., "server.tls").
+    /// Resolved dotted path (e.g., "server.tls"). Lossy: a segment
+    /// containing a literal '.' joins indistinguishably from two plain
+    /// segments. Kept for the string-path editors and comment lookups;
+    /// segment-based resolution uses `path_segments` instead.
     path: []const u8,
+    /// Decoded path segments, unjoined -- the collision-free identity
+    /// `path` cannot represent. `["a", "b.c"]` for `[a."b.c"]`, distinct
+    /// from `["a", "b", "c"]` for `[a.b.c]`.
+    path_segments: []const []const u8,
     /// True for `[[array]]`, false for `[table]`.
     is_array: bool,
 };
@@ -158,8 +180,15 @@ const InlineValue = union(enum) {
 pub const KeyValue = struct {
     /// Full source bytes (key + `=` + value + any trailing comment + newline).
     raw: []const u8,
-    /// Full path resolved against the enclosing header.
+    /// Full path resolved against the enclosing header, joined by '.'.
+    /// Lossy (see `Header.path`); kept for the string-path editors and
+    /// comment lookups. Segment-based resolution uses `full_path_segments`.
     full_path: []const u8,
+    /// Decoded full path segments (enclosing header's segments, if any,
+    /// followed by this line's own key segment(s) -- a source line may
+    /// itself use inline dotted-key syntax, e.g. `a.b = 1`). The
+    /// collision-free identity `full_path` cannot represent.
+    full_path_segments: []const []const u8,
     /// Byte offset within `raw` where the value text starts.
     value_offset: usize,
     /// Length of the value text inside `raw`.
@@ -205,6 +234,16 @@ pub const Document = struct {
         return doc;
     }
 
+    /// Bootstrap a document with no source bytes -- the "file doesn't
+    /// exist yet" case. Empty input is already valid TOML (an empty
+    /// table), so this is a thin, explicitly-named alias for
+    /// `parse(arena, "", options)`: reads see nothing, and the first
+    /// `set` (or any segment variant) creates the whole requested table
+    /// path and leaf as one edit.
+    pub fn empty(arena: Allocator, options: parser_mod.ParseOptions) Error!Document {
+        return parse(arena, "", options);
+    }
+
     /// Look up a value by dotted path. Returns null if absent.
     pub fn get(self: *const Document, path: []const u8) ?Value {
         return self.parsed.get(path);
@@ -241,6 +280,20 @@ pub const Document = struct {
         return false;
     }
 
+    /// Segment-based twin of `pathThroughArrayOfTables`, used by the
+    /// write core (never by the comment editors, which stay string-only).
+    /// Scans headers directly rather than consulting `aot_paths` (which
+    /// is keyed by the lossy joined string) so a segment containing a
+    /// literal '.' cannot collide with an unrelated array-of-tables path.
+    fn pathThroughArrayOfTablesSegments(self: *const Document, segments: []const []const u8) bool {
+        for (self.items.items) |item| {
+            if (item != .header or !item.header.is_array) continue;
+            const p = item.header.path_segments;
+            if (p.len <= segments.len and segArrayEq(p, segments[0..p.len])) return true;
+        }
+        return false;
+    }
+
     /// kv_index lookup for the comment editors: refuses ambiguous paths
     /// (through an array-of-tables) before consulting the index.
     fn editableKvIndex(self: *const Document, path: []const u8) Error!usize {
@@ -253,18 +306,47 @@ pub const Document = struct {
         // array elements, so reject the syntax rather than silently mint a
         // literal `"arr[0]"` key that disagrees with the read path.
         if (pathHasArrayIndex(path)) return error.UnsupportedPath;
-        if (self.pathThroughArrayOfTables(path)) return error.UnsupportedPath;
+        return self.setLiteralSegments(try segmentsFromPath(self.arena, path), raw);
+    }
+
+    /// Segment-taking twin of `setValue`. `segments` are literal key names
+    /// addressed in order -- never re-split on `.` -- so a key containing a
+    /// literal `.` is addressed unambiguously; a segment that isn't a valid
+    /// bare TOML key is quoted on emit. Missing intermediate tables along
+    /// `segments` are created the same way `set` creates them for a dotted
+    /// string path (see the module doc comment).
+    pub fn setValueSegments(self: *Document, segments: []const []const u8, value: Value) Error!void {
+        const raw = formatValue(self.arena, value) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.NestingTooDeep => return error.NestingTooDeep,
+            else => return error.InvalidValue,
+        };
+        return self.setLiteralSegments(segments, raw);
+    }
+
+    /// Segment-taking twin of `set`.
+    pub fn setSegments(self: *Document, segments: []const []const u8, value: anytype) Error!void {
+        const v = try valueFromAny(self.arena, @TypeOf(value), value);
+        return self.setValueSegments(segments, v);
+    }
+
+    /// Segment-based core shared by `setLiteral` (string paths, pre-split
+    /// via `segmentsFromPath`) and `setValueSegments` (already literal key
+    /// segments).
+    fn setLiteralSegments(self: *Document, segments: []const []const u8, raw: []const u8) Error!void {
+        if (segments.len == 0) return error.UnsupportedPath;
+        if (self.pathThroughArrayOfTablesSegments(segments)) return error.UnsupportedPath;
         try validateValueLiteral(self.arena, raw);
 
-        if (self.kv_index.get(path)) |idx| {
+        if (self.findKvIndexBySegments(segments)) |idx| {
             return self.replaceValueAt(idx, raw);
         }
 
         // Walk up the path looking for an enclosing inline-table parent.
-        if (try self.editInsideInlineTable(path, raw)) return;
+        if (try self.editInsideInlineTableSegments(segments, raw)) return;
 
         // Path doesn't match an existing kv or nest into one - append/create.
-        return self.insertNewKey(path, raw);
+        return self.insertNewKeySegments(segments, raw);
     }
 
     fn replaceValueAt(self: *Document, idx: usize, raw_value: []const u8) Error!void {
@@ -280,6 +362,7 @@ pub const Document = struct {
         self.items.items[idx] = .{ .kv = .{
             .raw = new_raw,
             .full_path = old.full_path,
+            .full_path_segments = old.full_path_segments,
             .value_offset = old.value_offset,
             .value_len = raw_value.len,
             .inline_layout = inline_layout,
@@ -293,19 +376,20 @@ pub const Document = struct {
         };
     }
 
-    /// If `path` like `point.x` falls inside an existing inline-table
-    /// value (`point = { x = 1, y = 2 }`), edit the sub-key in place
-    /// using the in-memory layout (preserves original whitespace and
-    /// key order). Returns true on success, false if no enclosing
-    /// inline-table parent was found.
-    fn editInsideInlineTable(self: *Document, path: []const u8, raw_value: []const u8) Error!bool {
-        var dot_pos = path.len;
-        while (true) {
-            const dot = std.mem.lastIndexOfScalar(u8, path[0..dot_pos], '.') orelse return false;
-            const parent_path = path[0..dot];
-            const sub_path = path[dot + 1 ..];
+    /// If `segments` like `&.{ "point", "x" }` falls inside an existing
+    /// inline-table value (`point = { x = 1, y = 2 }`), edit the sub-key in
+    /// place using the in-memory layout (preserves original whitespace and
+    /// key order). Tries progressively shorter leading segment counts as
+    /// the candidate parent, longest first. Returns true on success, false
+    /// if no enclosing inline-table parent was found.
+    fn editInsideInlineTableSegments(self: *Document, segments: []const []const u8, raw_value: []const u8) Error!bool {
+        var split = segments.len;
+        while (split > 1) {
+            split -= 1;
+            const parent_segments = segments[0..split];
+            const sub_segments = segments[split..];
 
-            if (self.kv_index.get(parent_path)) |parent_idx| {
+            if (self.findKvIndexBySegments(parent_segments)) |parent_idx| {
                 if (self.items.items[parent_idx].kv.inline_layout) |layout| {
                     // Edit a fresh clone of the layout so a failed reparse
                     // rolls back cleanly: the layout is mutated in place, so
@@ -316,29 +400,28 @@ pub const Document = struct {
                     // closing brace on reparse.
                     const old_item = self.items.items[parent_idx];
                     self.items.items[parent_idx].kv.inline_layout = try cloneLayout(self.arena, layout);
-                    self.applyInlineEdit(parent_idx, sub_path, raw_value) catch |e| {
+                    self.applyInlineEditSegments(parent_idx, sub_segments, raw_value) catch |e| {
                         self.items.items[parent_idx] = old_item;
                         return e;
                     };
                     return true;
                 }
             }
-
-            dot_pos = dot;
         }
+        return false;
     }
 
     /// Mutate the (already-cloned) inline layout at `parent_idx`, rebuild its
     /// kv raw, and reparse to validate. The caller snapshots the item first
     /// and restores it on any error here.
-    fn applyInlineEdit(self: *Document, parent_idx: usize, sub_path: []const u8, raw_value: []const u8) Error!void {
+    fn applyInlineEditSegments(self: *Document, parent_idx: usize, sub_segments: []const []const u8, raw_value: []const u8) Error!void {
         const layout = self.items.items[parent_idx].kv.inline_layout.?;
-        try setInLayout(self.arena, layout, sub_path, raw_value);
+        try setInLayout(self.arena, layout, sub_segments, raw_value);
         try self.rebuildInlineKv(parent_idx);
         try self.refreshParsed();
     }
 
-    fn insertNewKey(self: *Document, path: []const u8, raw_value: []const u8) Error!void {
+    fn insertNewKeySegments(self: *Document, segments: []const []const u8, raw_value: []const u8) Error!void {
         // Atomicity: snapshot the in-memory state mutated by the insert, do
         // the (possibly multi-step, section-creating) mutation, then validate
         // by reparsing exactly once. If anything fails, restore the snapshot
@@ -348,7 +431,7 @@ pub const Document = struct {
         const section_snapshot = try self.section_end.clone(self.arena);
         const parsed_snapshot = self.parsed;
 
-        self.insertNewKeyMutate(path, raw_value) catch |e| {
+        self.insertNewKeySegmentsMutate(segments, raw_value) catch |e| {
             self.restoreSnapshot(items_snapshot, kv_snapshot, section_snapshot, parsed_snapshot);
             return e;
         };
@@ -375,35 +458,42 @@ pub const Document = struct {
     }
 
     /// Perform the in-memory mutation for inserting a new key, without
-    /// reparsing. Recurses through appendNewSection for missing sections.
-    /// The caller (insertNewKey) validates via a single refreshParsed and
+    /// reparsing. Recurses through appendNewSectionSegments for a missing
+    /// enclosing table, creating every missing level in one combined
+    /// header (`[a.b.c]`) via TOML's implicit-super-table rule -- no
+    /// per-level header is emitted separately. The caller
+    /// (insertNewKeySegments) validates via a single refreshParsed and
     /// rolls back on failure.
-    fn insertNewKeyMutate(self: *Document, path: []const u8, raw_value: []const u8) Error!void {
-        const enclosing = enclosingSection(path);
-        if (self.section_end.get(enclosing)) |after_idx| {
+    fn insertNewKeySegmentsMutate(self: *Document, segments: []const []const u8, raw_value: []const u8) Error!void {
+        const enclosing = segments[0 .. segments.len - 1];
+        const leaf = segments[segments.len - 1];
+        if (self.sectionAppendPoint(enclosing)) |after_idx| {
             // Ensure the preceding item ends with a newline so the
             // new line starts cleanly.
             try self.ensureItemEndsWithNewline(after_idx);
 
             // Append new kv right after the section's last item.
-            const local_key = path[enclosing.len + (if (enclosing.len == 0) @as(usize, 0) else @as(usize, 1)) ..];
-            const fmt = try formatKvLine(self.arena, local_key, raw_value);
+            const fmt = try formatKvLine(self.arena, leaf, raw_value);
+            const full_segments = try dupeSegments(self.arena, segments);
             const new_item: Item = .{ .kv = .{
                 .raw = fmt.line,
-                .full_path = try self.arena.dupe(u8, path),
+                .full_path = try std.mem.join(self.arena, ".", full_segments),
+                .full_path_segments = full_segments,
                 .value_offset = fmt.value_offset,
                 .value_len = raw_value.len,
             } };
             try self.items.insert(self.arena, after_idx + 1, new_item);
             self.shiftIndices(after_idx + 1, 1);
             try self.kv_index.put(self.arena, new_item.kv.full_path, after_idx + 1);
-            try self.section_end.put(self.arena, enclosing, after_idx + 1);
+            try self.section_end.put(self.arena, try std.mem.join(self.arena, ".", enclosing), after_idx + 1);
         } else if (enclosing.len == 0) {
-            // Root-level key but the document is empty -- just append.
-            const fmt = try formatKvLine(self.arena, path, raw_value);
+            // Root-level key but the document has no root content yet -- just append.
+            const fmt = try formatKvLine(self.arena, leaf, raw_value);
+            const full_segments = try dupeSegments(self.arena, segments);
             const new_item: Item = .{ .kv = .{
                 .raw = fmt.line,
-                .full_path = try self.arena.dupe(u8, path),
+                .full_path = try std.mem.join(self.arena, ".", full_segments),
+                .full_path_segments = full_segments,
                 .value_offset = fmt.value_offset,
                 .value_len = raw_value.len,
             } };
@@ -411,10 +501,11 @@ pub const Document = struct {
             try self.kv_index.put(self.arena, new_item.kv.full_path, self.items.items.len - 1);
             try self.section_end.put(self.arena, "", self.items.items.len - 1);
         } else {
-            // Section doesn't exist: create the header, then recurse to add
-            // the key now that the section is present.
-            try self.appendNewSection(enclosing);
-            try self.insertNewKeyMutate(path, raw_value);
+            // Section doesn't exist: create the header covering every
+            // missing segment, then recurse to add the key now that the
+            // section is present.
+            try self.appendNewSectionSegments(enclosing);
+            try self.insertNewKeySegmentsMutate(segments, raw_value);
         }
     }
 
@@ -450,8 +541,18 @@ pub const Document = struct {
         // Mirror setLiteral: `arr[0]` is array-element access, which remove
         // does not support. Erroring keeps it consistent with `get`.
         if (pathHasArrayIndex(path)) return error.UnsupportedPath;
-        if (self.pathThroughArrayOfTables(path)) return error.UnsupportedPath;
-        if (self.kv_index.get(path)) |idx| {
+        return self.removeSeg(try segmentsFromPath(self.arena, path));
+    }
+
+    /// Segment-taking twin of `remove`.
+    pub fn removeSegments(self: *Document, segments: []const []const u8) Error!void {
+        return self.removeSeg(segments);
+    }
+
+    fn removeSeg(self: *Document, segments: []const []const u8) Error!void {
+        if (segments.len == 0) return error.UnsupportedPath;
+        if (self.pathThroughArrayOfTablesSegments(segments)) return error.UnsupportedPath;
+        if (self.findKvIndexBySegments(segments)) |idx| {
             _ = self.items.orderedRemove(idx);
             // section_end may point exactly at the removed kv (last item of
             // its section); a plain index shift would underflow or leave a
@@ -461,21 +562,24 @@ pub const Document = struct {
             return;
         }
 
-        if (try self.removeInsideInlineTable(path)) return;
+        if (try self.removeInsideInlineTableSegments(segments)) return;
 
         return error.PathNotFound;
     }
 
-    fn removeInsideInlineTable(self: *Document, path: []const u8) Error!bool {
-        var dot_pos = path.len;
-        while (true) {
-            const dot = std.mem.lastIndexOfScalar(u8, path[0..dot_pos], '.') orelse return false;
-            const parent_path = path[0..dot];
-            const sub_path = path[dot + 1 ..];
+    /// Segment-based twin of the old `removeInsideInlineTable`: tries
+    /// progressively shorter leading segment counts as the candidate
+    /// enclosing inline-table parent, longest first.
+    fn removeInsideInlineTableSegments(self: *Document, segments: []const []const u8) Error!bool {
+        var split = segments.len;
+        while (split > 1) {
+            split -= 1;
+            const parent_segments = segments[0..split];
+            const sub_segments = segments[split..];
 
-            if (self.kv_index.get(parent_path)) |parent_idx| {
+            if (self.findKvIndexBySegments(parent_segments)) |parent_idx| {
                 if (self.items.items[parent_idx].kv.inline_layout) |layout| {
-                    if (try removeFromLayout(self.arena, layout, sub_path)) {
+                    if (try removeFromLayout(self.arena, layout, sub_segments)) {
                         try self.rebuildInlineKv(parent_idx);
                         try self.refreshParsed();
                         return true;
@@ -483,9 +587,8 @@ pub const Document = struct {
                     return error.PathNotFound;
                 }
             }
-
-            dot_pos = dot;
         }
+        return false;
     }
 
     /// Write the (possibly modified) document.
@@ -578,6 +681,7 @@ pub const Document = struct {
         self.items.items[idx] = .{ .kv = .{
             .raw = new_raw,
             .full_path = old.full_path,
+            .full_path_segments = old.full_path_segments,
             .value_offset = old.value_offset,
             .value_len = old.value_len,
         } };
@@ -649,10 +753,11 @@ pub const Document = struct {
         switch (item) {
             .blank => self.items.items[idx] = .{ .blank = new_raw },
             .comment => self.items.items[idx] = .{ .comment = new_raw },
-            .header => |h| self.items.items[idx] = .{ .header = .{ .raw = new_raw, .path = h.path, .is_array = h.is_array } },
+            .header => |h| self.items.items[idx] = .{ .header = .{ .raw = new_raw, .path = h.path, .path_segments = h.path_segments, .is_array = h.is_array } },
             .kv => |k| self.items.items[idx] = .{ .kv = .{
                 .raw = new_raw,
                 .full_path = k.full_path,
+                .full_path_segments = k.full_path_segments,
                 .value_offset = k.value_offset,
                 .value_len = k.value_len,
             } },
@@ -682,24 +787,67 @@ pub const Document = struct {
         }
     }
 
-    fn appendNewSection(self: *Document, header_path: []const u8) !void {
+    /// Append a new `[a.b.c]`-style header covering every segment of
+    /// `enclosing` in one line, relying on TOML's implicit-super-table
+    /// rule rather than emitting a separate header per level. Each
+    /// segment is re-encoded so one needing quotes (spaces, dots,
+    /// specials) emits valid TOML; `.path`/`.path_segments` stay decoded
+    /// so they share identity with kv full paths and `get`.
+    fn appendNewSectionSegments(self: *Document, enclosing: []const []const u8) !void {
         const needs_blank = self.items.items.len > 0 and !endsWithBlank(self.items.items);
         if (needs_blank) {
             try self.items.append(self.arena, .{ .blank = "\n" });
         }
-        // header_path is the decoded dotted identity; re-encode each segment
-        // so a segment needing quotes (spaces, specials) emits valid TOML.
-        // The stored .path stays decoded so it shares identity with kv
-        // full_paths and `get`.
-        const rendered = try renderHeaderPath(self.arena, header_path);
+        const rendered = try renderHeaderSegments(self.arena, enclosing);
         const raw = try std.fmt.allocPrint(self.arena, "[{s}]\n", .{rendered});
+        const path_segments = try dupeSegments(self.arena, enclosing);
         const header_item: Item = .{ .header = .{
             .raw = raw,
-            .path = try self.arena.dupe(u8, header_path),
+            .path = try std.mem.join(self.arena, ".", path_segments),
+            .path_segments = path_segments,
             .is_array = false,
         } };
         try self.items.append(self.arena, header_item);
         try self.section_end.put(self.arena, header_item.header.path, self.items.items.len - 1);
+    }
+
+    /// Segment-based twin of `findHeaderIndex`, comparing decoded segment
+    /// arrays directly instead of the lossy joined string -- so a header
+    /// whose own path has a literal-dot segment cannot collide with an
+    /// unrelated dotted header.
+    fn findHeaderIndexBySegments(self: *const Document, segments: []const []const u8) ?usize {
+        for (self.items.items, 0..) |item, i| {
+            if (item == .header and segArrayEq(item.header.path_segments, segments)) return i;
+        }
+        return null;
+    }
+
+    /// Segment-based twin of a `kv_index` lookup: scans for the kv line
+    /// whose full path segments exactly match `segments`.
+    fn findKvIndexBySegments(self: *const Document, segments: []const []const u8) ?usize {
+        for (self.items.items, 0..) |item, i| {
+            if (item == .kv and segArrayEq(item.kv.full_path_segments, segments)) return i;
+        }
+        return null;
+    }
+
+    /// Where to insert a new kv line addressed to `enclosing` (a table's
+    /// full segment path, or `&.{}` for the root pseudo-section): the
+    /// index of the last existing item belonging to that section, or null
+    /// if there is nothing to append after (root with no kv yet, or a
+    /// missing table). Segment-based twin of what `section_end` tracks
+    /// for the string-path editors.
+    fn sectionAppendPoint(self: *const Document, enclosing: []const []const u8) ?usize {
+        if (enclosing.len == 0) {
+            var last: ?usize = null;
+            for (self.items.items, 0..) |item, i| {
+                if (item == .header) break;
+                if (item == .kv) last = i;
+            }
+            return last;
+        }
+        const header_idx = self.findHeaderIndexBySegments(enclosing) orelse return null;
+        return findSectionEnd(self.items.items, header_idx) - 1;
     }
 
     fn rebuildInlineKv(self: *Document, idx: usize) Error!void {
@@ -756,11 +904,34 @@ fn endsWithBlank(items: []const Item) bool {
     };
 }
 
-fn enclosingSection(path: []const u8) []const u8 {
-    if (std.mem.lastIndexOfScalar(u8, path, '.')) |i| {
-        return path[0..i];
+/// Elementwise equality of two decoded segment arrays.
+fn segArrayEq(a: []const []const u8, b: []const []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| {
+        if (!std.mem.eql(u8, x, y)) return false;
     }
-    return "";
+    return true;
+}
+
+/// Split a dotted string path into segments the same way the write core
+/// always has: naive per-'.' splitting, quote-unaware. This is "today's"
+/// splitting (unchanged), just factored out so the string-path editors
+/// feed the same segment-based core the segment-taking editors use.
+fn segmentsFromPath(arena: Allocator, path: []const u8) Error![]const []const u8 {
+    var list: std.ArrayList([]const u8) = .empty;
+    var it = std.mem.splitScalar(u8, path, '.');
+    while (it.next()) |seg| try list.append(arena, seg);
+    return list.toOwnedSlice(arena);
+}
+
+/// Deep-copy `segments` into the arena (outer slice and each segment's
+/// bytes) so a stored `path_segments` / `full_path_segments` field
+/// outlives a caller-owned or transient source (e.g. a naive split of a
+/// caller's string, or a caller's own segment slice).
+fn dupeSegments(arena: Allocator, segments: []const []const u8) Error![]const []const u8 {
+    const out = try arena.alloc([]const u8, segments.len);
+    for (segments, out) |s, *o| o.* = try arena.dupe(u8, s);
+    return out;
 }
 
 const FormattedKv = struct { line: []const u8, value_offset: usize };
@@ -849,10 +1020,9 @@ fn cloneLayout(arena: Allocator, src: *const InlineTableLayout) Error!*InlineTab
     return out;
 }
 
-fn setInLayout(arena: Allocator, layout: *InlineTableLayout, sub_path: []const u8, raw_value: []const u8) Error!void {
-    const dot = std.mem.indexOfScalar(u8, sub_path, '.');
-    const head = if (dot) |d| sub_path[0..d] else sub_path;
-    const tail = if (dot) |d| sub_path[d + 1 ..] else "";
+fn setInLayout(arena: Allocator, layout: *InlineTableLayout, segments: []const []const u8, raw_value: []const u8) Error!void {
+    const head = segments[0];
+    const tail = segments[1..];
 
     for (layout.entries.items) |*entry| {
         if (std.mem.eql(u8, entry.key, head)) {
@@ -981,18 +1151,15 @@ fn wsTail(pattern: []const u8) []const u8 {
     return "";
 }
 
-/// Render a decoded dotted path as a TOML header body, re-encoding each
-/// `.`-separated segment so segments needing quotes emit valid TOML
-/// (`my server` -> `"my server"`, `a.b` -> `a.b`). Mirrors the encoder's
-/// writePath segment-by-segment quoting.
-fn renderHeaderPath(arena: Allocator, path: []const u8) Error![]const u8 {
+/// Render decoded key segments as a TOML header body, re-encoding each
+/// segment so one needing quotes emits valid TOML (`my server` ->
+/// `"my server"`, a segment containing a literal `.` like `a.b` ->
+/// `"a.b"`). Mirrors the encoder's writePath segment-by-segment quoting.
+fn renderHeaderSegments(arena: Allocator, segments: []const []const u8) Error![]const u8 {
     var aw: Io.Writer.Allocating = .init(arena);
     defer aw.deinit();
-    var first = true;
-    var it = std.mem.splitScalar(u8, path, '.');
-    while (it.next()) |segment| {
-        if (!first) aw.writer.writeByte('.') catch return error.WriteFailed;
-        first = false;
+    for (segments, 0..) |segment, i| {
+        if (i > 0) aw.writer.writeByte('.') catch return error.WriteFailed;
         encoder.writeKey(&aw.writer, segment) catch |e| switch (e) {
             error.WriteFailed => return error.WriteFailed,
             else => unreachable,
@@ -1014,13 +1181,12 @@ fn encodeKey(arena: Allocator, key: []const u8) Error![]const u8 {
     return arena.dupe(u8, aw.written());
 }
 
-/// Remove the entry matching sub_path from layout. Returns true when the
+/// Remove the entry matching `segments` from layout. Returns true when the
 /// entry was found and removed, false when not found. Strips a now-redundant
 /// trailing comma from the preceding entry when the removed entry was last.
-fn removeFromLayout(arena: Allocator, layout: *InlineTableLayout, sub_path: []const u8) Error!bool {
-    const dot = std.mem.indexOfScalar(u8, sub_path, '.');
-    const head = if (dot) |d| sub_path[0..d] else sub_path;
-    const tail = if (dot) |d| sub_path[d + 1 ..] else "";
+fn removeFromLayout(arena: Allocator, layout: *InlineTableLayout, segments: []const []const u8) Error!bool {
+    const head = segments[0];
+    const tail = segments[1..];
 
     for (layout.entries.items, 0..) |entry, i| {
         if (std.mem.eql(u8, entry.key, head)) {
@@ -1085,6 +1251,7 @@ const Tokenizer = struct {
 fn tokenize(doc: *Document, src: []const u8) !void {
     var tok: Tokenizer = .{ .source = src };
     var current_section: []const u8 = "";
+    var current_section_segments: []const []const u8 = &.{};
 
     while (tok.pos < src.len) {
         const line_start = tok.pos;
@@ -1124,18 +1291,27 @@ fn tokenize(doc: *Document, src: []const u8) !void {
             else
                 path_start;
             const header_path = std.mem.trim(u8, src[path_start..path_end], " \t");
-            // Index headers by their decoded dotted path so kv full_paths,
-            // section lookups, and `get` all share one key identity.
-            const owned_path = parser_mod.decodeKeyPath(doc.arena, header_path) catch
-                try doc.arena.dupe(u8, header_path);
+            // Decode into segments first (the collision-free identity),
+            // then derive the joined `.path` from them: this is index by
+            // their decoded dotted path so kv full_paths, section lookups,
+            // and `get` all share one key identity, while `path_segments`
+            // keeps the unjoined form segment-based resolution needs.
+            const path_segments = parser_mod.decodeKeyPathSegments(doc.arena, header_path) catch blk: {
+                const one = try doc.arena.alloc([]const u8, 1);
+                one[0] = header_path;
+                break :blk one;
+            };
+            const owned_path = try std.mem.join(doc.arena, ".", path_segments);
 
             const header_item: Item = .{ .header = .{
                 .raw = raw,
                 .path = owned_path,
+                .path_segments = path_segments,
                 .is_array = is_array,
             } };
             try doc.items.append(doc.arena, header_item);
             current_section = owned_path;
+            current_section_segments = path_segments;
             try doc.section_end.put(doc.arena, owned_path, doc.items.items.len - 1);
             if (is_array) try doc.aot_paths.put(doc.arena, owned_path, {});
 
@@ -1167,12 +1343,19 @@ fn tokenize(doc: *Document, src: []const u8) !void {
         // The editor index keys kv lines by their DECODED dotted path so a
         // quoted/literal/escaped key resolves under the same identity as
         // `get` (which reads the decoded value tree). `kv.raw` still holds
-        // the source bytes for lossless emit.
-        const key_decoded = parser_mod.decodeKeyPath(doc.arena, key_raw) catch key_raw;
-        const full_path = blk: {
-            if (current_section.len == 0) break :blk try doc.arena.dupe(u8, key_decoded);
-            break :blk try std.fmt.allocPrint(doc.arena, "{s}.{s}", .{ current_section, key_decoded });
+        // the source bytes for lossless emit. Segments decode first (the
+        // collision-free identity); `full_path`/`key_decoded` are then
+        // just the joined form, kept for the string-path editors.
+        const key_segments = parser_mod.decodeKeyPathSegments(doc.arena, key_raw) catch blk: {
+            const one = try doc.arena.alloc([]const u8, 1);
+            one[0] = key_raw;
+            break :blk one;
         };
+        const full_path_segments = if (current_section_segments.len == 0)
+            key_segments
+        else
+            try std.mem.concat(doc.arena, []const u8, &.{ current_section_segments, key_segments });
+        const full_path = try std.mem.join(doc.arena, ".", full_path_segments);
         const value_offset: usize = value_start - line_start;
         const value_len: usize = value_end - value_start;
 
@@ -1185,6 +1368,7 @@ fn tokenize(doc: *Document, src: []const u8) !void {
         const kv_item: Item = .{ .kv = .{
             .raw = raw,
             .full_path = full_path,
+            .full_path_segments = full_path_segments,
             .value_offset = value_offset,
             .value_len = value_len,
             .inline_layout = inline_layout,
@@ -2930,4 +3114,205 @@ test "document: simple bare-key new section still emits unquoted" {
     defer aw.deinit();
     try doc.emit(&aw.writer);
     try testing.expectEqualStrings("[server]\nport = 8080\n\n[client]\ntimeout = 30\n", aw.written());
+}
+
+test "Document.empty bootstraps a document with no source bytes" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.empty(a, .{});
+
+    var aw: Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+    try doc.emit(&aw.writer);
+    try testing.expectEqualStrings("", aw.written());
+    try testing.expect(!doc.has("a.b.c"));
+
+    try doc.set("a.b.c", @as(i64, 1));
+
+    var aw2: Io.Writer.Allocating = .init(a);
+    defer aw2.deinit();
+    try doc.emit(&aw2.writer);
+    try testing.expectEqualStrings("[a.b]\nc = 1\n", aw2.written());
+    try testing.expectEqual(@as(i64, 1), doc.getT(i64, "a.b.c").?);
+}
+
+test "setValueSegments creates a missing 3-level table chain, preserving surrounding trivia" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const src = "# keep me\ntitle = \"toml\"\n";
+    var doc = try Document.parse(a, src, .{});
+
+    try doc.setValueSegments(&.{ "a", "b", "c" }, .{ .integer = 9 });
+
+    var aw: Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+    try doc.emit(&aw.writer);
+    try testing.expectEqualStrings("# keep me\ntitle = \"toml\"\n\n[a.b]\nc = 9\n", aw.written());
+    try testing.expectEqual(@as(i64, 9), doc.get("a.b.c").?.integer);
+}
+
+test "setSegments creates missing intermediates through a partially existing prefix" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a,
+        \\[a]
+        \\x = 1
+        \\
+    , .{});
+
+    try doc.setSegments(&.{ "a", "b", "c" }, @as(i64, 2));
+
+    var aw: Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+    try doc.emit(&aw.writer);
+    try testing.expectEqualStrings("[a]\nx = 1\n\n[a.b]\nc = 2\n", aw.written());
+    try testing.expectEqual(@as(i64, 2), doc.get("a.b.c").?.integer);
+    try testing.expectEqual(@as(i64, 1), doc.get("a.x").?.integer);
+}
+
+test "setValueSegments creates the single literal key \"a.b\", not a nested a->b path" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a, "", .{});
+
+    try doc.setValueSegments(&.{"a.b"}, .{ .string = "x" });
+
+    var aw: Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+    try doc.emit(&aw.writer);
+    try testing.expectEqualStrings("\"a.b\" = \"x\"\n", aw.written());
+
+    // Re-parse independently and confirm the root has exactly one key, the
+    // literal "a.b" -- not a table "a" containing key "b".
+    var check = try Document.parse(a, aw.written(), .{});
+    try testing.expectEqual(@as(usize, 1), check.parsed.table.count());
+    try testing.expectEqualStrings("x", check.parsed.table.get("a.b").?.string);
+    try testing.expect(check.parsed.table.get("a") == null);
+}
+
+test "setSegments dispatches native types like set" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a, "", .{});
+
+    try doc.setSegments(&.{ "server", "host" }, "example.com");
+
+    var aw: Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+    try doc.emit(&aw.writer);
+    try testing.expectEqualStrings("[server]\nhost = \"example.com\"\n", aw.written());
+    try testing.expectEqualStrings("example.com", doc.get("server.host").?.string);
+}
+
+test "setValueSegments quotes and escapes a segment needing it" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a, "", .{});
+
+    // The segment itself contains a double quote and a backslash.
+    try doc.setValueSegments(&.{"a\"b\\c"}, .{ .integer = 1 });
+
+    var aw: Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+    try doc.emit(&aw.writer);
+    try testing.expectEqualStrings("\"a\\\"b\\\\c\" = 1\n", aw.written());
+
+    var check = try Document.parse(a, aw.written(), .{});
+    try testing.expectEqual(@as(usize, 1), check.parsed.table.count());
+    try testing.expectEqual(@as(i64, 1), check.parsed.table.get("a\"b\\c").?.integer);
+}
+
+test "removeSegments removes a quoted-dotted key without touching a same-named table" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a,
+        \\"a.b" = 1
+        \\other = 2
+        \\
+    , .{});
+
+    try doc.removeSegments(&.{"a.b"});
+
+    var aw: Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+    try doc.emit(&aw.writer);
+    try testing.expectEqualStrings("other = 2\n", aw.written());
+    try testing.expectError(error.PathNotFound, doc.removeSegments(&.{"a.b"}));
+}
+
+test "existing bare-key path set is byte-identical via string path and segments" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const src = "[a]\nx = 1\ny = 2\n";
+
+    var via_path = try Document.parse(a, src, .{});
+    try via_path.setLiteral("a.x", "99");
+
+    var via_seg = try Document.parse(a, src, .{});
+    try via_seg.setValueSegments(&.{ "a", "x" }, .{ .integer = 99 });
+
+    const wanted = "[a]\nx = 99\ny = 2\n";
+    var aw1: Io.Writer.Allocating = .init(a);
+    defer aw1.deinit();
+    try via_path.emit(&aw1.writer);
+    try testing.expectEqualStrings(wanted, aw1.written());
+
+    var aw2: Io.Writer.Allocating = .init(a);
+    defer aw2.deinit();
+    try via_seg.emit(&aw2.writer);
+    try testing.expectEqualStrings(wanted, aw2.written());
+}
+
+test "an array index in a missing tail is still rejected, never fabricated" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var doc = try Document.parse(arena.allocator(), "", .{});
+
+    try testing.expectError(error.UnsupportedPath, doc.set("missing[0].c", true));
+    try testing.expectError(error.UnsupportedPath, doc.set("missing[0]", true));
+}
+
+test "setValueSegments rejects an empty segment list" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var doc = try Document.parse(arena.allocator(), "", .{});
+
+    try testing.expectError(error.UnsupportedPath, doc.setValueSegments(&.{}, .{ .integer = 1 }));
+    try testing.expectError(error.UnsupportedPath, doc.removeSegments(&.{}));
+}
+
+test "setSegments creates a sub-key inside an existing inline table" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a, "point = { x = 1 }\n", .{});
+
+    try doc.setSegments(&.{ "point", "y" }, @as(i64, 2));
+
+    var aw: Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+    try doc.emit(&aw.writer);
+    try testing.expectEqualStrings("point = { x = 1, y = 2 }\n", aw.written());
+    try testing.expectEqual(@as(i64, 2), doc.get("point.y").?.integer);
+}
+
+test "setValueSegments refuses a path through an array-of-tables" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a,
+        \\[[items]]
+        \\name = "a"
+        \\
+    , .{});
+
+    try testing.expectError(error.UnsupportedPath, doc.setValueSegments(&.{ "items", "name" }, .{ .string = "b" }));
 }

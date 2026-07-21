@@ -6,6 +6,32 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `Document.setValueSegments` / `Document.setSegments` /
+  `Document.removeSegments`: segment-taking twins of `setValue` / `set` /
+  `remove` that address a path as pre-split, already-unescaped key
+  segments (e.g. `&.{ "host", "example.com" }`) instead of a dotted
+  string, so a key containing a literal `.` is addressed unambiguously.
+  A segment that isn't a valid bare TOML key is quoted on emit. Missing
+  intermediate tables along the path are created the same way `set`
+  already creates them for a dotted string path (one combined `[a.b]`
+  header, via TOML's implicit-super-table rule). Array elements are
+  still never created, only replaced: an `[N]` index anywhere in the
+  path is `error.UnsupportedPath`.
+- `Document.empty`: bootstrap a document with no source bytes (the "file
+  doesn't exist yet" case). TOML already treats empty input as valid (an
+  empty table), so this is a thin, explicitly-named alias for
+  `Document.parse(arena, "", options)`.
+
+### Fixed
+
+- `set` / `setValue` / `setLiteral` / `remove` now resolve a path against
+  decoded key *segments* internally instead of a lossily `.`-joined
+  string, so a document containing both a literally-dotted key (e.g.
+  `"a.b" = 1`) and an unrelated nested table (`[a.b]` i.e. table `a`'s
+  key `b`) can no longer have one edit silently target the other.
+
 ## [0.4.0] - 2026-07-05
 
 ### Changed
