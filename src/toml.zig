@@ -141,6 +141,7 @@ test {
     _ = @import("conformance.zig");
     _ = @import("levenshtein.zig");
     _ = @import("stream.zig");
+    _ = @import("document_property.zig");
 }
 
 test "parseReader matches parse for the same document" {
