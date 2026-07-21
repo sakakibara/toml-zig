@@ -847,7 +847,13 @@ pub const Document = struct {
             return last;
         }
         const header_idx = self.findHeaderIndexBySegments(enclosing) orelse return null;
-        return findSectionEnd(self.items.items, header_idx) - 1;
+        const end = findSectionEnd(self.items.items, header_idx);
+        var last = header_idx;
+        var i = header_idx + 1;
+        while (i < end) : (i += 1) if (self.items.items[i] == .kv) {
+            last = i;
+        };
+        return last;
     }
 
     fn rebuildInlineKv(self: *Document, idx: usize) Error!void {
@@ -1921,6 +1927,88 @@ test "document: setLiteral appends to existing section" {
     defer aw.deinit();
     try doc.emit(&aw.writer);
     try testing.expectEqualStrings("[server]\nport = 8080\ntls = true\n", aw.written());
+}
+
+test "document: setLiteral appends before a trailing blank and next header" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var doc = try Document.parse(arena.allocator(),
+        \\[server]
+        \\port = 8080
+        \\
+        \\[other]
+        \\x = 1
+        \\
+    , .{});
+
+    try doc.setLiteral("server.host", "\"h\"");
+
+    var aw: Io.Writer.Allocating = .init(arena.allocator());
+    defer aw.deinit();
+    try doc.emit(&aw.writer);
+    try testing.expectEqualStrings(
+        "[server]\nport = 8080\nhost = \"h\"\n\n[other]\nx = 1\n",
+        aw.written(),
+    );
+}
+
+test "document: setLiteral appends before a trailing comment and next header" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var doc = try Document.parse(arena.allocator(),
+        \\[server]
+        \\port = 8080
+        \\# trailing comment
+        \\[other]
+        \\x = 1
+        \\
+    , .{});
+
+    try doc.setLiteral("server.host", "\"h\"");
+
+    var aw: Io.Writer.Allocating = .init(arena.allocator());
+    defer aw.deinit();
+    try doc.emit(&aw.writer);
+    try testing.expectEqualStrings(
+        "[server]\nport = 8080\nhost = \"h\"\n# trailing comment\n[other]\nx = 1\n",
+        aw.written(),
+    );
+}
+
+test "document: setLiteral appends before a trailing blank at EOF in the last section" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var doc = try Document.parse(arena.allocator(),
+        \\[server]
+        \\port = 8080
+        \\
+        \\
+    , .{});
+
+    try doc.setLiteral("server.host", "\"h\"");
+
+    var aw: Io.Writer.Allocating = .init(arena.allocator());
+    defer aw.deinit();
+    try doc.emit(&aw.writer);
+    try testing.expectEqualStrings("[server]\nport = 8080\nhost = \"h\"\n\n", aw.written());
+}
+
+test "document: setLiteral into a header-only section with no existing kv" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var doc = try Document.parse(arena.allocator(),
+        \\[empty]
+        \\[other]
+        \\x = 1
+        \\
+    , .{});
+
+    try doc.setLiteral("empty.host", "\"h\"");
+
+    var aw: Io.Writer.Allocating = .init(arena.allocator());
+    defer aw.deinit();
+    try doc.emit(&aw.writer);
+    try testing.expectEqualStrings("[empty]\nhost = \"h\"\n[other]\nx = 1\n", aw.written());
 }
 
 test "document: setLiteral creates new section if missing" {
