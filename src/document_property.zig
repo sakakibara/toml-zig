@@ -12,8 +12,15 @@
 //!   4. Every other leaf from the original document still reads back its
 //!      original value.
 //!   5. Every comment present in the source is still present in the
-//!      output; a pure value-replace on an existing leaf changes only
-//!      the value's own byte span.
+//!      output as a whole line (distinct comment lines are matched by
+//!      exact line text and multiplicity, not substring search, so
+//!      `# c1` can't be masked by `# c10`); a pure value-replace on an
+//!      existing leaf changes only the value's own byte span (5b); and
+//!      an appended or newly created key lands exactly where the
+//!      editor's append-point contract puts it -- immediately after the
+//!      target section's last existing line, before any trailing blank
+//!      line or comment that precedes the next header -- with every
+//!      other byte of the document untouched (5c).
 //!   6. Re-applying the same set is a byte-identical no-op.
 //!   7. Removing an existing leaf drops it, re-parses cleanly, and
 //!      preserves siblings and comments.
@@ -404,6 +411,131 @@ fn findValueSpan(doc: *const Document, segments: []const []const u8) ?PreEditSpa
     return null;
 }
 
+/// Where a new key under `segments`'s enclosing container is expected to
+/// land, decided from the pre-edit document: `.append` when the
+/// enclosing container already has a section (byte offset = immediately
+/// after its last existing key/value line, before any trailing blank
+/// line or comment that precedes the next header); `.create` when it
+/// doesn't (the editor always creates the missing table's combined
+/// header, and the new key under it, by appending at the true end of
+/// the document -- `needs_blank` records whether a separating blank
+/// line is needed first, i.e. whether the document is non-empty and its
+/// last item isn't already blank).
+const PlacementPlan = union(enum) {
+    append: usize,
+    create: bool,
+};
+
+/// Computed independently of `Document.sectionAppendPoint` /
+/// `appendNewSectionSegments` so this stays a proof of the intended
+/// append-point contract rather than an echo of whatever the editor
+/// currently does.
+fn planPlacement(doc: *const Document, segments: []const []const u8) PlacementPlan {
+    const enclosing = segments[0 .. segments.len - 1];
+    if (sectionAnchorByte(doc, enclosing)) |anchor| return .{ .append = anchor };
+    const items = doc.items.items;
+    const needs_blank = items.len > 0 and items[items.len - 1] != .blank;
+    return .{ .create = needs_blank };
+}
+
+/// `null` means `enclosing` has no header pre-edit (root's implicit
+/// section never counts as "missing" here since it needs none). The
+/// root branch mirrors `sectionAppendPoint`'s own root case: the last
+/// kv before the first header, or `null` if the root has no kv yet.
+fn sectionAnchorByte(doc: *const Document, enclosing: []const []const u8) ?usize {
+    if (enclosing.len == 0) {
+        var last: ?usize = null;
+        for (doc.items.items) |item| {
+            if (item == .header) break;
+            if (item == .kv) last = itemEndByte(doc, item);
+        }
+        return last;
+    }
+    var header_idx: ?usize = null;
+    for (doc.items.items, 0..) |item, i| {
+        if (item == .header and segEq(item.header.path_segments, enclosing)) {
+            header_idx = i;
+            break;
+        }
+    }
+    const h_idx = header_idx orelse return null;
+    var anchor = itemEndByte(doc, doc.items.items[h_idx]);
+    var i = h_idx + 1;
+    while (i < doc.items.items.len and doc.items.items[i] != .header) : (i += 1) {
+        if (doc.items.items[i] == .kv) anchor = itemEndByte(doc, doc.items.items[i]);
+    }
+    return anchor;
+}
+
+fn itemEndByte(doc: *const Document, item: document.Item) usize {
+    const raw = item.rawBytes();
+    const start = @intFromPtr(raw.ptr) - @intFromPtr(doc.source.ptr);
+    return start + raw.len;
+}
+
+/// Reconstructs the exact byte-for-byte expected output for the
+/// planned placement (using the same `encoder.writeKey` /
+/// `encoder.writeInlineValue` calls the editor's own formatter uses,
+/// via `writeKvLine`/`writeHeaderLine`) and asserts the actual output
+/// matches exactly. A whole-string comparison rather than a
+/// boundary-only one: a boundary-only check (matching prefix/suffix
+/// around an inferred insertion length) can be fooled when the
+/// insertion sits next to a bare `\n` blank line, since the moved
+/// blank's byte is indistinguishable from the new line's own trailing
+/// `\n` -- reconstructing and comparing the whole string has no such
+/// blind spot.
+fn checkPlacement(arena: Allocator, plan: PlacementPlan, pre_source: []const u8, leaf: []const u8, enclosing: []const []const u8, value: Value, output: []const u8, ctx: *Ctx) !void {
+    var aw: Io.Writer.Allocating = .init(arena);
+    switch (plan) {
+        .append => |anchor| {
+            try aw.writer.writeAll(pre_source[0..anchor]);
+            try writeKvLine(&aw.writer, leaf, value);
+            try aw.writer.writeAll(pre_source[anchor..]);
+        },
+        .create => |needs_blank| {
+            try aw.writer.writeAll(pre_source);
+            if (needs_blank) try aw.writer.writeByte('\n');
+            try writeHeaderLine(&aw.writer, enclosing);
+            try writeKvLine(&aw.writer, leaf, value);
+        },
+    }
+    if (!std.mem.eql(u8, aw.written(), output)) {
+        return fail(ctx, "5c-append-create-placement", "appended/created key was not inserted exactly where the editor's append-point contract puts it (placement/layout regression)");
+    }
+}
+
+/// Whole-line, multiplicity-aware comment check: every distinct comment
+/// line from the source must appear as an exact line in `output` at
+/// least as many times as it appears in `comments`. Guards against a
+/// substring search being fooled by one comment's text being a prefix
+/// of another's (`# c1` inside `# c10`) or appearing embedded in
+/// unrelated content.
+fn checkCommentsPreserved(arena: Allocator, output: []const u8, comments: []const []const u8, ctx: *Ctx, label: []const u8) !void {
+    var have: std.StringHashMapUnmanaged(usize) = .empty;
+    var out_lines = std.mem.splitScalar(u8, output, '\n');
+    while (out_lines.next()) |line| {
+        const gop = try have.getOrPut(arena, line);
+        if (!gop.found_existing) gop.value_ptr.* = 0;
+        gop.value_ptr.* += 1;
+    }
+
+    var needed: std.StringHashMapUnmanaged(usize) = .empty;
+    for (comments) |c| {
+        const line = std.mem.trimEnd(u8, c, "\n");
+        const gop = try needed.getOrPut(arena, line);
+        if (!gop.found_existing) gop.value_ptr.* = 0;
+        gop.value_ptr.* += 1;
+    }
+
+    var it = needed.iterator();
+    while (it.next()) |entry| {
+        const got = have.get(entry.key_ptr.*) orelse 0;
+        if (got < entry.value_ptr.*) {
+            return fail(ctx, label, "a source comment line is missing (or under-counted by exact-line match) from the output");
+        }
+    }
+}
+
 fn runSetCase(arena: Allocator, rng: std.Random, model: *Model, source: []const u8, ctx: *Ctx) !void {
     var doc = try parseOrReport(arena, source, ctx);
     const target = try pickTarget(arena, rng, model);
@@ -413,13 +545,16 @@ fn runSetCase(arena: Allocator, rng: std.Random, model: *Model, source: []const 
     ctx.value_desc = try formatValueDebug(arena, value);
 
     var pre_edit: ?PreEditSpan = null;
-    if (target.kind == .existing_leaf) {
-        pre_edit = findValueSpan(&doc, target.segments) orelse
-            return fail(ctx, "setup", "existing leaf target not found before editing (generator bug)");
+    var pre_plan: ?PlacementPlan = null;
+    switch (target.kind) {
+        .existing_leaf => pre_edit = findValueSpan(&doc, target.segments) orelse
+            return fail(ctx, "setup", "existing leaf target not found before editing (generator bug)"),
+        .new_leaf, .missing_chain => pre_plan = planPlacement(&doc, target.segments),
+        .aot_blocked => {},
     }
 
     if (doc.setValueSegments(target.segments, value)) |_| {
-        try checkSetSuccess(arena, &doc, model, target, value, pre_edit, ctx);
+        try checkSetSuccess(arena, &doc, model, target, value, pre_edit, pre_plan, ctx);
     } else |err| {
         try checkSetFailureRollback(arena, &doc, source, err, target, ctx);
     }
@@ -436,7 +571,7 @@ fn checkSetFailureRollback(arena: Allocator, doc: *Document, source: []const u8,
     }
 }
 
-fn checkSetSuccess(arena: Allocator, doc: *Document, model: *Model, target: Target, value: Value, pre_edit: ?PreEditSpan, ctx: *Ctx) !void {
+fn checkSetSuccess(arena: Allocator, doc: *Document, model: *Model, target: Target, value: Value, pre_edit: ?PreEditSpan, pre_plan: ?PlacementPlan, ctx: *Ctx) !void {
     var aw1: Io.Writer.Allocating = .init(arena);
     try doc.emit(&aw1.writer);
     const emitted1 = aw1.written();
@@ -459,14 +594,14 @@ fn checkSetSuccess(arena: Allocator, doc: *Document, model: *Model, target: Targ
         }
     }
 
-    for (model.comments.items) |c| {
-        if (std.mem.indexOf(u8, emitted1, c) == null) {
-            return fail(ctx, "5-comment-preservation", "a comment present in source is missing from the output");
-        }
-    }
+    try checkCommentsPreserved(arena, emitted1, model.comments.items, ctx, "5-comment-preservation");
 
     if (target.kind == .existing_leaf) {
         try checkByteExactExceptValue(arena, doc, pre_edit.?, ctx);
+    } else if (pre_plan) |plan| {
+        const enclosing = target.segments[0 .. target.segments.len - 1];
+        const leaf = target.segments[target.segments.len - 1];
+        try checkPlacement(arena, plan, doc.source, leaf, enclosing, value, emitted1, ctx);
     }
 
     try doc.setValueSegments(target.segments, value);
@@ -527,11 +662,7 @@ fn runRemoveCase(arena: Allocator, rng: std.Random, model: *Model, source: []con
         }
     }
 
-    for (model.comments.items) |c| {
-        if (std.mem.indexOf(u8, output, c) == null) {
-            return fail(ctx, "7-comment-preservation", "a comment present in source is missing after remove");
-        }
-    }
+    try checkCommentsPreserved(arena, output, model.comments.items, ctx, "7-comment-preservation");
 }
 
 // debug replay helpers
