@@ -67,6 +67,11 @@ const Model = struct {
     leaves: std.ArrayList(Leaf) = .empty,
     containers: std.ArrayList([]const []const u8) = .empty,
     comments: std.ArrayList([]const u8) = .empty,
+    /// Owning container path for each entry of `comments`, same index --
+    /// the generator only ever places a comment immediately before one of
+    /// its own container's direct kv lines, so removing a table removes
+    /// exactly the comments whose owner is that table or a descendant.
+    comment_owners: std.ArrayList([]const []const u8) = .empty,
     aot_root: ?[]const []const u8 = null,
     counter: u32 = 0,
 };
@@ -95,6 +100,7 @@ fn runCase(case_index: usize) !void {
 
     try runSetCase(arena, rng, &model, source, &ctx);
     try runRemoveCase(arena, rng, &model, source, &ctx);
+    try runRemoveTableCase(arena, rng, &model, source, &ctx);
 }
 
 // generation
@@ -118,7 +124,7 @@ fn genContainer(arena: Allocator, rng: std.Random, model: *Model, w: *Io.Writer,
 
     var li: u32 = 0;
     while (li < leaf_count) : (li += 1) {
-        try maybeBlankOrComment(arena, rng, model, w);
+        try maybeBlankOrComment(arena, rng, model, w, path);
         const key = try freshKey(arena, rng, model, &used);
         const value = try genValue(arena, rng, model, true);
         try writeKvLine(w, key, value);
@@ -156,7 +162,7 @@ fn genAotBlock(arena: Allocator, rng: std.Random, model: *Model, w: *Io.Writer) 
     model.aot_root = root;
 }
 
-fn maybeBlankOrComment(arena: Allocator, rng: std.Random, model: *Model, w: *Io.Writer) !void {
+fn maybeBlankOrComment(arena: Allocator, rng: std.Random, model: *Model, w: *Io.Writer, owner: []const []const u8) !void {
     const roll = rng.uintLessThan(u8, 100);
     if (roll < 15) {
         try w.writeByte('\n');
@@ -165,6 +171,7 @@ fn maybeBlankOrComment(arena: Allocator, rng: std.Random, model: *Model, w: *Io.
         const text = try std.fmt.allocPrint(arena, "# note {d}\n", .{model.counter});
         try w.writeAll(text);
         try model.comments.append(arena, text);
+        try model.comment_owners.append(arena, owner);
     }
 }
 
@@ -663,6 +670,91 @@ fn runRemoveCase(arena: Allocator, rng: std.Random, model: *Model, source: []con
     }
 
     try checkCommentsPreserved(arena, output, model.comments.items, ctx, "7-comment-preservation");
+}
+
+/// Whole-table twin of `runRemoveCase`: picks a random generated
+/// container (never the implicit root) and removes it entirely, or --
+/// occasionally, when the document has an array-of-tables -- targets the
+/// array-of-tables root instead to exercise the refusal path.
+fn runRemoveTableCase(arena: Allocator, rng: std.Random, model: *Model, source: []const u8, ctx: *Ctx) !void {
+    var doc = try parseOrReport(arena, source, ctx);
+
+    if (model.aot_root != null and rng.uintLessThan(u8, 3) == 0) {
+        return checkRemoveTableAotBlocked(arena, &doc, source, model.aot_root.?, ctx);
+    }
+
+    var candidates: std.ArrayList([]const []const u8) = .empty;
+    for (model.containers.items) |c| {
+        if (c.len == 0) continue;
+        try candidates.append(arena, c);
+    }
+    if (candidates.items.len == 0) return;
+    const target = candidates.items[rng.uintLessThan(usize, candidates.items.len)];
+    ctx.target_desc = try formatSegments(arena, target);
+    ctx.value_desc = "<whole table>";
+
+    doc.removeSegments(target) catch
+        return fail(ctx, "8-remove-table-round-trip", "removeSegments on an existing whole table unexpectedly errored");
+
+    var aw: Io.Writer.Allocating = .init(arena);
+    try doc.emit(&aw.writer);
+    const output = aw.written();
+
+    const reparsed = parser_mod.parse(arena, output, .{}) catch
+        return fail(ctx, "8-reparse-clean", "output after whole-table remove failed to reparse");
+
+    for (model.leaves.items) |leaf| {
+        const removed = segPrefixEq(leaf.segments, target);
+        const got = resolveSegments(reparsed, leaf.segments);
+        if (removed) {
+            if (got != null) return fail(ctx, "8-remove-table-absent", "a leaf under the removed table still resolves after removal");
+        } else {
+            const v = got orelse return fail(ctx, "8-sibling-preservation", "a leaf outside the removed table is missing after removal");
+            if (!Value.eql(v, leaf.value)) return fail(ctx, "8-sibling-preservation", "a leaf outside the removed table changed value after removal");
+        }
+    }
+
+    // A comment's owning container -- the generator only ever emits one
+    // immediately before that container's own kv line -- tells us exactly
+    // which comments the removed table's body took with it.
+    var remaining_comments: std.ArrayList([]const u8) = .empty;
+    for (model.comments.items, model.comment_owners.items) |c, owner| {
+        if (segPrefixEq(owner, target)) {
+            if (containsLine(output, std.mem.trimEnd(u8, c, "\n"))) {
+                return fail(ctx, "8-removed-table-comment-gone", "a comment owned by the removed table's own body is still present after removal");
+            }
+        } else {
+            try remaining_comments.append(arena, c);
+        }
+    }
+    try checkCommentsPreserved(arena, output, remaining_comments.items, ctx, "8-comment-preservation");
+}
+
+fn checkRemoveTableAotBlocked(arena: Allocator, doc: *Document, source: []const u8, aot_root: []const []const u8, ctx: *Ctx) !void {
+    ctx.target_desc = try formatSegments(arena, aot_root);
+    ctx.value_desc = "<array-of-tables root>";
+
+    if (doc.removeSegments(aot_root)) |_| {
+        return fail(ctx, "8-aot-blocked-error-kind", "removeSegments on an array-of-tables root unexpectedly succeeded");
+    } else |err| {
+        if (err != error.UnsupportedPath) {
+            return fail(ctx, "8-aot-blocked-error-kind", "expected UnsupportedPath for a whole-table remove of an array-of-tables root");
+        }
+    }
+
+    var aw: Io.Writer.Allocating = .init(arena);
+    try doc.emit(&aw.writer);
+    if (!std.mem.eql(u8, aw.written(), source)) {
+        return fail(ctx, "8-aot-blocked-rollback", "document changed after a rejected array-of-tables whole-table remove");
+    }
+}
+
+fn containsLine(output: []const u8, line: []const u8) bool {
+    var it = std.mem.splitScalar(u8, output, '\n');
+    while (it.next()) |l| {
+        if (std.mem.eql(u8, l, line)) return true;
+    }
+    return false;
 }
 
 // debug replay helpers

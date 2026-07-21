@@ -4,6 +4,19 @@ All notable changes to this project are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `Document.removeSegments` now removes a whole table, not just a kv:
+  when `segments` resolves to a `[header]` line instead of a key, it
+  removes the header, every key directly under it, and every descendant
+  sub-table transitively (removing `a` also removes `a.b`, `a.b.c`,
+  ...), plus the blank-line/comment separator that block owns -- without
+  disturbing a neighboring table's own leading blank or comment. A table
+  with an array-of-tables descendant (or an array-of-tables path itself)
+  is refused with `error.UnsupportedPath` rather than partially removed.
+
 ## [0.5.0] - 2026-07-21
 
 ### Added

@@ -536,7 +536,8 @@ pub const Document = struct {
         return self.setValue(path, v);
     }
 
-    /// Remove a key. Returns `error.PathNotFound` if absent.
+    /// Remove a key, or a whole table (header, body, and every nested
+    /// sub-table). Returns `error.PathNotFound` if `path` names neither.
     pub fn remove(self: *Document, path: []const u8) Error!void {
         // Mirror setLiteral: `arr[0]` is array-element access, which remove
         // does not support. Erroring keeps it consistent with `get`.
@@ -544,7 +545,16 @@ pub const Document = struct {
         return self.removeSeg(try segmentsFromPath(self.arena, path));
     }
 
-    /// Segment-taking twin of `remove`.
+    /// Segment-taking twin of `remove`. When `segments` resolves to a kv,
+    /// only that line is removed (existing behavior, unchanged). When
+    /// `segments` resolves to a table's `[header]` line instead, the whole
+    /// table is removed: the header, every kv directly under it, and every
+    /// descendant sub-table (a header whose path is `segments` or has
+    /// `segments` as a proper segment-array prefix -- never a string
+    /// prefix, so a dotted key sharing raw text with a table name is never
+    /// confused for it). An array-of-tables header, or a table with an
+    /// array-of-tables descendant, is refused with `error.UnsupportedPath`
+    /// rather than partially removed.
     pub fn removeSegments(self: *Document, segments: []const []const u8) Error!void {
         return self.removeSeg(segments);
     }
@@ -562,9 +572,55 @@ pub const Document = struct {
             return;
         }
 
+        if (try self.removeTableSegments(segments)) return;
+
         if (try self.removeInsideInlineTableSegments(segments)) return;
 
         return error.PathNotFound;
+    }
+
+    /// Whole-table removal core. Returns `false` (document untouched) when
+    /// `segments` names no `[header]` line at all, so the caller falls
+    /// through to `error.PathNotFound`.
+    fn removeTableSegments(self: *Document, segments: []const []const u8) Error!bool {
+        if (self.findHeaderIndexBySegments(segments) == null) return false;
+
+        // Every header at or below `segments`: an exact match, plus any
+        // header whose path has `segments` as a segment-array prefix (so
+        // removing `a` also removes `a.b`, `a.b.c`, ...). Comparing
+        // decoded segment arrays, not raw header text, means a header
+        // named e.g. "ab" can never be mistaken for a descendant of "a".
+        // An array-of-tables match anywhere in that set means the removal
+        // would have to reach into `[[...]]` elements, which is out of
+        // scope -- refuse outright rather than removing only some of it.
+        var matches: std.ArrayList(usize) = .empty;
+        for (self.items.items, 0..) |item, i| {
+            if (item != .header) continue;
+            const p = item.header.path_segments;
+            if (p.len < segments.len) continue;
+            if (!segArrayEq(p[0..segments.len], segments)) continue;
+            if (item.header.is_array) return error.UnsupportedPath;
+            try matches.append(self.arena, i);
+        }
+
+        var spans: std.ArrayList([2]usize) = .empty;
+        for (matches.items) |h| {
+            try spans.append(self.arena, tableRemovalSpan(self.items.items, h));
+        }
+
+        var kept: std.ArrayList(Item) = .empty;
+        try kept.ensureTotalCapacityPrecise(self.arena, self.items.items.len);
+        item_loop: for (self.items.items, 0..) |item, i| {
+            for (spans.items) |s| {
+                if (i >= s[0] and i < s[1]) continue :item_loop;
+            }
+            kept.appendAssumeCapacity(item);
+        }
+        self.items = kept;
+
+        try self.rebuildIndices();
+        try self.refreshParsed();
+        return true;
     }
 
     /// Segment-based twin of the old `removeInsideInlineTable`: tries
@@ -900,6 +956,38 @@ fn findSectionEnd(items: []const Item, header_idx: usize) usize {
     var i = header_idx + 1;
     while (i < items.len and items[i] != .header) : (i += 1) {}
     return i;
+}
+
+/// The `[start, end)` removal span for the header block at `header_idx`:
+/// the header line, every item through its last direct kv, and the
+/// header's own leading separator (the contiguous run of blank/comment
+/// items immediately before it). A trailing blank/comment run after the
+/// last kv and before the next header is deliberately left out -- it
+/// reads as that next header's own leading separator/description, so
+/// removing this table must not eat it. When there is no next header
+/// (EOF), that trailing run has nothing else to belong to, so it is
+/// swept up too.
+fn tableRemovalSpan(items: []const Item, header_idx: usize) [2]usize {
+    const next_header = findSectionEnd(items, header_idx);
+
+    var body_end = header_idx + 1;
+    if (next_header == items.len) {
+        body_end = next_header;
+    } else {
+        var i = header_idx + 1;
+        while (i < next_header) : (i += 1) {
+            if (items[i] == .kv) body_end = i + 1;
+        }
+    }
+
+    var start = header_idx;
+    while (start > 0) {
+        switch (items[start - 1]) {
+            .blank, .comment => start -= 1,
+            else => break,
+        }
+    }
+    return .{ start, body_end };
 }
 
 fn endsWithBlank(items: []const Item) bool {
@@ -3403,4 +3491,260 @@ test "setValueSegments refuses a path through an array-of-tables" {
     , .{});
 
     try testing.expectError(error.UnsupportedPath, doc.setValueSegments(&.{ "items", "name" }, .{ .string = "b" }));
+}
+
+test "removeSegments drops a whole table, header through its body, and the leading blank separator" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a,
+        \\foo = 1
+        \\
+        \\[user]
+        \\name = "x"
+        \\
+    , .{});
+
+    try doc.removeSegments(&.{"user"});
+
+    var aw: Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+    try doc.emit(&aw.writer);
+    try testing.expectEqualStrings("foo = 1\n", aw.written());
+    try testing.expect(!doc.has("user"));
+    try testing.expect(!doc.has("user.name"));
+}
+
+test "removeSegments on a table also removes its nested sub-tables, leaving a sibling intact" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a,
+        \\[a]
+        \\x = 1
+        \\
+        \\[a.b]
+        \\y = 2
+        \\
+        \\[c]
+        \\z = 3
+        \\
+    , .{});
+
+    try doc.removeSegments(&.{"a"});
+
+    var aw: Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+    try doc.emit(&aw.writer);
+    // The blank line between "y = 2" and "[c]" is [c]'s own leading
+    // separator, not the removed table's trailing padding, so it survives.
+    try testing.expectEqualStrings("\n[c]\nz = 3\n", aw.written());
+    try testing.expect(!doc.has("a"));
+    try testing.expect(!doc.has("a.b"));
+    try testing.expect(!doc.has("a.b.y"));
+    try testing.expectEqual(@as(i64, 3), doc.getT(i64, "c.z").?);
+}
+
+test "removeSegments on a table also removes non-adjacent descendant sub-tables scattered elsewhere in the file" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a,
+        \\[a]
+        \\x = 1
+        \\
+        \\[c]
+        \\w = 1
+        \\
+        \\[a.b]
+        \\y = 2
+        \\
+    , .{});
+
+    try doc.removeSegments(&.{"a"});
+
+    var aw: Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+    try doc.emit(&aw.writer);
+    // The blank line between "x = 1" and "[c]" is [c]'s own leading
+    // separator, not [a]'s trailing padding, so it survives untouched.
+    try testing.expectEqualStrings("\n[c]\nw = 1\n", aw.written());
+    try testing.expect(!doc.has("a"));
+    try testing.expect(!doc.has("a.b"));
+}
+
+test "removeSegments on a nested sub-table leaves its parent and sibling sub-table intact" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a,
+        \\[a]
+        \\x = 1
+        \\
+        \\[a.b]
+        \\y = 2
+        \\
+        \\[a.c]
+        \\z = 3
+        \\
+    , .{});
+
+    try doc.removeSegments(&.{ "a", "b" });
+
+    var aw: Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+    try doc.emit(&aw.writer);
+    try testing.expectEqualStrings("[a]\nx = 1\n\n[a.c]\nz = 3\n", aw.written());
+    try testing.expectEqual(@as(i64, 1), doc.getT(i64, "a.x").?);
+    try testing.expect(!doc.has("a.b"));
+    try testing.expectEqual(@as(i64, 3), doc.getT(i64, "a.c.z").?);
+}
+
+test "removeSegments on a table preserves a comment that describes the following neighbor table" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a,
+        \\[a]
+        \\x = 1
+        \\
+        \\# comment for b
+        \\[b]
+        \\y = 2
+        \\
+    , .{});
+
+    try doc.removeSegments(&.{"a"});
+
+    var aw: Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+    try doc.emit(&aw.writer);
+    try testing.expectEqualStrings("\n# comment for b\n[b]\ny = 2\n", aw.written());
+}
+
+test "removeSegments on a table removes its own leading comment when it (not a neighbor) is the target" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a,
+        \\[a]
+        \\x = 1
+        \\
+        \\# comment for b
+        \\[b]
+        \\y = 2
+        \\
+    , .{});
+
+    try doc.removeSegments(&.{"b"});
+
+    var aw: Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+    try doc.emit(&aw.writer);
+    try testing.expectEqualStrings("[a]\nx = 1\n", aw.written());
+}
+
+// `[a]\nb = 1\n[a.b]\nx = 2` (redefining key "b" as a table) is invalid TOML
+// -- the strict parser Document.parse cross-checks against rejects it with
+// TomlParseError, so it cannot stand in for the "kv path vs. table path"
+// disambiguation case. A quoted root key sharing its *joined* text with a
+// table's dotted path is the real, valid case: `"a.b"` is one segment
+// (a literal dot in the key), while `[a.b]` is two segments (a, b) -- they
+// coexist without conflict, and only segment-array identity (not raw text)
+// tells them apart.
+test "removeSegments resolves a table path over a same-text quoted key, and vice versa, by segment identity" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const src =
+        \\"a.b" = 1
+        \\
+        \\[a]
+        \\x = 2
+        \\
+        \\[a.b]
+        \\y = 3
+        \\
+    ;
+
+    // Two segments ["a","b"] resolves to the table [a.b], not the quoted
+    // root key "a.b".
+    var doc1 = try Document.parse(a, src, .{});
+    try doc1.removeSegments(&.{ "a", "b" });
+    var aw1: Io.Writer.Allocating = .init(a);
+    defer aw1.deinit();
+    try doc1.emit(&aw1.writer);
+    try testing.expectEqualStrings("\"a.b\" = 1\n\n[a]\nx = 2\n", aw1.written());
+    try testing.expectEqual(@as(i64, 1), doc1.parsed.table.get("a.b").?.integer);
+    try testing.expectEqual(@as(i64, 2), doc1.getT(i64, "a.x").?);
+    try testing.expect(!doc1.has("a.b"));
+
+    // One segment ["a.b"] resolves to the quoted root key, not the table.
+    var doc2 = try Document.parse(a, src, .{});
+    try doc2.removeSegments(&.{"a.b"});
+    var aw2: Io.Writer.Allocating = .init(a);
+    defer aw2.deinit();
+    try doc2.emit(&aw2.writer);
+    try testing.expectEqualStrings("\n[a]\nx = 2\n\n[a.b]\ny = 3\n", aw2.written());
+    try testing.expectEqual(@as(i64, 2), doc2.getT(i64, "a.x").?);
+    try testing.expectEqual(@as(i64, 3), doc2.getT(i64, "a.b.y").?);
+    try testing.expect(doc2.parsed.table.get("a.b") == null);
+}
+
+test "removeSegments refuses a table with an array-of-tables descendant, leaving the document untouched" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const src =
+        \\[a]
+        \\x = 1
+        \\
+        \\[[a.b]]
+        \\y = 2
+        \\
+    ;
+    var doc = try Document.parse(a, src, .{});
+
+    try testing.expectError(error.UnsupportedPath, doc.removeSegments(&.{"a"}));
+
+    var aw: Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+    try doc.emit(&aw.writer);
+    try testing.expectEqualStrings(src, aw.written());
+}
+
+test "removeSegments on a table with no following header also removes its trailing blank padding" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a,
+        \\[a]
+        \\x = 1
+        \\
+        \\[b]
+        \\y = 2
+        \\
+        \\
+    , .{});
+
+    try doc.removeSegments(&.{"b"});
+
+    var aw: Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+    try doc.emit(&aw.writer);
+    try testing.expectEqualStrings("[a]\nx = 1\n", aw.written());
+}
+
+test "removeSegments on a path that names neither a kv nor a table stays PathNotFound" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a,
+        \\[a]
+        \\x = 1
+        \\
+    , .{});
+
+    try testing.expectError(error.PathNotFound, doc.removeSegments(&.{ "a", "nope" }));
+    try testing.expectError(error.PathNotFound, doc.removeSegments(&.{"nope"}));
 }
