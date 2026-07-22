@@ -554,7 +554,10 @@ pub const Document = struct {
     /// prefix, so a dotted key sharing raw text with a table name is never
     /// confused for it). An array-of-tables header, or a table with an
     /// array-of-tables descendant, is refused with `error.UnsupportedPath`
-    /// rather than partially removed.
+    /// rather than partially removed. A blank/comment run directly above the
+    /// removed header is taken as that table's leading separator and removed
+    /// with it, even when it reads as a trailing note on the preceding table;
+    /// a run before the next header is left for that header to own.
     pub fn removeSegments(self: *Document, segments: []const []const u8) Error!void {
         return self.removeSeg(segments);
     }
@@ -3543,6 +3546,33 @@ test "removeSegments on a table also removes its nested sub-tables, leaving a si
     try testing.expect(!doc.has("a.b"));
     try testing.expect(!doc.has("a.b.y"));
     try testing.expectEqual(@as(i64, 3), doc.getT(i64, "c.z").?);
+}
+
+test "removeSegments on a table leaves same-prefix sibling tables intact" {
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var doc = try Document.parse(a,
+        \\[a]
+        \\x = 1
+        \\[ab]
+        \\y = 2
+        \\[a2]
+        \\z = 3
+        \\
+    , .{});
+
+    try doc.removeSegments(&.{"a"});
+
+    var aw: Io.Writer.Allocating = .init(a);
+    defer aw.deinit();
+    try doc.emit(&aw.writer);
+    // "[a]" is removed by segment-array identity, not string prefix, so the
+    // raw-text neighbors "[ab]" and "[a2]" are untouched.
+    try testing.expectEqualStrings("[ab]\ny = 2\n[a2]\nz = 3\n", aw.written());
+    try testing.expect(!doc.has("a"));
+    try testing.expectEqual(@as(i64, 2), doc.getT(i64, "ab.y").?);
+    try testing.expectEqual(@as(i64, 3), doc.getT(i64, "a2.z").?);
 }
 
 test "removeSegments on a table also removes non-adjacent descendant sub-tables scattered elsewhere in the file" {
