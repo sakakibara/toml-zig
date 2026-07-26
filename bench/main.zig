@@ -50,9 +50,9 @@ pub fn main(init: std.process.Init) !void {
     try printHeader(w);
 
     const benches = [_]Bench{
-        .{ .name = "small  (manifest)",  .fixture = fixtures.small,  .inner_iters = 10_000 },
+        .{ .name = "small  (manifest)", .fixture = fixtures.small, .inner_iters = 10_000 },
         .{ .name = "medium (cargo-lock)", .fixture = fixtures.medium, .inner_iters = 1_000 },
-        .{ .name = "large  (10k tables)", .fixture = fixtures.large,  .inner_iters = 50 },
+        .{ .name = "large  (10k tables)", .fixture = fixtures.large, .inner_iters = 50 },
     };
 
     for (benches) |b| {
@@ -378,7 +378,7 @@ fn benchEncode(gpa: std.mem.Allocator, io: Io, fixture: []const u8, iters: usize
     while (i < iters) : (i += 1) {
         var aw: Io.Writer.Allocating = .init(gpa);
         defer aw.deinit();
-        try toml.encode(&aw.writer, v);
+        try toml.encode(&aw.writer, v, .{});
         sink +%= aw.writer.end;
     }
     std.mem.doNotOptimizeAway(&sink);
