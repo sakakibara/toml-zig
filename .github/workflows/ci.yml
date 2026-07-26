@@ -21,6 +21,7 @@ jobs:
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -64,6 +65,9 @@ jobs:
           key: zig-cache-${{ runner.os }}-${{ runner.arch }}-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
           restore-keys: |
             zig-cache-${{ runner.os }}-${{ runner.arch }}-${{ env.ZIG_VERSION }}-
+
+      - name: format check
+        run: zig fmt --check build.zig src examples
 
       - name: zig build test
         run: zig build test --summary all
@@ -121,6 +125,7 @@ jobs:
   cross-compile:
     name: cross (${{ matrix.target }})
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -157,6 +162,7 @@ jobs:
   fuzz:
     name: fuzz
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
       - name: install zig
@@ -179,6 +185,7 @@ jobs:
   bench:
     name: bench
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v6
