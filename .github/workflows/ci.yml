@@ -67,7 +67,7 @@ jobs:
             zig-cache-${{ runner.os }}-${{ runner.arch }}-${{ env.ZIG_VERSION }}-
 
       - name: format check
-        run: zig fmt --check build.zig src examples
+        run: zig fmt --check build.zig src examples bench tools
 
       - name: zig build test
         run: zig build test --summary all
@@ -181,12 +181,12 @@ jobs:
       - name: 200k iter fuzz
         run: zig build fuzz -- --iters 200000
 
-  # Microbenchmarks. Reports numbers; doesn't gate on regression.
+  # Microbenchmarks. Gates only that the harness builds and runs;
+  # the numbers are reported, not compared.
   bench:
     name: bench
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v6
       - name: install zig
