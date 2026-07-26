@@ -480,13 +480,16 @@ zig build bench
 The harness reports min/p50/p99/max latency and throughput across multiple
 samples with explicit warmup. See `bench/main.zig`.
 
-On aarch64-linux, ReleaseFast, this lands at roughly:
+On an Apple M1 Max (aarch64-macos), Zig 0.16.0, ReleaseFast -- p50
+latency, median of ten runs, cross-run spread below 8% per cell:
 
-| Fixture | Size | Parse p50 | Throughput | Encode p50 | Throughput |
-| --- | --- | --- | --- | --- | --- |
-| small (manifest) | 1.1 KB | 4187 ns | 268 MB/s | 1782 ns | 629 MB/s |
-| medium (cargo-lock) | 21 KB | 67330 ns | 322 MB/s | 19775 ns | 1098 MB/s |
-| large (10k tables) | 113 KB | 784447 ns | 144 MB/s | 193052 ns | 587 MB/s |
+| Benchmark | small (1.1 KB) | medium (21 KB) | large (113 KB) |
+| --- | --- | --- | --- |
+| parse | 7.11 us, 150 MB/s | 78.3 us, 265 MB/s | 1.06 ms, 102 MB/s |
+| encode | 1.97 us, 541 MB/s | 21.1 us, 980 MB/s | 231 us, 468 MB/s |
+
+The fixtures are a package manifest (small), a Cargo-style lock file
+(medium), and a 10k-table document (large); see `bench/fixtures.zig`.
 
 The hot path uses SIMD basic-string scanning and SIMD encoder escape
 scanning (`@Vector(16, u8)`) plus a hand-rolled fast-path decimal
