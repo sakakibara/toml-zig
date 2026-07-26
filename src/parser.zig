@@ -406,1372 +406,1075 @@ pub fn ParserOf(comptime Sink: type) type {
     return struct {
         const Self = @This();
 
-    arena: Allocator,
-    input: []const u8,
-    pos: usize = 0,
-    /// Byte position of the current token attempt's start. Captured at the
-    /// top of parse* helpers that may error; used to populate the offending
-    /// span on a Diagnostic. Line/col are not tracked during scanning -- they
-    /// are derived from the span at render time (see `Span.lineCol`).
-    token_start: usize = 0,
-
-    /// Top-level (root) table. Injected: the buffered path points it at a
-    /// fresh local map; the streaming path points it at the accumulating
-    /// shared root so units land in the same tree.
-    root: Sink.TableRef = undefined,
-
-    /// Where the next `key = value` pair lands. Changes on
-    /// `[header]` / `[[array-of-tables]]`.
-    current: Sink.TableRef = undefined,
-    /// Dotted path prefix that identifies `current` (empty at root).
-    /// Used to build full keys during kv dotted-descent. Plain '.'-join,
-    /// human-facing: it seeds `current_path` (span keys) and error text.
-    current_prefix: ArrayList(u8) = .empty,
-    /// Escaped mirror of `current_prefix` (see `appendSeenSegment`), used to
-    /// seed the seen-set keys a kv records. Split from `current_prefix` so
-    /// span keys / streaming header paths stay a plain '.'-join while the
-    /// duplicate-detection sets distinguish quoted-dotted segments.
-    current_seen_prefix: ArrayList(u8) = .empty,
-
-    /// Decoded dotted header path of the most recent `[header]` /
-    /// `[[header]]` (without the synthetic `[N]` array index), or empty
-    /// when no header has been seen (a leading top-level-kv unit). Read by
-    /// the streaming seam (`streamParseUnit`) to label `table_header` /
-    /// `array_of_tables_header` events. Borrows the value arena.
-    last_header_path: ArrayList(u8) = .empty,
-    /// Whether the most recent header was `[[...]]` (array-of-tables).
-    last_header_was_array: bool = false,
-
-    /// Whole-file duplicate-detection sets. Injected: the buffered path
-    /// points it at a fresh local `SeenState`; the streaming path points
-    /// it at one shared across units so redefinition rejection spans the
-    /// whole stream.
-    seen: *SeenState = undefined,
-
-    /// Arena owning `seen`'s key bytes. In the buffered path this is the
-    /// same arena as `arena` (the whole document outlives one parse). In
-    /// the streaming path it is the STREAM-lifetime arena, distinct from
-    /// the per-unit `arena`: a unit's values are discarded and its arena
-    /// reset after each frame, but `seen`'s path NAMES must survive for the
-    /// whole stream so cross-unit duplicate detection holds. Defaults to
-    /// `arena` so non-streaming callers see no behavior change.
-    seen_arena: Allocator = undefined,
-
-    /// Typed-sink instance (decode.zig's streaming typed decode). Unused
-    /// and never dereferenced under ValueSink.
-    sink: *Sink = undefined,
-
-    /// Current array / inline-table nesting depth. Incremented on
-    /// entering `parseArray` / `parseInlineTable`; exceeding `max_depth`
-    /// bails with `error.NestingTooDeep` before recursing further, which
-    /// bounds stack growth on hostile deeply-nested input.
-    depth: usize = 0,
-    /// Nesting-depth ceiling. Set from `ParseOptions.max_depth` in `parse`.
-    max_depth: usize = 128,
-
-    /// Multi-error sink. When set, each error append + recover; when null,
-    /// first error bails. Set from ParseOptions.errors in `parse` / `parseReader`.
-    errors: ?*std.ArrayList(Diagnostic) = null,
-
-    /// When non-null, populated with one entry per emitted value
-    /// (path -> source span). Set via `ParseOptions.spans`.
-    spans: ?*v.Spans = null,
-    /// Mutable buffer holding the current value's full dotted path while
-    /// inside `parseValue`. Composite parsers (`parseArray`,
-    /// `parseInlineTable`) push child segments before recursing and
-    /// restore the buffer length on exit. Only meaningful when
-    /// `spans != null`.
-    current_path: ArrayList(u8) = .empty,
-
-    /// Bare init. Leaves `root` / `seen` undefined; the caller must either
-    /// drive `parseDocument` (which wires fresh local storage) or only use
-    /// helpers that don't touch the value tree (e.g. `parseKeyPath`).
-    pub fn init(arena: Allocator, input: []const u8) Self {
-        return .{ .arena = arena, .input = input, .seen_arena = arena };
-    }
-
-    /// Per-unit init: parse one statement-unit's bytes against an EXISTING
-    /// shared root + EXISTING shared `SeenState`. `current` / `current_prefix`
-    /// start at the root; a leading `[header]` in the unit re-navigates them
-    /// before its key-values land. This is the seam the streaming reader
-    /// uses to parse table-by-table while preserving cross-unit duplicate
-    /// detection.
-    ///
-    /// `arena` owns this unit's VALUES (reset/discarded after the unit's
-    /// events are emitted). `seen_arena` owns `seen`'s path-NAME keys and
-    /// must outlive every unit (the stream-lifetime arena) so duplicate
-    /// detection survives the per-unit reset. Pass the same allocator for
-    /// both to get the non-streaming behavior (statement-by-statement over
-    /// one arena, as the equivalence tests do).
-    fn initUnit(
         arena: Allocator,
-        seen_arena: Allocator,
         input: []const u8,
-        root: *StringArrayHashMap(Value),
-        seen: *SeenState,
-    ) Self {
-        return .{
-            .arena = arena,
-            .seen_arena = seen_arena,
-            .input = input,
-            .root = root,
-            .seen = seen,
-            .current = root,
-        };
-    }
+        pos: usize = 0,
+        /// Byte position of the current token attempt's start. Captured at the
+        /// top of parse* helpers that may error; used to populate the offending
+        /// span on a Diagnostic. Line/col are not tracked during scanning -- they
+        /// are derived from the span at render time (see `Span.lineCol`).
+        token_start: usize = 0,
 
-    /// The offending span for a diagnostic: `[token_start, pos]` as u64 byte
-    /// offsets. Line/col are derived from it at render time.
-    fn diagSpan(self: *const Self) Span {
-        return .{ .start = self.token_start, .end = self.pos };
-    }
+        /// Top-level (root) table. Injected: the buffered path points it at a
+        /// fresh local map; the streaming path points it at the accumulating
+        /// shared root so units land in the same tree.
+        root: Sink.TableRef = undefined,
 
-    /// Append a child path segment, returning the previous length so the
-    /// caller can restore via `popPath`. Cheap when spans are off.
-    fn pushPath(self: *Self, separator: u8, segment: []const u8) Error!usize {
-        if (self.spans == null) return 0;
-        const prev_len = self.current_path.items.len;
-        if (prev_len > 0 and separator != 0) try self.current_path.append(self.arena, separator);
-        try self.current_path.appendSlice(self.arena, segment);
-        return prev_len;
-    }
+        /// Where the next `key = value` pair lands. Changes on
+        /// `[header]` / `[[array-of-tables]]`.
+        current: Sink.TableRef = undefined,
+        /// Dotted path prefix that identifies `current` (empty at root).
+        /// Used to build full keys during kv dotted-descent. Plain '.'-join,
+        /// human-facing: it seeds `current_path` (span keys) and error text.
+        current_prefix: ArrayList(u8) = .empty,
+        /// Escaped mirror of `current_prefix` (see `appendSeenSegment`), used to
+        /// seed the seen-set keys a kv records. Split from `current_prefix` so
+        /// span keys / streaming header paths stay a plain '.'-join while the
+        /// duplicate-detection sets distinguish quoted-dotted segments.
+        current_seen_prefix: ArrayList(u8) = .empty,
 
-    /// Append `[N]` index segment.
-    fn pushIndex(self: *Self, idx: usize) Error!usize {
-        if (self.spans == null) return 0;
-        const prev_len = self.current_path.items.len;
-        try self.current_path.print(self.arena, "[{d}]", .{idx});
-        return prev_len;
-    }
+        /// Decoded dotted header path of the most recent `[header]` /
+        /// `[[header]]` (without the synthetic `[N]` array index), or empty
+        /// when no header has been seen (a leading top-level-kv unit). Read by
+        /// the streaming seam (`streamParseUnit`) to label `table_header` /
+        /// `array_of_tables_header` events. Borrows the value arena.
+        last_header_path: ArrayList(u8) = .empty,
+        /// Whether the most recent header was `[[...]]` (array-of-tables).
+        last_header_was_array: bool = false,
 
-    fn popPath(self: *Self, prev_len: usize) void {
-        if (self.spans == null) return;
-        self.current_path.shrinkRetainingCapacity(prev_len);
-    }
+        /// Whole-file duplicate-detection sets. Injected: the buffered path
+        /// points it at a fresh local `SeenState`; the streaming path points
+        /// it at one shared across units so redefinition rejection spans the
+        /// whole stream.
+        seen: *SeenState = undefined,
 
-    fn parseDocument(self: *Self) Error!Value {
-        self.current = self.root;
-        try self.parseStatements();
-        return Value{ .table = self.root.* };
-    }
+        /// Arena owning `seen`'s key bytes. In the buffered path this is the
+        /// same arena as `arena` (the whole document outlives one parse). In
+        /// the streaming path it is the STREAM-lifetime arena, distinct from
+        /// the per-unit `arena`: a unit's values are discarded and its arena
+        /// reset after each frame, but `seen`'s path NAMES must survive for the
+        /// whole stream so cross-unit duplicate detection holds. Defaults to
+        /// `arena` so non-streaming callers see no behavior change.
+        seen_arena: Allocator = undefined,
 
-    /// Parse every statement in `input` against the injected shared root +
-    /// `SeenState`, leaving `current` wherever the last header pointed it.
-    /// Used by the streaming reader to feed one statement-unit's bytes
-    /// (constructed via `initUnit`). Runs the identical statement loop as
-    /// `parseDocument`, but does NOT own the value tree -- the shared root
-    /// is the result and persists across units. Recovery semantics match
-    /// the buffered path.
-    pub fn parseStatements(self: *Self) Error!void {
-        var had_error = false;
+        /// Typed-sink instance (decode.zig's streaming typed decode). Unused
+        /// and never dereferenced under ValueSink.
+        sink: *Sink = undefined,
 
-        while (true) {
-            try self.skipWsAndComments();
-            if (self.eof()) break;
+        /// Current array / inline-table nesting depth. Incremented on
+        /// entering `parseArray` / `parseInlineTable`; exceeding `max_depth`
+        /// bails with `error.NestingTooDeep` before recursing further, which
+        /// bounds stack growth on hostile deeply-nested input.
+        depth: usize = 0,
+        /// Nesting-depth ceiling. Set from `ParseOptions.max_depth` in `parse`.
+        max_depth: usize = 128,
 
-            const c = self.peek();
-            const stmt_result: Error!void = if (c == '[')
-                self.parseHeader()
-            else
-                self.parseKeyValue(self.current);
+        /// Multi-error sink. When set, each error append + recover; when null,
+        /// first error bails. Set from ParseOptions.errors in `parse` / `parseReader`.
+        errors: ?*std.ArrayList(Diagnostic) = null,
 
-            if (stmt_result) |_| {
-                try self.expectEol();
-            } else |err| {
-                if (err != error.TomlParseError) return err;
-                had_error = true;
-                if (self.errors == null) return err;
-                if (self.errors.?.items.len >= MAX_RECOVERY_ERRORS) return err;
-                self.recoverToNextStatement();
-                continue;
-            }
+        /// When non-null, populated with one entry per emitted value
+        /// (path -> source span). Set via `ParseOptions.spans`.
+        spans: ?*v.Spans = null,
+        /// Mutable buffer holding the current value's full dotted path while
+        /// inside `parseValue`. Composite parsers (`parseArray`,
+        /// `parseInlineTable`) push child segments before recursing and
+        /// restore the buffer length on exit. Only meaningful when
+        /// `spans != null`.
+        current_path: ArrayList(u8) = .empty,
+
+        /// Bare init. Leaves `root` / `seen` undefined; the caller must either
+        /// drive `parseDocument` (which wires fresh local storage) or only use
+        /// helpers that don't touch the value tree (e.g. `parseKeyPath`).
+        pub fn init(arena: Allocator, input: []const u8) Self {
+            return .{ .arena = arena, .input = input, .seen_arena = arena };
         }
 
-        if (had_error) return error.TomlParseError;
-    }
-
-    // Location / lookahead primitives
-
-    inline fn eof(self: *Self) bool {
-        return self.pos >= self.input.len;
-    }
-
-    inline fn peek(self: *Self) u8 {
-        return self.input[self.pos];
-    }
-
-    inline fn peekAt(self: *Self, offset: usize) ?u8 {
-        const idx = self.pos + offset;
-        if (idx >= self.input.len) return null;
-        return self.input[idx];
-    }
-
-    inline fn advance(self: *Self) void {
-        self.pos += 1;
-    }
-
-    inline fn match(self: *Self, c: u8) bool {
-        if (self.eof() or self.peek() != c) return false;
-        self.advance();
-        return true;
-    }
-
-    fn matchStr(self: *Self, s: []const u8) bool {
-        if (self.pos + s.len > self.input.len) return false;
-        if (!std.mem.eql(u8, self.input[self.pos .. self.pos + s.len], s)) return false;
-        var i: usize = 0;
-        while (i < s.len) : (i += 1) self.advance();
-        return true;
-    }
-
-    fn skipWs(self: *Self) void {
-        while (!self.eof()) {
-            const c = self.peek();
-            if (c == ' ' or c == '\t') self.advance() else return;
-        }
-    }
-
-    /// Skip to the end of the current line and consume the newline.
-    /// Used for error recovery: after a statement-level parse failure,
-    /// advance past the bad line so the outer loop can attempt the next one.
-    fn recoverToNextStatement(self: *Self) void {
-        while (!self.eof() and self.peek() != '\n') self.advance();
-        if (!self.eof()) self.advance(); // consume the newline
-    }
-
-    /// Skip whitespace, comments, and newlines. Used at statement
-    /// boundaries. Returns an error on malformed comments or bare CR.
-    fn skipWsAndComments(self: *Self) Error!void {
-        while (!self.eof()) {
-            const c = self.peek();
-            switch (c) {
-                ' ', '\t' => self.advance(),
-                '\n' => self.advance(),
-                '\r' => {
-                    // A lone CR (not part of CRLF) is invalid.
-                    if (self.peekAt(1) != '\n') {
-                        return self.setError("bare CR is invalid");
-                    }
-                    self.advance();
-                },
-                '#' => {
-                    try self.consumeComment();
-                },
-                else => return,
-            }
-        }
-    }
-
-    /// Consume a `#`-prefixed comment up to (but not including) the
-    /// terminating newline. Returns an error if the comment contains
-    /// disallowed control characters or invalid UTF-8.
-    fn consumeComment(self: *Self) Error!void {
-        _ = self.match('#');
-        while (!self.eof() and self.peek() != '\n') {
-            const k = self.peek();
-            if (k == '\r') {
-                if (self.peekAt(1) == '\n') return; // CRLF ends comment.
-                return self.setError("bare CR in comment");
-            }
-            if (k < 0x20 and k != 0x09) {
-                return self.setError("control character in comment");
-            }
-            if (k == 0x7F) {
-                return self.setError("DEL control character in comment");
-            }
-            if (k >= 0x80) {
-                // Validate UTF-8 multi-byte sequence.
-                try self.validateUtf8();
-                continue;
-            }
-            self.advance();
-        }
-    }
-
-    /// Validate that the current position is the start of a valid UTF-8
-    /// multi-byte sequence and advance past it. Rejects overlong
-    /// encodings and surrogate code points.
-    fn validateUtf8(self: *Self) Error!void {
-        const b0 = self.peek();
-        const seq_len: usize = if (b0 < 0x80) 1 else if (b0 < 0xC2) 0 // 0x80..0xC1: invalid continuation or overlong
-            else if (b0 < 0xE0) 2 else if (b0 < 0xF0) 3 else if (b0 < 0xF5) 4 else 0;
-        if (seq_len == 0) return self.setError("invalid UTF-8 byte");
-        if (self.pos + seq_len > self.input.len) return self.setError("truncated UTF-8 sequence");
-        const bytes = self.input[self.pos .. self.pos + seq_len];
-        const cp = std.unicode.utf8Decode(bytes) catch return self.setError("invalid UTF-8 sequence");
-        // Surrogates (encoded as 3 bytes) are rejected by utf8Decode,
-        // but double-check code point range.
-        if (cp > 0x10FFFF) return self.setError("code point out of range");
-        var i: usize = 0;
-        while (i < seq_len) : (i += 1) self.advance();
-    }
-
-    /// Expect end-of-line (newline or EOF), possibly preceded by whitespace
-    /// and a comment.
-    fn expectEol(self: *Self) Error!void {
-        self.skipWs();
-        if (self.eof()) return;
-        if (self.peek() == '#') {
-            try self.consumeComment();
-        }
-        if (self.eof()) return;
-        if (self.peek() == '\n') {
-            self.advance();
-            return;
-        }
-        if (self.peek() == '\r') {
-            if (self.peekAt(1) != '\n') return self.setError("bare CR is invalid");
-            self.advance();
-            self.advance();
-            return;
-        }
-        return self.setError("expected newline");
-    }
-
-    fn setError(self: *Self, comptime msg: []const u8) Error {
-        if (self.errors) |list| {
-            const owned_msg = self.arena.dupe(u8, msg) catch return error.OutOfMemory;
-            list.append(self.arena, .{
-                .message = owned_msg,
-                .span = self.diagSpan(),
-            }) catch return error.OutOfMemory;
-        }
-        return error.TomlParseError;
-    }
-
-    /// Depth-guard failure: records a diagnostic but returns the distinct
-    /// `error.NestingTooDeep`, which the document recovery loop never swallows.
-    fn setDepthError(self: *Self) Error {
-        if (self.errors) |list| {
-            const msg = std.fmt.allocPrint(self.arena, "nesting depth exceeds limit ({d})", .{self.max_depth}) catch return error.OutOfMemory;
-            list.append(self.arena, .{
-                .message = msg,
-                .span = self.diagSpan(),
-            }) catch return error.OutOfMemory;
-        }
-        return error.NestingTooDeep;
-    }
-
-    fn setErrorFmt(self: *Self, comptime fmt: []const u8, args: anytype) Error {
-        if (self.errors) |list| {
-            const msg = std.fmt.allocPrint(self.arena, fmt, args) catch return error.OutOfMemory;
-            list.append(self.arena, .{
-                .message = msg,
-                .span = self.diagSpan(),
-            }) catch return error.OutOfMemory;
-        }
-        return error.TomlParseError;
-    }
-
-    fn setErrorWithSuggestion(self: *Self, msg: []const u8, suggestion: ?[]const u8) Error {
-        if (self.errors) |list| {
-            const owned_msg = self.arena.dupe(u8, msg) catch return error.OutOfMemory;
-            const owned_sug = if (suggestion) |s| self.arena.dupe(u8, s) catch return error.OutOfMemory else null;
-            list.append(self.arena, .{
-                .message = owned_msg,
-                .span = self.diagSpan(),
-                .suggestion = owned_sug,
-            }) catch return error.OutOfMemory;
-        }
-        return error.TomlParseError;
-    }
-
-    // Header / array-of-tables parsing
-
-    fn parseHeader(self: *Self) Error!void {
-        // Already saw `[`
-        _ = self.match('[');
-        const is_array = self.match('[');
-
-        self.skipWs();
-        self.token_start = self.pos;
-        var key_parts: ArrayList([]const u8) = .empty;
-        defer key_parts.deinit(self.arena);
-
-        try self.parseKeyPath(&key_parts);
-        self.skipWs();
-
-        if (is_array) {
-            if (!self.match(']')) return self.setError("expected ']]'");
-            if (!self.match(']')) return self.setError("expected ']]'");
-        } else {
-            if (!self.match(']')) return self.setError("expected ']'");
+        /// Per-unit init: parse one statement-unit's bytes against an EXISTING
+        /// shared root + EXISTING shared `SeenState`. `current` / `current_prefix`
+        /// start at the root; a leading `[header]` in the unit re-navigates them
+        /// before its key-values land. This is the seam the streaming reader
+        /// uses to parse table-by-table while preserving cross-unit duplicate
+        /// detection.
+        ///
+        /// `arena` owns this unit's VALUES (reset/discarded after the unit's
+        /// events are emitted). `seen_arena` owns `seen`'s path-NAME keys and
+        /// must outlive every unit (the stream-lifetime arena) so duplicate
+        /// detection survives the per-unit reset. Pass the same allocator for
+        /// both to get the non-streaming behavior (statement-by-statement over
+        /// one arena, as the equivalence tests do).
+        fn initUnit(
+            arena: Allocator,
+            seen_arena: Allocator,
+            input: []const u8,
+            root: *StringArrayHashMap(Value),
+            seen: *SeenState,
+        ) Self {
+            return .{
+                .arena = arena,
+                .seen_arena = seen_arena,
+                .input = input,
+                .root = root,
+                .seen = seen,
+                .current = root,
+            };
         }
 
-        // Entering a new header invalidates the "dotted in current header"
-        // scope -- headers never share dotted-created tables.
-        self.seen.clearHeaderScope();
+        /// The offending span for a diagnostic: `[token_start, pos]` as u64 byte
+        /// offsets. Line/col are derived from it at render time.
+        fn diagSpan(self: *const Self) Span {
+            return .{ .start = self.token_start, .end = self.pos };
+        }
 
-        // Navigate / create intermediate tables. Two key builders run in
-        // lockstep: `full_key` is the plain '.'-join (error text +
-        // `last_header_path` / streaming header path), while `seen_key` is the
-        // escaped encoding (`appendSeenSegment`) that keys every seen-set, so
-        // a quoted segment containing a '.' stays distinct from a dotted path.
-        var table = self.root;
-        var full_key: ArrayList(u8) = .empty;
-        defer full_key.deinit(self.arena);
-        var seen_key: ArrayList(u8) = .empty;
-        defer seen_key.deinit(self.arena);
+        /// Append a child path segment, returning the previous length so the
+        /// caller can restore via `popPath`. Cheap when spans are off.
+        fn pushPath(self: *Self, separator: u8, segment: []const u8) Error!usize {
+            if (self.spans == null) return 0;
+            const prev_len = self.current_path.items.len;
+            if (prev_len > 0 and separator != 0) try self.current_path.append(self.arena, separator);
+            try self.current_path.appendSlice(self.arena, segment);
+            return prev_len;
+        }
 
-        // Same paths as `full_key` / `seen_key` but with each traversed
-        // array-of-tables segment resolved to its CURRENT element index
-        // (`name[N]`), matching the `current_prefix` / `current_seen_prefix`
-        // convention `parseKeyValue` uses to key `scalar_leaves`. Non-table
-        // leaves live inside a specific AOT element, so this lets the verdict
-        // reject a same-element conflict while letting a later element's `[w.a]`
-        // (which targets a fresh element with no such leaf) through.
-        // `indexed_key` is plain (seeds `current_prefix` / span keys);
-        // `indexed_seen_key` is escaped (`scalar_leaves` lookups).
-        var indexed_key: ArrayList(u8) = .empty;
-        defer indexed_key.deinit(self.arena);
-        var indexed_seen_key: ArrayList(u8) = .empty;
-        defer indexed_seen_key.deinit(self.arena);
+        /// Append `[N]` index segment.
+        fn pushIndex(self: *Self, idx: usize) Error!usize {
+            if (self.spans == null) return 0;
+            const prev_len = self.current_path.items.len;
+            try self.current_path.print(self.arena, "[{d}]", .{idx});
+            return prev_len;
+        }
 
-        for (key_parts.items, 0..) |part, i| {
-            // Bound header nesting by max_depth: a long dotted header
-            // (`[a.a.a...]`) otherwise re-dupes a growing full_key into
-            // seen_arena at every segment (O(N^2) memory) and builds a Value
-            // tree deep enough to overflow the recursive Value.clone /
-            // Value.eql. Mirrors the dotted-key and bracketed-nesting guards.
-            if (i >= self.max_depth) return self.setDepthError();
-            if (i > 0) try full_key.append(self.arena, '.');
-            try full_key.appendSlice(self.arena, part);
+        fn popPath(self: *Self, prev_len: usize) void {
+            if (self.spans == null) return;
+            self.current_path.shrinkRetainingCapacity(prev_len);
+        }
 
-            if (i > 0) try seen_key.append(self.arena, '.');
-            try appendSeenSegment(self.arena, &seen_key, part);
+        fn parseDocument(self: *Self) Error!Value {
+            self.current = self.root;
+            try self.parseStatements();
+            return Value{ .table = self.root.* };
+        }
 
-            if (i > 0) try indexed_key.append(self.arena, '.');
-            try indexed_key.appendSlice(self.arena, part);
+        /// Parse every statement in `input` against the injected shared root +
+        /// `SeenState`, leaving `current` wherever the last header pointed it.
+        /// Used by the streaming reader to feed one statement-unit's bytes
+        /// (constructed via `initUnit`). Runs the identical statement loop as
+        /// `parseDocument`, but does NOT own the value tree -- the shared root
+        /// is the result and persists across units. Recovery semantics match
+        /// the buffered path.
+        pub fn parseStatements(self: *Self) Error!void {
+            var had_error = false;
 
-            if (i > 0) try indexed_seen_key.append(self.arena, '.');
-            try appendSeenSegment(self.arena, &indexed_seen_key, part);
+            while (true) {
+                try self.skipWsAndComments();
+                if (self.eof()) break;
 
-            const last = i == key_parts.items.len - 1;
-            // Duped into the seen-arena: it is stored into seen-sets
-            // (implicit/defined/array) and used as their lookup key, so it
-            // must outlive the per-unit value arena in the streaming path.
-            const key_owned = try self.seen_arena.dupe(u8, seen_key.items);
+                const c = self.peek();
+                const stmt_result: Error!void = if (c == '[')
+                    self.parseHeader()
+                else
+                    self.parseKeyValue(self.current);
 
-            // Inline-defined paths are sealed -- never re-openable via
-            // `[header]` (even for intermediates, you can't traverse
-            // into an inline table's sub-structure).
-            if (self.seen.inline_tables.contains(key_owned)) {
-                return self.setErrorFmt("cannot extend inline table '{s}'", .{full_key.items});
-            }
-            // Dotted-key-created paths only block direct RE-DEFINITION
-            // by a header with the exact same path. Deeper sub-tables
-            // (`[a.b.seeds]` after `a.b.x = ...`) are allowed.
-            if (last and self.seen.dotted_created.contains(key_owned)) {
-                return self.setErrorFmt("cannot redefine dotted-key-created table '{s}'", .{full_key.items});
-            }
-
-            if (last) {
-                // Record the clean (index-free) header path + shape for the
-                // streaming seam before appending the synthetic `[N]`.
-                self.last_header_path.clearRetainingCapacity();
-                try self.last_header_path.appendSlice(self.arena, full_key.items);
-                self.last_header_was_array = is_array;
-                if (is_array) {
-                    try self.openArrayOfTables(table, part, key_owned, indexed_seen_key.items, full_key.items);
-                    if (comptime Sink.is_value_sink) {
-                        // current becomes the newly appended table element
-                        const gop = table.getPtr(part).?; // array entry
-                        const last_elem = &gop.array.items[gop.array.items.len - 1];
-                        self.current = &last_elem.table;
-                    } else {
-                        self.current = try self.sink.openAotAppend(table, part);
-                    }
-                    // `current_prefix` keys the non-table leaves a kv records
-                    // (`scalar_leaves`), so it must equal the path the verdict
-                    // sites reconstruct: every array-of-tables segment (including
-                    // outer ones in a nested `[[w]] / [[w.sub]]`) carries its
-                    // element index. `indexed_key` already holds the outer
-                    // indices; append THIS element's. Its index is the CUMULATIVE
-                    // count (`aot_lengths`), not the live per-unit array length:
-                    // in the streaming path each `[[w]]` unit sees a fresh
-                    // single-element array, so a live `len - 1` is always 0 and
-                    // later elements' leaves would collide with the first.
-                    const idx = (self.seen.aot_lengths.get(key_owned) orelse 1) - 1;
-                    self.current_prefix.clearRetainingCapacity();
-                    try self.current_prefix.appendSlice(self.arena, indexed_key.items);
-                    try self.current_prefix.print(self.arena, "[{d}]", .{idx});
-                    self.current_seen_prefix.clearRetainingCapacity();
-                    try self.current_seen_prefix.appendSlice(self.arena, indexed_seen_key.items);
-                    try self.current_seen_prefix.print(self.arena, "[{d}]", .{idx});
-                } else {
-                    try self.openTable(table, part, key_owned, indexed_seen_key.items, full_key.items);
-                    if (comptime Sink.is_value_sink) {
-                        self.current = &table.getPtr(part).?.table;
-                    } else {
-                        self.current = try self.sink.openPlainTable(table, part);
-                    }
-                    self.current_prefix.clearRetainingCapacity();
-                    try self.current_prefix.appendSlice(self.arena, indexed_key.items);
-                    self.current_seen_prefix.clearRetainingCapacity();
-                    try self.current_seen_prefix.appendSlice(self.arena, indexed_seen_key.items);
+                if (stmt_result) |_| {
+                    try self.expectEol();
+                } else |err| {
+                    if (err != error.TomlParseError) return err;
+                    had_error = true;
+                    if (self.errors == null) return err;
+                    if (self.errors.?.items.len >= MAX_RECOVERY_ERRORS) return err;
+                    self.recoverToNextStatement();
+                    continue;
                 }
+            }
+
+            if (had_error) return error.TomlParseError;
+        }
+
+        // Location / lookahead primitives
+
+        inline fn eof(self: *Self) bool {
+            return self.pos >= self.input.len;
+        }
+
+        inline fn peek(self: *Self) u8 {
+            return self.input[self.pos];
+        }
+
+        inline fn peekAt(self: *Self, offset: usize) ?u8 {
+            const idx = self.pos + offset;
+            if (idx >= self.input.len) return null;
+            return self.input[idx];
+        }
+
+        inline fn advance(self: *Self) void {
+            self.pos += 1;
+        }
+
+        inline fn match(self: *Self, c: u8) bool {
+            if (self.eof() or self.peek() != c) return false;
+            self.advance();
+            return true;
+        }
+
+        fn matchStr(self: *Self, s: []const u8) bool {
+            if (self.pos + s.len > self.input.len) return false;
+            if (!std.mem.eql(u8, self.input[self.pos .. self.pos + s.len], s)) return false;
+            var i: usize = 0;
+            while (i < s.len) : (i += 1) self.advance();
+            return true;
+        }
+
+        fn skipWs(self: *Self) void {
+            while (!self.eof()) {
+                const c = self.peek();
+                if (c == ' ' or c == '\t') self.advance() else return;
+            }
+        }
+
+        /// Skip to the end of the current line and consume the newline.
+        /// Used for error recovery: after a statement-level parse failure,
+        /// advance past the bad line so the outer loop can attempt the next one.
+        fn recoverToNextStatement(self: *Self) void {
+            while (!self.eof() and self.peek() != '\n') self.advance();
+            if (!self.eof()) self.advance(); // consume the newline
+        }
+
+        /// Skip whitespace, comments, and newlines. Used at statement
+        /// boundaries. Returns an error on malformed comments or bare CR.
+        fn skipWsAndComments(self: *Self) Error!void {
+            while (!self.eof()) {
+                const c = self.peek();
+                switch (c) {
+                    ' ', '\t' => self.advance(),
+                    '\n' => self.advance(),
+                    '\r' => {
+                        // A lone CR (not part of CRLF) is invalid.
+                        if (self.peekAt(1) != '\n') {
+                            return self.setError("bare CR is invalid");
+                        }
+                        self.advance();
+                    },
+                    '#' => {
+                        try self.consumeComment();
+                    },
+                    else => return,
+                }
+            }
+        }
+
+        /// Consume a `#`-prefixed comment up to (but not including) the
+        /// terminating newline. Returns an error if the comment contains
+        /// disallowed control characters or invalid UTF-8.
+        fn consumeComment(self: *Self) Error!void {
+            _ = self.match('#');
+            while (!self.eof() and self.peek() != '\n') {
+                const k = self.peek();
+                if (k == '\r') {
+                    if (self.peekAt(1) == '\n') return; // CRLF ends comment.
+                    return self.setError("bare CR in comment");
+                }
+                if (k < 0x20 and k != 0x09) {
+                    return self.setError("control character in comment");
+                }
+                if (k == 0x7F) {
+                    return self.setError("DEL control character in comment");
+                }
+                if (k >= 0x80) {
+                    // Validate UTF-8 multi-byte sequence.
+                    try self.validateUtf8();
+                    continue;
+                }
+                self.advance();
+            }
+        }
+
+        /// Validate that the current position is the start of a valid UTF-8
+        /// multi-byte sequence and advance past it. Rejects overlong
+        /// encodings and surrogate code points.
+        fn validateUtf8(self: *Self) Error!void {
+            const b0 = self.peek();
+            const seq_len: usize = if (b0 < 0x80) 1 else if (b0 < 0xC2) 0 // 0x80..0xC1: invalid continuation or overlong
+                else if (b0 < 0xE0) 2 else if (b0 < 0xF0) 3 else if (b0 < 0xF5) 4 else 0;
+            if (seq_len == 0) return self.setError("invalid UTF-8 byte");
+            if (self.pos + seq_len > self.input.len) return self.setError("truncated UTF-8 sequence");
+            const bytes = self.input[self.pos .. self.pos + seq_len];
+            const cp = std.unicode.utf8Decode(bytes) catch return self.setError("invalid UTF-8 sequence");
+            // Surrogates (encoded as 3 bytes) are rejected by utf8Decode,
+            // but double-check code point range.
+            if (cp > 0x10FFFF) return self.setError("code point out of range");
+            var i: usize = 0;
+            while (i < seq_len) : (i += 1) self.advance();
+        }
+
+        /// Expect end-of-line (newline or EOF), possibly preceded by whitespace
+        /// and a comment.
+        fn expectEol(self: *Self) Error!void {
+            self.skipWs();
+            if (self.eof()) return;
+            if (self.peek() == '#') {
+                try self.consumeComment();
+            }
+            if (self.eof()) return;
+            if (self.peek() == '\n') {
+                self.advance();
+                return;
+            }
+            if (self.peek() == '\r') {
+                if (self.peekAt(1) != '\n') return self.setError("bare CR is invalid");
+                self.advance();
+                self.advance();
+                return;
+            }
+            return self.setError("expected newline");
+        }
+
+        fn setError(self: *Self, comptime msg: []const u8) Error {
+            if (self.errors) |list| {
+                const owned_msg = self.arena.dupe(u8, msg) catch return error.OutOfMemory;
+                list.append(self.arena, .{
+                    .message = owned_msg,
+                    .span = self.diagSpan(),
+                }) catch return error.OutOfMemory;
+            }
+            return error.TomlParseError;
+        }
+
+        /// Depth-guard failure: records a diagnostic but returns the distinct
+        /// `error.NestingTooDeep`, which the document recovery loop never swallows.
+        fn setDepthError(self: *Self) Error {
+            if (self.errors) |list| {
+                const msg = std.fmt.allocPrint(self.arena, "nesting depth exceeds limit ({d})", .{self.max_depth}) catch return error.OutOfMemory;
+                list.append(self.arena, .{
+                    .message = msg,
+                    .span = self.diagSpan(),
+                }) catch return error.OutOfMemory;
+            }
+            return error.NestingTooDeep;
+        }
+
+        fn setErrorFmt(self: *Self, comptime fmt: []const u8, args: anytype) Error {
+            if (self.errors) |list| {
+                const msg = std.fmt.allocPrint(self.arena, fmt, args) catch return error.OutOfMemory;
+                list.append(self.arena, .{
+                    .message = msg,
+                    .span = self.diagSpan(),
+                }) catch return error.OutOfMemory;
+            }
+            return error.TomlParseError;
+        }
+
+        fn setErrorWithSuggestion(self: *Self, msg: []const u8, suggestion: ?[]const u8) Error {
+            if (self.errors) |list| {
+                const owned_msg = self.arena.dupe(u8, msg) catch return error.OutOfMemory;
+                const owned_sug = if (suggestion) |s| self.arena.dupe(u8, s) catch return error.OutOfMemory else null;
+                list.append(self.arena, .{
+                    .message = owned_msg,
+                    .span = self.diagSpan(),
+                    .suggestion = owned_sug,
+                }) catch return error.OutOfMemory;
+            }
+            return error.TomlParseError;
+        }
+
+        // Header / array-of-tables parsing
+
+        fn parseHeader(self: *Self) Error!void {
+            // Already saw `[`
+            _ = self.match('[');
+            const is_array = self.match('[');
+
+            self.skipWs();
+            self.token_start = self.pos;
+            var key_parts: ArrayList([]const u8) = .empty;
+            defer key_parts.deinit(self.arena);
+
+            try self.parseKeyPath(&key_parts);
+            self.skipWs();
+
+            if (is_array) {
+                if (!self.match(']')) return self.setError("expected ']]'");
+                if (!self.match(']')) return self.setError("expected ']]'");
             } else {
-                // Intermediate -- walk or create, but forbid traversing
-                // through scalars, inline tables, or arrays-of-tables
-                // (must target the last element of array-of-tables) or
-                // normal arrays.
-                // A scalar / static-array leaf at this path is a conflict:
-                // the seen-set catches it even when the value tree was
-                // discarded (streaming). The message mirrors the buffered
-                // tree-walk below, which reports a static array
-                // ("cannot redefine array ...") differently from a scalar
-                // ("... is not a table").
-                if (self.seen.scalar_leaves.get(indexed_seen_key.items)) |kind| {
-                    return switch (kind) {
-                        .static_array => self.setErrorFmt("cannot redefine array '{s}' as table", .{full_key.items}),
-                        .scalar => self.setErrorFmt("key '{s}' is not a table", .{full_key.items}),
-                    };
+                if (!self.match(']')) return self.setError("expected ']'");
+            }
+
+            // Entering a new header invalidates the "dotted in current header"
+            // scope -- headers never share dotted-created tables.
+            self.seen.clearHeaderScope();
+
+            // Navigate / create intermediate tables. Two key builders run in
+            // lockstep: `full_key` is the plain '.'-join (error text +
+            // `last_header_path` / streaming header path), while `seen_key` is the
+            // escaped encoding (`appendSeenSegment`) that keys every seen-set, so
+            // a quoted segment containing a '.' stays distinct from a dotted path.
+            var table = self.root;
+            var full_key: ArrayList(u8) = .empty;
+            defer full_key.deinit(self.arena);
+            var seen_key: ArrayList(u8) = .empty;
+            defer seen_key.deinit(self.arena);
+
+            // Same paths as `full_key` / `seen_key` but with each traversed
+            // array-of-tables segment resolved to its CURRENT element index
+            // (`name[N]`), matching the `current_prefix` / `current_seen_prefix`
+            // convention `parseKeyValue` uses to key `scalar_leaves`. Non-table
+            // leaves live inside a specific AOT element, so this lets the verdict
+            // reject a same-element conflict while letting a later element's `[w.a]`
+            // (which targets a fresh element with no such leaf) through.
+            // `indexed_key` is plain (seeds `current_prefix` / span keys);
+            // `indexed_seen_key` is escaped (`scalar_leaves` lookups).
+            var indexed_key: ArrayList(u8) = .empty;
+            defer indexed_key.deinit(self.arena);
+            var indexed_seen_key: ArrayList(u8) = .empty;
+            defer indexed_seen_key.deinit(self.arena);
+
+            for (key_parts.items, 0..) |part, i| {
+                // Bound header nesting by max_depth: a long dotted header
+                // (`[a.a.a...]`) otherwise re-dupes a growing full_key into
+                // seen_arena at every segment (O(N^2) memory) and builds a Value
+                // tree deep enough to overflow the recursive Value.clone /
+                // Value.eql. Mirrors the dotted-key and bracketed-nesting guards.
+                if (i >= self.max_depth) return self.setDepthError();
+                if (i > 0) try full_key.append(self.arena, '.');
+                try full_key.appendSlice(self.arena, part);
+
+                if (i > 0) try seen_key.append(self.arena, '.');
+                try appendSeenSegment(self.arena, &seen_key, part);
+
+                if (i > 0) try indexed_key.append(self.arena, '.');
+                try indexed_key.appendSlice(self.arena, part);
+
+                if (i > 0) try indexed_seen_key.append(self.arena, '.');
+                try appendSeenSegment(self.arena, &indexed_seen_key, part);
+
+                const last = i == key_parts.items.len - 1;
+                // Duped into the seen-arena: it is stored into seen-sets
+                // (implicit/defined/array) and used as their lookup key, so it
+                // must outlive the per-unit value arena in the streaming path.
+                const key_owned = try self.seen_arena.dupe(u8, seen_key.items);
+
+                // Inline-defined paths are sealed -- never re-openable via
+                // `[header]` (even for intermediates, you can't traverse
+                // into an inline table's sub-structure).
+                if (self.seen.inline_tables.contains(key_owned)) {
+                    return self.setErrorFmt("cannot extend inline table '{s}'", .{full_key.items});
                 }
-                // An array-of-tables intermediate resolves to its CURRENT
-                // element (per `aot_lengths`, which is sound even when the live
-                // slot is absent in the streaming path). Qualify both indexed
-                // keys with that element's index so deeper `scalar_leaves`
-                // lookups address the element the leaf was recorded under.
-                if (self.seen.array_tables.contains(key_owned)) {
-                    const count = self.seen.aot_lengths.get(key_owned) orelse 0;
-                    if (count > 0) {
-                        try indexed_key.print(self.arena, "[{d}]", .{count - 1});
-                        try indexed_seen_key.print(self.arena, "[{d}]", .{count - 1});
+                // Dotted-key-created paths only block direct RE-DEFINITION
+                // by a header with the exact same path. Deeper sub-tables
+                // (`[a.b.seeds]` after `a.b.x = ...`) are allowed.
+                if (last and self.seen.dotted_created.contains(key_owned)) {
+                    return self.setErrorFmt("cannot redefine dotted-key-created table '{s}'", .{full_key.items});
+                }
+
+                if (last) {
+                    // Record the clean (index-free) header path + shape for the
+                    // streaming seam before appending the synthetic `[N]`.
+                    self.last_header_path.clearRetainingCapacity();
+                    try self.last_header_path.appendSlice(self.arena, full_key.items);
+                    self.last_header_was_array = is_array;
+                    if (is_array) {
+                        try self.openArrayOfTables(table, part, key_owned, indexed_seen_key.items, full_key.items);
+                        if (comptime Sink.is_value_sink) {
+                            // current becomes the newly appended table element
+                            const gop = table.getPtr(part).?; // array entry
+                            const last_elem = &gop.array.items[gop.array.items.len - 1];
+                            self.current = &last_elem.table;
+                        } else {
+                            self.current = try self.sink.openAotAppend(table, part);
+                        }
+                        // `current_prefix` keys the non-table leaves a kv records
+                        // (`scalar_leaves`), so it must equal the path the verdict
+                        // sites reconstruct: every array-of-tables segment (including
+                        // outer ones in a nested `[[w]] / [[w.sub]]`) carries its
+                        // element index. `indexed_key` already holds the outer
+                        // indices; append THIS element's. Its index is the CUMULATIVE
+                        // count (`aot_lengths`), not the live per-unit array length:
+                        // in the streaming path each `[[w]]` unit sees a fresh
+                        // single-element array, so a live `len - 1` is always 0 and
+                        // later elements' leaves would collide with the first.
+                        const idx = (self.seen.aot_lengths.get(key_owned) orelse 1) - 1;
+                        self.current_prefix.clearRetainingCapacity();
+                        try self.current_prefix.appendSlice(self.arena, indexed_key.items);
+                        try self.current_prefix.print(self.arena, "[{d}]", .{idx});
+                        self.current_seen_prefix.clearRetainingCapacity();
+                        try self.current_seen_prefix.appendSlice(self.arena, indexed_seen_key.items);
+                        try self.current_seen_prefix.print(self.arena, "[{d}]", .{idx});
+                    } else {
+                        try self.openTable(table, part, key_owned, indexed_seen_key.items, full_key.items);
+                        if (comptime Sink.is_value_sink) {
+                            self.current = &table.getPtr(part).?.table;
+                        } else {
+                            self.current = try self.sink.openPlainTable(table, part);
+                        }
+                        self.current_prefix.clearRetainingCapacity();
+                        try self.current_prefix.appendSlice(self.arena, indexed_key.items);
+                        self.current_seen_prefix.clearRetainingCapacity();
+                        try self.current_seen_prefix.appendSlice(self.arena, indexed_seen_key.items);
+                    }
+                } else {
+                    // Intermediate -- walk or create, but forbid traversing
+                    // through scalars, inline tables, or arrays-of-tables
+                    // (must target the last element of array-of-tables) or
+                    // normal arrays.
+                    // A scalar / static-array leaf at this path is a conflict:
+                    // the seen-set catches it even when the value tree was
+                    // discarded (streaming). The message mirrors the buffered
+                    // tree-walk below, which reports a static array
+                    // ("cannot redefine array ...") differently from a scalar
+                    // ("... is not a table").
+                    if (self.seen.scalar_leaves.get(indexed_seen_key.items)) |kind| {
+                        return switch (kind) {
+                            .static_array => self.setErrorFmt("cannot redefine array '{s}' as table", .{full_key.items}),
+                            .scalar => self.setErrorFmt("key '{s}' is not a table", .{full_key.items}),
+                        };
+                    }
+                    // An array-of-tables intermediate resolves to its CURRENT
+                    // element (per `aot_lengths`, which is sound even when the live
+                    // slot is absent in the streaming path). Qualify both indexed
+                    // keys with that element's index so deeper `scalar_leaves`
+                    // lookups address the element the leaf was recorded under.
+                    if (self.seen.array_tables.contains(key_owned)) {
+                        const count = self.seen.aot_lengths.get(key_owned) orelse 0;
+                        if (count > 0) {
+                            try indexed_key.print(self.arena, "[{d}]", .{count - 1});
+                            try indexed_seen_key.print(self.arena, "[{d}]", .{count - 1});
+                        }
+                    }
+                    if (comptime Sink.is_value_sink) {
+                        if (table.getPtr(part)) |existing| {
+                            switch (existing.*) {
+                                .table => table = &existing.table,
+                                .array => {
+                                    if (!self.seen.array_tables.contains(key_owned)) {
+                                        return self.setErrorFmt("cannot redefine array '{s}' as table", .{full_key.items});
+                                    }
+                                    const last_elem = &existing.array.items[existing.array.items.len - 1];
+                                    table = &last_elem.table;
+                                },
+                                else => return self.setErrorFmt("key '{s}' is not a table", .{full_key.items}),
+                            }
+                        } else {
+                            // Create implicit intermediate table. `part` is a
+                            // zero-copy slice into self.input.
+                            try table.put(self.arena, part, .{ .table = .empty });
+                            try self.seen.implicit_tables.put(self.seen_arena, key_owned, {});
+                            table = &table.getPtr(part).?.table;
+                        }
+                    } else {
+                        // Seen-sets carry the verdicts (checked above); mirror
+                        // the buffered path's bookkeeping: a path not yet known
+                        // in any table-shaped set is a fresh implicit table.
+                        if (!self.seen.implicit_tables.contains(key_owned) and
+                            !self.seen.defined_tables.contains(key_owned) and
+                            !self.seen.array_tables.contains(key_owned) and
+                            !self.seen.dotted_created.contains(key_owned))
+                        {
+                            try self.seen.implicit_tables.put(self.seen_arena, key_owned, {});
+                        }
+                        table = try self.sink.childTable(table, part, true);
                     }
                 }
+            }
+        }
+
+        /// `seen_key` is the escaped index-free header path used to key the
+        /// table-shaped seen-sets (see `appendSeenSegment`). `leaf_key` is the
+        /// escaped path with traversed array-of-tables segments resolved to their
+        /// current element index (`name[N].rest`); it addresses `scalar_leaves`,
+        /// whose non-table leaves were recorded under that element-qualified form
+        /// by `parseKeyValue`. `display` is the plain '.'-join for error text.
+        fn openTable(self: *Self, parent: Sink.TableRef, key: []const u8, seen_key: []const u8, leaf_key: []const u8, display: []const u8) Error!void {
+            if (self.seen.inline_tables.contains(seen_key)) {
+                return self.setErrorFmt("cannot redefine inline table '{s}'", .{display});
+            }
+            // Seen-sets are authoritative for the redefinition / type-conflict
+            // verdict, so the decision holds even when the live tree slot is
+            // absent (the streaming path frames units against a fresh per-unit
+            // root). In the buffered path the tree and seen-sets always agree, so
+            // these early checks reproduce the previous behavior exactly.
+            if (self.seen.defined_tables.contains(seen_key)) {
+                return self.setErrorFmt("table '{s}' redefined", .{display});
+            }
+            if (self.seen.array_tables.contains(seen_key)) {
+                return self.setErrorFmt("key '{s}' already defined with different type", .{display});
+            }
+            // A scalar / static-array leaf at this path is a type conflict.
+            // The seen-set catches it even when the value tree was discarded
+            // (streaming), matching the buffered tree-walk's `else` branch below.
+            if (self.seen.scalar_leaves.contains(leaf_key)) {
+                return self.setErrorFmt("key '{s}' already defined with different type", .{display});
+            }
+            if (comptime Sink.is_value_sink) {
+                if (parent.getPtr(key)) |existing| {
+                    switch (existing.*) {
+                        .table => {
+                            _ = self.seen.implicit_tables.remove(seen_key);
+                            try self.seen.defined_tables.put(self.seen_arena, seen_key, {});
+                            return;
+                        },
+                        else => return self.setErrorFmt("key '{s}' already defined with different type", .{display}),
+                    }
+                }
+                // Zero-copy: `key` is a slice into self.input.
+                try parent.put(self.arena, key, .{ .table = .empty });
+                _ = self.seen.implicit_tables.remove(seen_key);
+                try self.seen.defined_tables.put(self.seen_arena, seen_key, {});
+            } else {
+                // Non-table conflicts were rejected by the seen checks above;
+                // the caller navigates the sink. Same net seen effect as both
+                // buffered branches.
+                _ = self.seen.implicit_tables.remove(seen_key);
+                try self.seen.defined_tables.put(self.seen_arena, seen_key, {});
+            }
+        }
+
+        /// See `openTable` for the `seen_key` / `leaf_key` / `display` split.
+        fn openArrayOfTables(self: *Self, parent: Sink.TableRef, key: []const u8, seen_key: []const u8, leaf_key: []const u8, display: []const u8) Error!void {
+            // Seen-sets are authoritative for the type-conflict verdict (see
+            // `openTable`). A path previously defined as a `[table]`, an inline
+            // table, or a dotted-key table cannot be reopened as `[[array]]`.
+            if (self.seen.defined_tables.contains(seen_key) or
+                self.seen.inline_tables.contains(seen_key) or
+                self.seen.dotted_created.contains(seen_key))
+            {
+                return self.setErrorFmt("key '{s}' already defined", .{display});
+            }
+            // A non-table leaf at this path blocks `[[aot]]`. The message
+            // mirrors the buffered tree-walk below: a static array reports
+            // "cannot append to static array", a scalar "already defined".
+            if (self.seen.scalar_leaves.get(leaf_key)) |kind| {
+                return switch (kind) {
+                    .static_array => self.setErrorFmt("cannot append to static array '{s}'", .{display}),
+                    .scalar => self.setErrorFmt("key '{s}' already defined", .{display}),
+                };
+            }
+            if (comptime !Sink.is_value_sink) {
+                // An implicit table at this exact path blocks [[aot]]; the
+                // buffered path catches it via the live tree's else-branch.
+                if (self.seen.implicit_tables.contains(seen_key)) {
+                    return self.setErrorFmt("key '{s}' already defined", .{display});
+                }
+                try self.seen.array_tables.put(self.seen_arena, seen_key, {});
+                try self.bumpAotLength(seen_key);
+                try self.resetAotSubPaths(seen_key);
+                return;
+            }
+            if (parent.getPtr(key)) |existing| {
+                switch (existing.*) {
+                    .array => {
+                        if (!self.seen.array_tables.contains(seen_key)) {
+                            return self.setErrorFmt("cannot append to static array '{s}'", .{display});
+                        }
+                        try existing.array.append(self.arena, .{ .table = .empty });
+                        try self.bumpAotLength(seen_key);
+                        try self.resetAotSubPaths(seen_key);
+                        return;
+                    },
+                    else => return self.setErrorFmt("key '{s}' already defined", .{display}),
+                }
+            }
+            // Slot absent. In the buffered path this is a first definition; in the
+            // streaming path (fresh per-unit root) it may instead be an append to
+            // an array-of-tables defined in an earlier unit -- the seen-set knows
+            // which. Either way one fresh element table is created in THIS unit's
+            // tree; the streaming reader emits it as one `[[x]]` element and the
+            // consumer appends across units.
+            var arr: ArrayList(Value) = .empty;
+            try arr.append(self.arena, .{ .table = .empty });
+            try parent.put(self.arena, key, .{ .array = arr });
+            try self.seen.array_tables.put(self.seen_arena, seen_key, {});
+            try self.bumpAotLength(seen_key);
+            // The buffered path reaches here only on a first definition (no
+            // sub-paths yet), but the streaming path frames each `[[base]]`
+            // against a fresh per-unit root, so an "absent slot" may actually be
+            // an append to an array from an earlier unit whose element left
+            // sub-path bookkeeping behind. Reset it here too so both paths agree.
+            try self.resetAotSubPaths(seen_key);
+        }
+
+        /// Record one more element for the array-of-tables at the escaped
+        /// index-free path `seen_key`. `seen_key` is already seen-arena-owned (it
+        /// is the lookup key the other AOT sets store), so it can key
+        /// `aot_lengths` directly.
+        fn bumpAotLength(self: *Self, seen_key: []const u8) Error!void {
+            const gop = try self.seen.aot_lengths.getOrPut(self.seen_arena, seen_key);
+            if (!gop.found_existing) gop.value_ptr.* = 0;
+            gop.value_ptr.* += 1;
+        }
+
+        /// Opening a new element of the array-of-tables at `base` starts that
+        /// element's sub-structure fresh: a `[base.sub]` / `[[base.sub]]` under
+        /// the new element is a DISTINCT table from the same-named one under the
+        /// prior element, not a redefinition. The table-shaped seen-sets key
+        /// sub-tables by their escaped index-free path (`base.sub`), so an entry
+        /// left by a prior element would wrongly flag the new one as a
+        /// redefinition. Drop every entry under `base.` from those index-free
+        /// sets. `base` is the escaped encoding, so the `base.` prefix match
+        /// stops at a true segment boundary and never matches an escaped '.'
+        /// inside a quoted segment. The value-leaf sets (`scalar_leaves`, and
+        /// kv-created `inline_tables` / `dotted_created`) are keyed via the
+        /// element-qualified `current_seen_prefix` (`base[N].rest`), so they are
+        /// already element-scoped and untouched.
+        fn resetAotSubPaths(self: *Self, base: []const u8) Error!void {
+            const prefix = try std.fmt.allocPrint(self.arena, "{s}.", .{base});
+            inline for (.{
+                &self.seen.defined_tables,
+                &self.seen.implicit_tables,
+                &self.seen.array_tables,
+                &self.seen.aot_lengths,
+            }) |map| {
+                var doomed: ArrayList([]const u8) = .empty;
+                defer doomed.deinit(self.arena);
+                var it = map.iterator();
+                while (it.next()) |entry| {
+                    if (std.mem.startsWith(u8, entry.key_ptr.*, prefix)) {
+                        try doomed.append(self.arena, entry.key_ptr.*);
+                    }
+                }
+                for (doomed.items) |k| _ = map.remove(k);
+            }
+        }
+
+        // Key/value parsing
+
+        fn parseKeyValue(self: *Self, target: Sink.TableRef) Error!void {
+            self.skipWs();
+            self.token_start = self.pos;
+            var parts: ArrayList([]const u8) = .empty;
+            defer parts.deinit(self.arena);
+            try self.parseKeyPath(&parts);
+            self.skipWs();
+            if (!self.match('=')) return self.setError("expected '=' after key");
+            self.skipWs();
+
+            // Build the full key prefix so we can check against closed-set rules.
+            // Two builders run in lockstep: `full_key` is the plain '.'-join
+            // (span keys + error text), `seen_key` the escaped encoding that keys
+            // the seen-sets so quoted-dotted segments stay distinct.
+            var full_key: ArrayList(u8) = .empty;
+            defer full_key.deinit(self.arena);
+            try full_key.appendSlice(self.arena, self.current_prefix.items);
+            var seen_key: ArrayList(u8) = .empty;
+            defer seen_key.deinit(self.arena);
+            try seen_key.appendSlice(self.arena, self.current_seen_prefix.items);
+
+            // Descend intermediate tables for dotted keys. Bound the descent by
+            // max_depth: without this, a long dotted key (`a.a.a...=1`) builds an
+            // arbitrarily deep Value tree, which both re-dupes a growing full_key
+            // into seen_arena at every level (O(N^2) memory) and later overflows
+            // the recursive Value.clone / Value.eql. parseArray / parseInlineTable
+            // already enforce the same ceiling on bracketed nesting.
+            var t = target;
+            for (parts.items[0 .. parts.items.len - 1], 0..) |part, i| {
+                if (i >= self.max_depth) return self.setDepthError();
+                // Always emit a separator for joins -- empty keys are valid
+                // in TOML (e.g. `""."x" = 1`) and would otherwise collapse.
+                if (self.current_prefix.items.len > 0 or i > 0) try full_key.append(self.arena, '.');
+                try full_key.appendSlice(self.arena, part);
+                if (self.current_seen_prefix.items.len > 0 or i > 0) try seen_key.append(self.arena, '.');
+                try appendSeenSegment(self.arena, &seen_key, part);
+                // Duped into the seen-arena: stored into dotted_created /
+                // dotted_current and used as their lookup key, so it must
+                // outlive the per-unit value arena in the streaming path.
+                const fk = try self.seen_arena.dupe(u8, seen_key.items);
+
+                // Inline/header-defined/other-header-dotted-created tables
+                // cannot be extended via dotted-key descent.
+                if (self.seen.inline_tables.contains(fk)) {
+                    return self.setErrorFmt("cannot extend inline table '{s}'", .{full_key.items});
+                }
+                if (self.seen.defined_tables.contains(fk)) {
+                    return self.setErrorFmt("cannot extend header-defined table '{s}'", .{full_key.items});
+                }
+                if (self.seen.dotted_created.contains(fk) and !self.seen.dotted_current.contains(fk)) {
+                    return self.setErrorFmt("cannot extend dotted-key-created table '{s}' from a different scope", .{full_key.items});
+                }
+                // A scalar / static-array leaf at this intermediate path is a
+                // conflict: the seen-set catches it even when the value tree was
+                // discarded (streaming), matching the buffered tree-walk's `else`
+                // branch below.
+                if (self.seen.scalar_leaves.contains(fk)) {
+                    return self.setErrorFmt("key '{s}' is not a table", .{full_key.items});
+                }
+
                 if (comptime Sink.is_value_sink) {
-                    if (table.getPtr(part)) |existing| {
+                    if (t.getPtr(part)) |existing| {
                         switch (existing.*) {
-                            .table => table = &existing.table,
-                            .array => {
-                                if (!self.seen.array_tables.contains(key_owned)) {
-                                    return self.setErrorFmt("cannot redefine array '{s}' as table", .{full_key.items});
-                                }
-                                const last_elem = &existing.array.items[existing.array.items.len - 1];
-                                table = &last_elem.table;
+                            .table => {
+                                t = &existing.table;
                             },
                             else => return self.setErrorFmt("key '{s}' is not a table", .{full_key.items}),
                         }
                     } else {
-                        // Create implicit intermediate table. `part` is a
-                        // zero-copy slice into self.input.
-                        try table.put(self.arena, part, .{ .table = .empty });
-                        try self.seen.implicit_tables.put(self.seen_arena, key_owned, {});
-                        table = &table.getPtr(part).?.table;
+                        // Zero-copy: `part` is a slice into self.input.
+                        try t.put(self.arena, part, .{ .table = .empty });
+                        t = &t.getPtr(part).?.table;
+                        try self.seen.dotted_created.put(self.seen_arena, fk, {});
+                        try self.seen.dotted_current.put(self.seen_arena, fk, {});
                     }
                 } else {
-                    // Seen-sets carry the verdicts (checked above); mirror
-                    // the buffered path's bookkeeping: a path not yet known
-                    // in any table-shaped set is a fresh implicit table.
-                    if (!self.seen.implicit_tables.contains(key_owned) and
-                        !self.seen.defined_tables.contains(key_owned) and
-                        !self.seen.array_tables.contains(key_owned) and
-                        !self.seen.dotted_created.contains(key_owned))
+                    // Mirror the buffered bookkeeping: a path not yet known in
+                    // any table-shaped set is a fresh dotted-created table.
+                    // Dotted descent never traverses arrays-of-tables.
+                    if (!self.seen.implicit_tables.contains(fk) and
+                        !self.seen.defined_tables.contains(fk) and
+                        !self.seen.array_tables.contains(fk) and
+                        !self.seen.dotted_created.contains(fk))
                     {
-                        try self.seen.implicit_tables.put(self.seen_arena, key_owned, {});
+                        try self.seen.dotted_created.put(self.seen_arena, fk, {});
+                        try self.seen.dotted_current.put(self.seen_arena, fk, {});
                     }
-                    table = try self.sink.childTable(table, part, true);
+                    t = try self.sink.childTable(t, part, false);
                 }
             }
-        }
-    }
 
-    /// `seen_key` is the escaped index-free header path used to key the
-    /// table-shaped seen-sets (see `appendSeenSegment`). `leaf_key` is the
-    /// escaped path with traversed array-of-tables segments resolved to their
-    /// current element index (`name[N].rest`); it addresses `scalar_leaves`,
-    /// whose non-table leaves were recorded under that element-qualified form
-    /// by `parseKeyValue`. `display` is the plain '.'-join for error text.
-    fn openTable(self: *Self, parent: Sink.TableRef, key: []const u8, seen_key: []const u8, leaf_key: []const u8, display: []const u8) Error!void {
-        if (self.seen.inline_tables.contains(seen_key)) {
-            return self.setErrorFmt("cannot redefine inline table '{s}'", .{display});
-        }
-        // Seen-sets are authoritative for the redefinition / type-conflict
-        // verdict, so the decision holds even when the live tree slot is
-        // absent (the streaming path frames units against a fresh per-unit
-        // root). In the buffered path the tree and seen-sets always agree, so
-        // these early checks reproduce the previous behavior exactly.
-        if (self.seen.defined_tables.contains(seen_key)) {
-            return self.setErrorFmt("table '{s}' redefined", .{display});
-        }
-        if (self.seen.array_tables.contains(seen_key)) {
-            return self.setErrorFmt("key '{s}' already defined with different type", .{display});
-        }
-        // A scalar / static-array leaf at this path is a type conflict.
-        // The seen-set catches it even when the value tree was discarded
-        // (streaming), matching the buffered tree-walk's `else` branch below.
-        if (self.seen.scalar_leaves.contains(leaf_key)) {
-            return self.setErrorFmt("key '{s}' already defined with different type", .{display});
-        }
-        if (comptime Sink.is_value_sink) {
-            if (parent.getPtr(key)) |existing| {
-                switch (existing.*) {
-                    .table => {
-                        _ = self.seen.implicit_tables.remove(seen_key);
-                        try self.seen.defined_tables.put(self.seen_arena, seen_key, {});
-                        return;
-                    },
-                    else => return self.setErrorFmt("key '{s}' already defined with different type", .{display}),
-                }
-            }
-            // Zero-copy: `key` is a slice into self.input.
-            try parent.put(self.arena, key, .{ .table = .empty });
-            _ = self.seen.implicit_tables.remove(seen_key);
-            try self.seen.defined_tables.put(self.seen_arena, seen_key, {});
-        } else {
-            // Non-table conflicts were rejected by the seen checks above;
-            // the caller navigates the sink. Same net seen effect as both
-            // buffered branches.
-            _ = self.seen.implicit_tables.remove(seen_key);
-            try self.seen.defined_tables.put(self.seen_arena, seen_key, {});
-        }
-    }
-
-    /// See `openTable` for the `seen_key` / `leaf_key` / `display` split.
-    fn openArrayOfTables(self: *Self, parent: Sink.TableRef, key: []const u8, seen_key: []const u8, leaf_key: []const u8, display: []const u8) Error!void {
-        // Seen-sets are authoritative for the type-conflict verdict (see
-        // `openTable`). A path previously defined as a `[table]`, an inline
-        // table, or a dotted-key table cannot be reopened as `[[array]]`.
-        if (self.seen.defined_tables.contains(seen_key) or
-            self.seen.inline_tables.contains(seen_key) or
-            self.seen.dotted_created.contains(seen_key))
-        {
-            return self.setErrorFmt("key '{s}' already defined", .{display});
-        }
-        // A non-table leaf at this path blocks `[[aot]]`. The message
-        // mirrors the buffered tree-walk below: a static array reports
-        // "cannot append to static array", a scalar "already defined".
-        if (self.seen.scalar_leaves.get(leaf_key)) |kind| {
-            return switch (kind) {
-                .static_array => self.setErrorFmt("cannot append to static array '{s}'", .{display}),
-                .scalar => self.setErrorFmt("key '{s}' already defined", .{display}),
-            };
-        }
-        if (comptime !Sink.is_value_sink) {
-            // An implicit table at this exact path blocks [[aot]]; the
-            // buffered path catches it via the live tree's else-branch.
-            if (self.seen.implicit_tables.contains(seen_key)) {
-                return self.setErrorFmt("key '{s}' already defined", .{display});
-            }
-            try self.seen.array_tables.put(self.seen_arena, seen_key, {});
-            try self.bumpAotLength(seen_key);
-            try self.resetAotSubPaths(seen_key);
-            return;
-        }
-        if (parent.getPtr(key)) |existing| {
-            switch (existing.*) {
-                .array => {
-                    if (!self.seen.array_tables.contains(seen_key)) {
-                        return self.setErrorFmt("cannot append to static array '{s}'", .{display});
-                    }
-                    try existing.array.append(self.arena, .{ .table = .empty });
-                    try self.bumpAotLength(seen_key);
-                    try self.resetAotSubPaths(seen_key);
-                    return;
-                },
-                else => return self.setErrorFmt("key '{s}' already defined", .{display}),
-            }
-        }
-        // Slot absent. In the buffered path this is a first definition; in the
-        // streaming path (fresh per-unit root) it may instead be an append to
-        // an array-of-tables defined in an earlier unit -- the seen-set knows
-        // which. Either way one fresh element table is created in THIS unit's
-        // tree; the streaming reader emits it as one `[[x]]` element and the
-        // consumer appends across units.
-        var arr: ArrayList(Value) = .empty;
-        try arr.append(self.arena, .{ .table = .empty });
-        try parent.put(self.arena, key, .{ .array = arr });
-        try self.seen.array_tables.put(self.seen_arena, seen_key, {});
-        try self.bumpAotLength(seen_key);
-        // The buffered path reaches here only on a first definition (no
-        // sub-paths yet), but the streaming path frames each `[[base]]`
-        // against a fresh per-unit root, so an "absent slot" may actually be
-        // an append to an array from an earlier unit whose element left
-        // sub-path bookkeeping behind. Reset it here too so both paths agree.
-        try self.resetAotSubPaths(seen_key);
-    }
-
-    /// Record one more element for the array-of-tables at the escaped
-    /// index-free path `seen_key`. `seen_key` is already seen-arena-owned (it
-    /// is the lookup key the other AOT sets store), so it can key
-    /// `aot_lengths` directly.
-    fn bumpAotLength(self: *Self, seen_key: []const u8) Error!void {
-        const gop = try self.seen.aot_lengths.getOrPut(self.seen_arena, seen_key);
-        if (!gop.found_existing) gop.value_ptr.* = 0;
-        gop.value_ptr.* += 1;
-    }
-
-    /// Opening a new element of the array-of-tables at `base` starts that
-    /// element's sub-structure fresh: a `[base.sub]` / `[[base.sub]]` under
-    /// the new element is a DISTINCT table from the same-named one under the
-    /// prior element, not a redefinition. The table-shaped seen-sets key
-    /// sub-tables by their escaped index-free path (`base.sub`), so an entry
-    /// left by a prior element would wrongly flag the new one as a
-    /// redefinition. Drop every entry under `base.` from those index-free
-    /// sets. `base` is the escaped encoding, so the `base.` prefix match
-    /// stops at a true segment boundary and never matches an escaped '.'
-    /// inside a quoted segment. The value-leaf sets (`scalar_leaves`, and
-    /// kv-created `inline_tables` / `dotted_created`) are keyed via the
-    /// element-qualified `current_seen_prefix` (`base[N].rest`), so they are
-    /// already element-scoped and untouched.
-    fn resetAotSubPaths(self: *Self, base: []const u8) Error!void {
-        const prefix = try std.fmt.allocPrint(self.arena, "{s}.", .{base});
-        inline for (.{
-            &self.seen.defined_tables,
-            &self.seen.implicit_tables,
-            &self.seen.array_tables,
-            &self.seen.aot_lengths,
-        }) |map| {
-            var doomed: ArrayList([]const u8) = .empty;
-            defer doomed.deinit(self.arena);
-            var it = map.iterator();
-            while (it.next()) |entry| {
-                if (std.mem.startsWith(u8, entry.key_ptr.*, prefix)) {
-                    try doomed.append(self.arena, entry.key_ptr.*);
-                }
-            }
-            for (doomed.items) |k| _ = map.remove(k);
-        }
-    }
-
-    // Key/value parsing
-
-    fn parseKeyValue(self: *Self, target: Sink.TableRef) Error!void {
-        self.skipWs();
-        self.token_start = self.pos;
-        var parts: ArrayList([]const u8) = .empty;
-        defer parts.deinit(self.arena);
-        try self.parseKeyPath(&parts);
-        self.skipWs();
-        if (!self.match('=')) return self.setError("expected '=' after key");
-        self.skipWs();
-
-        // Build the full key prefix so we can check against closed-set rules.
-        // Two builders run in lockstep: `full_key` is the plain '.'-join
-        // (span keys + error text), `seen_key` the escaped encoding that keys
-        // the seen-sets so quoted-dotted segments stay distinct.
-        var full_key: ArrayList(u8) = .empty;
-        defer full_key.deinit(self.arena);
-        try full_key.appendSlice(self.arena, self.current_prefix.items);
-        var seen_key: ArrayList(u8) = .empty;
-        defer seen_key.deinit(self.arena);
-        try seen_key.appendSlice(self.arena, self.current_seen_prefix.items);
-
-        // Descend intermediate tables for dotted keys. Bound the descent by
-        // max_depth: without this, a long dotted key (`a.a.a...=1`) builds an
-        // arbitrarily deep Value tree, which both re-dupes a growing full_key
-        // into seen_arena at every level (O(N^2) memory) and later overflows
-        // the recursive Value.clone / Value.eql. parseArray / parseInlineTable
-        // already enforce the same ceiling on bracketed nesting.
-        var t = target;
-        for (parts.items[0 .. parts.items.len - 1], 0..) |part, i| {
-            if (i >= self.max_depth) return self.setDepthError();
-            // Always emit a separator for joins -- empty keys are valid
-            // in TOML (e.g. `""."x" = 1`) and would otherwise collapse.
-            if (self.current_prefix.items.len > 0 or i > 0) try full_key.append(self.arena, '.');
-            try full_key.appendSlice(self.arena, part);
-            if (self.current_seen_prefix.items.len > 0 or i > 0) try seen_key.append(self.arena, '.');
-            try appendSeenSegment(self.arena, &seen_key, part);
-            // Duped into the seen-arena: stored into dotted_created /
-            // dotted_current and used as their lookup key, so it must
-            // outlive the per-unit value arena in the streaming path.
-            const fk = try self.seen_arena.dupe(u8, seen_key.items);
-
-            // Inline/header-defined/other-header-dotted-created tables
-            // cannot be extended via dotted-key descent.
-            if (self.seen.inline_tables.contains(fk)) {
-                return self.setErrorFmt("cannot extend inline table '{s}'", .{full_key.items});
-            }
-            if (self.seen.defined_tables.contains(fk)) {
-                return self.setErrorFmt("cannot extend header-defined table '{s}'", .{full_key.items});
-            }
-            if (self.seen.dotted_created.contains(fk) and !self.seen.dotted_current.contains(fk)) {
-                return self.setErrorFmt("cannot extend dotted-key-created table '{s}' from a different scope", .{full_key.items});
-            }
-            // A scalar / static-array leaf at this intermediate path is a
-            // conflict: the seen-set catches it even when the value tree was
-            // discarded (streaming), matching the buffered tree-walk's `else`
-            // branch below.
-            if (self.seen.scalar_leaves.contains(fk)) {
-                return self.setErrorFmt("key '{s}' is not a table", .{full_key.items});
-            }
+            // Final key: full path for this leaf.
+            const last = parts.items[parts.items.len - 1];
+            if (self.current_prefix.items.len > 0 or parts.items.len > 1) try full_key.append(self.arena, '.');
+            try full_key.appendSlice(self.arena, last);
+            const fk_final = try self.arena.dupe(u8, full_key.items);
+            if (self.current_seen_prefix.items.len > 0 or parts.items.len > 1) try seen_key.append(self.arena, '.');
+            try appendSeenSegment(self.arena, &seen_key, last);
+            const seen_final = try self.arena.dupe(u8, seen_key.items);
 
             if (comptime Sink.is_value_sink) {
-                if (t.getPtr(part)) |existing| {
-                    switch (existing.*) {
-                        .table => {
-                            t = &existing.table;
-                        },
-                        else => return self.setErrorFmt("key '{s}' is not a table", .{full_key.items}),
-                    }
-                } else {
-                    // Zero-copy: `part` is a slice into self.input.
-                    try t.put(self.arena, part, .{ .table = .empty });
-                    t = &t.getPtr(part).?.table;
-                    try self.seen.dotted_created.put(self.seen_arena, fk, {});
-                    try self.seen.dotted_current.put(self.seen_arena, fk, {});
+                if (t.contains(last)) {
+                    return self.setErrorFmt("duplicate key '{s}'", .{last});
                 }
             } else {
-                // Mirror the buffered bookkeeping: a path not yet known in
-                // any table-shaped set is a fresh dotted-created table.
-                // Dotted descent never traverses arrays-of-tables.
-                if (!self.seen.implicit_tables.contains(fk) and
-                    !self.seen.defined_tables.contains(fk) and
-                    !self.seen.array_tables.contains(fk) and
-                    !self.seen.dotted_created.contains(fk))
+                // The live-tree membership test, reconstructed from the
+                // seen-sets: any prior definition at this exact path (leaf,
+                // inline value, or any table shape) is a duplicate.
+                if (self.seen.scalar_leaves.contains(seen_final) or
+                    self.seen.inline_tables.contains(seen_final) or
+                    self.seen.dotted_created.contains(seen_final) or
+                    self.seen.defined_tables.contains(seen_final) or
+                    self.seen.array_tables.contains(seen_final) or
+                    self.seen.implicit_tables.contains(seen_final))
                 {
-                    try self.seen.dotted_created.put(self.seen_arena, fk, {});
-                    try self.seen.dotted_current.put(self.seen_arena, fk, {});
+                    return self.setErrorFmt("duplicate key '{s}'", .{last});
                 }
-                t = try self.sink.childTable(t, part, false);
+            }
+
+            // Set the current path so parseValue records its span (and
+            // nested element spans, recursively) against the right key.
+            const prev_path_len = self.current_path.items.len;
+            self.current_path.clearRetainingCapacity();
+            try self.current_path.appendSlice(self.arena, fk_final);
+            defer {
+                self.current_path.shrinkRetainingCapacity(prev_path_len);
+            }
+
+            const value = try self.parseValue();
+            if (comptime Sink.is_value_sink) {
+                // Zero-copy: `last` is a slice into self.input, which the caller
+                // guarantees outlives the parse tree (documented contract). The
+                // HashMap stores the slice header, not a copy of the bytes.
+                try t.put(self.arena, last, value);
+            } else {
+                try self.sink.putLeaf(t, last, value);
+            }
+
+            // Record non-table leaves (scalars and static arrays) so a later
+            // header / `[[aot]]` / dotted-key that traverses through or
+            // redefines this path is rejected even after the value tree is
+            // discarded (the streaming path). Inline tables are handled by
+            // `sealInlineValue` -> `inline_tables` instead. The key is duped
+            // into the seen-arena (stream-lifetime), not the per-unit arena.
+            switch (value) {
+                .table => {},
+                .array => {
+                    const owned = try self.seen_arena.dupe(u8, seen_final);
+                    try self.seen.scalar_leaves.put(self.seen_arena, owned, .static_array);
+                },
+                else => {
+                    const owned = try self.seen_arena.dupe(u8, seen_final);
+                    try self.seen.scalar_leaves.put(self.seen_arena, owned, .scalar);
+                },
+            }
+
+            // If value is an inline table or an array containing inline
+            // tables, seal the affected paths so they can't be reopened
+            // or extended.
+            try self.sealInlineValue(seen_final, value);
+        }
+
+        /// Recursively mark `seen_key` (and, if the value is a table or array
+        /// of tables, its children) as inline-defined. `seen_key` is the escaped
+        /// encoding (`appendSeenSegment`) the seen-sets index on; child segments
+        /// are appended with the same escaping so a child key containing a '.'
+        /// keys distinctly from a dotted sub-path.
+        fn sealInlineValue(self: *Self, seen_key: []const u8, value: Value) Error!void {
+            // Only inline-table values (and their sub-tables) need sealing.
+            // Scalars and inline arrays don't introduce header-extendable
+            // table paths, so we save the HashMap insert in the hot path.
+            switch (value) {
+                .table => |t| {
+                    // The key is duped into the seen-arena: it is stored into
+                    // inline_tables (a seen-set), so it must outlive the
+                    // per-unit value arena in the streaming path. `seen_key`
+                    // may be a per-unit-arena slice (from `parseKeyValue`), so
+                    // re-dupe rather than store it directly.
+                    const owned = try self.seen_arena.dupe(u8, seen_key);
+                    try self.seen.inline_tables.put(self.seen_arena, owned, {});
+                    var it = t.iterator();
+                    while (it.next()) |entry| {
+                        var sub: ArrayList(u8) = .empty;
+                        defer sub.deinit(self.arena);
+                        try sub.appendSlice(self.arena, seen_key);
+                        try sub.append(self.arena, '.');
+                        try appendSeenSegment(self.arena, &sub, entry.key_ptr.*);
+                        try self.sealInlineValue(sub.items, entry.value_ptr.*);
+                    }
+                },
+                else => {},
             }
         }
 
-        // Final key: full path for this leaf.
-        const last = parts.items[parts.items.len - 1];
-        if (self.current_prefix.items.len > 0 or parts.items.len > 1) try full_key.append(self.arena, '.');
-        try full_key.appendSlice(self.arena, last);
-        const fk_final = try self.arena.dupe(u8, full_key.items);
-        if (self.current_seen_prefix.items.len > 0 or parts.items.len > 1) try seen_key.append(self.arena, '.');
-        try appendSeenSegment(self.arena, &seen_key, last);
-        const seen_final = try self.arena.dupe(u8, seen_key.items);
-
-        if (comptime Sink.is_value_sink) {
-            if (t.contains(last)) {
-                return self.setErrorFmt("duplicate key '{s}'", .{last});
-            }
-        } else {
-            // The live-tree membership test, reconstructed from the
-            // seen-sets: any prior definition at this exact path (leaf,
-            // inline value, or any table shape) is a duplicate.
-            if (self.seen.scalar_leaves.contains(seen_final) or
-                self.seen.inline_tables.contains(seen_final) or
-                self.seen.dotted_created.contains(seen_final) or
-                self.seen.defined_tables.contains(seen_final) or
-                self.seen.array_tables.contains(seen_final) or
-                self.seen.implicit_tables.contains(seen_final))
-            {
-                return self.setErrorFmt("duplicate key '{s}'", .{last});
+        fn parseKeyPath(self: *Self, out: *ArrayList([]const u8)) Error!void {
+            while (true) {
+                self.skipWs();
+                const part = try self.parseOneKey();
+                try out.append(self.arena, part);
+                self.skipWs();
+                if (!self.match('.')) return;
             }
         }
 
-        // Set the current path so parseValue records its span (and
-        // nested element spans, recursively) against the right key.
-        const prev_path_len = self.current_path.items.len;
-        self.current_path.clearRetainingCapacity();
-        try self.current_path.appendSlice(self.arena, fk_final);
-        defer {
-            self.current_path.shrinkRetainingCapacity(prev_path_len);
-        }
-
-        const value = try self.parseValue();
-        if (comptime Sink.is_value_sink) {
-            // Zero-copy: `last` is a slice into self.input, which the caller
-            // guarantees outlives the parse tree (documented contract). The
-            // HashMap stores the slice header, not a copy of the bytes.
-            try t.put(self.arena, last, value);
-        } else {
-            try self.sink.putLeaf(t, last, value);
-        }
-
-        // Record non-table leaves (scalars and static arrays) so a later
-        // header / `[[aot]]` / dotted-key that traverses through or
-        // redefines this path is rejected even after the value tree is
-        // discarded (the streaming path). Inline tables are handled by
-        // `sealInlineValue` -> `inline_tables` instead. The key is duped
-        // into the seen-arena (stream-lifetime), not the per-unit arena.
-        switch (value) {
-            .table => {},
-            .array => {
-                const owned = try self.seen_arena.dupe(u8, seen_final);
-                try self.seen.scalar_leaves.put(self.seen_arena, owned, .static_array);
-            },
-            else => {
-                const owned = try self.seen_arena.dupe(u8, seen_final);
-                try self.seen.scalar_leaves.put(self.seen_arena, owned, .scalar);
-            },
-        }
-
-        // If value is an inline table or an array containing inline
-        // tables, seal the affected paths so they can't be reopened
-        // or extended.
-        try self.sealInlineValue(seen_final, value);
-    }
-
-    /// Recursively mark `seen_key` (and, if the value is a table or array
-    /// of tables, its children) as inline-defined. `seen_key` is the escaped
-    /// encoding (`appendSeenSegment`) the seen-sets index on; child segments
-    /// are appended with the same escaping so a child key containing a '.'
-    /// keys distinctly from a dotted sub-path.
-    fn sealInlineValue(self: *Self, seen_key: []const u8, value: Value) Error!void {
-        // Only inline-table values (and their sub-tables) need sealing.
-        // Scalars and inline arrays don't introduce header-extendable
-        // table paths, so we save the HashMap insert in the hot path.
-        switch (value) {
-            .table => |t| {
-                // The key is duped into the seen-arena: it is stored into
-                // inline_tables (a seen-set), so it must outlive the
-                // per-unit value arena in the streaming path. `seen_key`
-                // may be a per-unit-arena slice (from `parseKeyValue`), so
-                // re-dupe rather than store it directly.
-                const owned = try self.seen_arena.dupe(u8, seen_key);
-                try self.seen.inline_tables.put(self.seen_arena, owned, {});
-                var it = t.iterator();
-                while (it.next()) |entry| {
-                    var sub: ArrayList(u8) = .empty;
-                    defer sub.deinit(self.arena);
-                    try sub.appendSlice(self.arena, seen_key);
-                    try sub.append(self.arena, '.');
-                    try appendSeenSegment(self.arena, &sub, entry.key_ptr.*);
-                    try self.sealInlineValue(sub.items, entry.value_ptr.*);
-                }
-            },
-            else => {},
-        }
-    }
-
-    fn parseKeyPath(self: *Self, out: *ArrayList([]const u8)) Error!void {
-        while (true) {
-            self.skipWs();
-            const part = try self.parseOneKey();
-            try out.append(self.arena, part);
-            self.skipWs();
-            if (!self.match('.')) return;
-        }
-    }
-
-    fn parseOneKey(self: *Self) Error![]const u8 {
-        if (self.eof()) return self.setError("expected key");
-        const c = self.peek();
-        if (c == '"') {
-            return self.parseBasicString();
-        }
-        if (c == '\'') {
-            return self.parseLiteralString();
-        }
-        // Bare key: A-Za-z0-9_-
-        const start = self.pos;
-        while (!self.eof()) {
-            const k = self.peek();
-            if ((k >= 'A' and k <= 'Z') or (k >= 'a' and k <= 'z') or (k >= '0' and k <= '9') or k == '_' or k == '-') {
-                self.advance();
-            } else break;
-        }
-        if (self.pos == start) return self.setError("expected key");
-        return self.input[start..self.pos];
-    }
-
-    // Values
-
-    fn parseValue(self: *Self) Error!Value {
-        if (self.eof()) return self.setError("expected value");
-
-        self.token_start = self.pos;
-        // Snapshot the value's byte-precise start so any nested parser
-        // (parseArray, parseInlineTable) can record spans against this
-        // exact position regardless of how deep we recurse.
-        const start = self.pos;
-        const value = try self.parseValueInner();
-        try self.recordSpanAtCurrentPath(start);
-        return value;
-    }
-
-    fn parseValueInner(self: *Self) Error!Value {
-        const c = self.peek();
-        switch (c) {
-            '"' => {
-                if (self.peekAt(1) == '"' and self.peekAt(2) == '"') {
-                    const s = try self.parseMultilineBasicString();
-                    return .{ .string = s };
-                }
-                const s = try self.parseBasicString();
-                return .{ .string = s };
-            },
-            '\'' => {
-                if (self.peekAt(1) == '\'' and self.peekAt(2) == '\'') {
-                    const s = try self.parseMultilineLiteralString();
-                    return .{ .string = s };
-                }
-                const s = try self.parseLiteralString();
-                return .{ .string = s };
-            },
-            '[' => return self.parseArray(),
-            '{' => return self.parseInlineTable(),
-            't', 'f' => return self.parseBoolean(),
-            else => return self.parseNumberOrDateTime(),
-        }
-    }
-
-    /// Record a span for the value currently being parsed at the current
-    /// path. No-op when spans are disabled. `start` is the value's byte offset.
-    fn recordSpanAtCurrentPath(self: *Self, start: usize) Error!void {
-        const sm = self.spans orelse return;
-        const dup = try self.arena.dupe(u8, self.current_path.items);
-        try sm.put(self.arena, dup, .{
-            .start = start,
-            .end = self.pos,
-        });
-    }
-
-    // Strings
-
-    fn parseBasicString(self: *Self) Error![]const u8 {
-        self.token_start = self.pos;
-        if (!self.match('"')) return self.setError("expected '\"'");
-
-        // Zero-copy fast-path: scan for end-of-string without building a buffer.
-        // SIMD bulk-skip plain ASCII 16 bytes at a time; only drop to scalar for
-        // stop bytes (quote, backslash, control, DEL, non-ASCII).
-        const start = self.pos;
-        var has_escape = false;
-        while (!self.eof()) {
-            // Bulk-advance past plain ASCII before touching individual bytes.
-            const skip = scanBasicStringFast(self.input[self.pos..]);
-            self.pos += skip;
-            if (self.eof()) break;
-
-            const c = self.peek();
-            if (c == '"') break;
-            if (c == '\\') {
-                has_escape = true;
-                break;
-            }
-            if (c == '\n' or c == '\r') return self.setError("newline in basic string");
-            if (c < 0x20 and c != 0x09) return self.setError("control character in string");
-            if (c == 0x7F) return self.setError("DEL in string");
-            if (c >= 0x80) {
-                try self.validateUtf8();
-                continue;
-            }
-            self.advance();
-        }
-        if (!has_escape) {
-            if (self.eof() or self.peek() != '"') return self.setError("unterminated string");
-            const slice = self.input[start..self.pos];
-            self.advance();
-            return slice;
-        }
-
-        var buf: ArrayList(u8) = .empty;
-        try buf.appendSlice(self.arena, self.input[start..self.pos]);
-        while (!self.eof()) {
-            // Bulk-advance past plain ASCII.
-            const skip = scanBasicStringFast(self.input[self.pos..]);
-            if (skip > 0) {
-                try buf.appendSlice(self.arena, self.input[self.pos .. self.pos + skip]);
-                self.pos += skip;
-                if (self.eof()) break;
-            }
-
+        fn parseOneKey(self: *Self) Error![]const u8 {
+            if (self.eof()) return self.setError("expected key");
             const c = self.peek();
             if (c == '"') {
-                self.advance();
-                return buf.items;
+                return self.parseBasicString();
             }
-            if (c == '\\') {
-                try self.consumeEscape(&buf, false);
-                continue;
-            }
-            if (c == '\n' or c == '\r') return self.setError("newline in basic string");
-            if (c < 0x20 and c != 0x09) return self.setError("control character in string");
-            if (c == 0x7F) return self.setError("DEL in string");
-            if (c >= 0x80) {
-                const before = self.pos;
-                try self.validateUtf8();
-                try buf.appendSlice(self.arena, self.input[before..self.pos]);
-                continue;
-            }
-            try buf.append(self.arena, c);
-            self.advance();
-        }
-        return self.setError("unterminated string");
-    }
-
-    fn consumeEscape(self: *Self, buf: *ArrayList(u8), multiline: bool) Error!void {
-        _ = self.match('\\');
-        if (self.eof()) return self.setError("unterminated escape");
-        const e = self.peek();
-        switch (e) {
-            'b' => {
-                try buf.append(self.arena, 0x08);
-                self.advance();
-            },
-            't' => {
-                try buf.append(self.arena, 0x09);
-                self.advance();
-            },
-            'n' => {
-                try buf.append(self.arena, 0x0A);
-                self.advance();
-            },
-            'f' => {
-                try buf.append(self.arena, 0x0C);
-                self.advance();
-            },
-            'r' => {
-                try buf.append(self.arena, 0x0D);
-                self.advance();
-            },
-            'e' => {
-                // TOML 1.1: \e -> U+001B (ESC).
-                try buf.append(self.arena, 0x1B);
-                self.advance();
-            },
-            '"' => {
-                try buf.append(self.arena, '"');
-                self.advance();
-            },
-            '\\' => {
-                try buf.append(self.arena, '\\');
-                self.advance();
-            },
-            'x' => {
-                // TOML 1.1: \xHH -> single byte. The two hex digits form
-                // a codepoint < 256; emit as UTF-8.
-                self.advance();
-                const cp = try self.parseUnicodeEscape(2);
-                try appendCodepoint(buf, self.arena, cp);
-            },
-            'u' => {
-                self.advance();
-                const cp = try self.parseUnicodeEscape(4);
-                try appendCodepoint(buf, self.arena, cp);
-            },
-            'U' => {
-                self.advance();
-                const cp = try self.parseUnicodeEscape(8);
-                try appendCodepoint(buf, self.arena, cp);
-            },
-            '\n', '\r', ' ', '\t' => {
-                if (!multiline) return self.setError("invalid escape");
-                // Line-ending backslash: eat whitespace+newline+whitespace.
-                // Must reach a newline or the sequence is an error.
-                // Skip trailing spaces/tabs on this line.
-                while (!self.eof() and (self.peek() == ' ' or self.peek() == '\t')) self.advance();
-                if (self.eof()) return self.setError("unterminated string");
-                if (self.peek() == '\r') self.advance();
-                if (self.eof() or self.peek() != '\n') return self.setError("invalid line-ending backslash");
-                self.advance();
-                // Now skip ALL subsequent whitespace incl. newlines.
-                while (!self.eof()) {
-                    const k = self.peek();
-                    if (k == ' ' or k == '\t' or k == '\n' or k == '\r') self.advance() else break;
-                }
-            },
-            else => return self.setError("invalid escape"),
-        }
-    }
-
-    fn parseUnicodeEscape(self: *Self, n: usize) Error!u32 {
-        if (self.pos + n > self.input.len) return self.setError("short unicode escape");
-        var cp: u32 = 0;
-        var i: usize = 0;
-        while (i < n) : (i += 1) {
-            const c = self.peek();
-            const d: u32 = switch (c) {
-                '0'...'9' => c - '0',
-                'a'...'f' => c - 'a' + 10,
-                'A'...'F' => c - 'A' + 10,
-                else => return self.setError("invalid hex in \\u escape"),
-            };
-            cp = cp * 16 + d;
-            self.advance();
-        }
-        if (cp > 0x10FFFF) return self.setError("\\U code point out of range");
-        // Surrogates are invalid.
-        if (cp >= 0xD800 and cp <= 0xDFFF) return self.setError("surrogate code point in \\u escape");
-        return cp;
-    }
-
-    fn appendCodepoint(buf: *ArrayList(u8), arena: Allocator, cp: u32) Error!void {
-        var utf8: [4]u8 = undefined;
-        const n = std.unicode.utf8Encode(@intCast(cp), &utf8) catch return error.TomlParseError;
-        try buf.appendSlice(arena, utf8[0..n]);
-    }
-
-    fn parseLiteralString(self: *Self) Error![]const u8 {
-        self.token_start = self.pos;
-        if (!self.match('\'')) return self.setError("expected '\\''");
-        const start = self.pos;
-        while (!self.eof()) {
-            const c = self.peek();
             if (c == '\'') {
+                return self.parseLiteralString();
+            }
+            // Bare key: A-Za-z0-9_-
+            const start = self.pos;
+            while (!self.eof()) {
+                const k = self.peek();
+                if ((k >= 'A' and k <= 'Z') or (k >= 'a' and k <= 'z') or (k >= '0' and k <= '9') or k == '_' or k == '-') {
+                    self.advance();
+                } else break;
+            }
+            if (self.pos == start) return self.setError("expected key");
+            return self.input[start..self.pos];
+        }
+
+        // Values
+
+        fn parseValue(self: *Self) Error!Value {
+            if (self.eof()) return self.setError("expected value");
+
+            self.token_start = self.pos;
+            // Snapshot the value's byte-precise start so any nested parser
+            // (parseArray, parseInlineTable) can record spans against this
+            // exact position regardless of how deep we recurse.
+            const start = self.pos;
+            const value = try self.parseValueInner();
+            try self.recordSpanAtCurrentPath(start);
+            return value;
+        }
+
+        fn parseValueInner(self: *Self) Error!Value {
+            const c = self.peek();
+            switch (c) {
+                '"' => {
+                    if (self.peekAt(1) == '"' and self.peekAt(2) == '"') {
+                        const s = try self.parseMultilineBasicString();
+                        return .{ .string = s };
+                    }
+                    const s = try self.parseBasicString();
+                    return .{ .string = s };
+                },
+                '\'' => {
+                    if (self.peekAt(1) == '\'' and self.peekAt(2) == '\'') {
+                        const s = try self.parseMultilineLiteralString();
+                        return .{ .string = s };
+                    }
+                    const s = try self.parseLiteralString();
+                    return .{ .string = s };
+                },
+                '[' => return self.parseArray(),
+                '{' => return self.parseInlineTable(),
+                't', 'f' => return self.parseBoolean(),
+                else => return self.parseNumberOrDateTime(),
+            }
+        }
+
+        /// Record a span for the value currently being parsed at the current
+        /// path. No-op when spans are disabled. `start` is the value's byte offset.
+        fn recordSpanAtCurrentPath(self: *Self, start: usize) Error!void {
+            const sm = self.spans orelse return;
+            const dup = try self.arena.dupe(u8, self.current_path.items);
+            try sm.put(self.arena, dup, .{
+                .start = start,
+                .end = self.pos,
+            });
+        }
+
+        // Strings
+
+        fn parseBasicString(self: *Self) Error![]const u8 {
+            self.token_start = self.pos;
+            if (!self.match('"')) return self.setError("expected '\"'");
+
+            // Zero-copy fast-path: scan for end-of-string without building a buffer.
+            // SIMD bulk-skip plain ASCII 16 bytes at a time; only drop to scalar for
+            // stop bytes (quote, backslash, control, DEL, non-ASCII).
+            const start = self.pos;
+            var has_escape = false;
+            while (!self.eof()) {
+                // Bulk-advance past plain ASCII before touching individual bytes.
+                const skip = scanBasicStringFast(self.input[self.pos..]);
+                self.pos += skip;
+                if (self.eof()) break;
+
+                const c = self.peek();
+                if (c == '"') break;
+                if (c == '\\') {
+                    has_escape = true;
+                    break;
+                }
+                if (c == '\n' or c == '\r') return self.setError("newline in basic string");
+                if (c < 0x20 and c != 0x09) return self.setError("control character in string");
+                if (c == 0x7F) return self.setError("DEL in string");
+                if (c >= 0x80) {
+                    try self.validateUtf8();
+                    continue;
+                }
+                self.advance();
+            }
+            if (!has_escape) {
+                if (self.eof() or self.peek() != '"') return self.setError("unterminated string");
                 const slice = self.input[start..self.pos];
                 self.advance();
                 return slice;
             }
-            if (c == '\n' or c == '\r') return self.setError("newline in literal string");
-            if (c < 0x20 and c != 0x09) return self.setError("control character in literal string");
-            if (c == 0x7F) return self.setError("DEL in literal string");
-            if (c >= 0x80) {
-                try self.validateUtf8();
-                continue;
-            }
-            self.advance();
-        }
-        return self.setError("unterminated literal string");
-    }
 
-    fn parseMultilineBasicString(self: *Self) Error![]const u8 {
-        self.token_start = self.pos;
-        // consume opening """
-        _ = self.match('"');
-        _ = self.match('"');
-        _ = self.match('"');
-        // Trim at most one newline (LF or CRLF pair) immediately after the
-        // opening delimiter. A lone CR is NOT a newline per TOML ABNF and
-        // must fall through to the body loop where it is rejected.
-        if (!self.eof() and self.peek() == '\r' and self.peekAt(1) == '\n') {
-            self.advance();
-            self.advance();
-        } else if (!self.eof() and self.peek() == '\n') {
-            self.advance();
-        }
-
-        var buf: ArrayList(u8) = .empty;
-
-        while (!self.eof()) {
-            // Look for closing """
-            if (self.peek() == '"') {
-                if (self.peekAt(1) == '"' and self.peekAt(2) == '"') {
-                    // Consume three ", then allow up to 2 more as content.
-                    self.advance();
-                    self.advance();
-                    self.advance();
-                    if (!self.eof() and self.peek() == '"') {
-                        try buf.append(self.arena, '"');
-                        self.advance();
-                        if (!self.eof() and self.peek() == '"') {
-                            try buf.append(self.arena, '"');
-                            self.advance();
-                        }
-                    }
-                    return buf.items;
-                }
-                // else: single/double " not at terminator
-                try buf.append(self.arena, '"');
-                self.advance();
-                continue;
-            }
-            if (self.peek() == '\\') {
-                try self.consumeEscape(&buf, true);
-                continue;
-            }
-            const c = self.peek();
-            if (c < 0x20 and c != 0x09 and c != 0x0A and c != 0x0D) return self.setError("control character in string");
-            if (c == 0x7F) return self.setError("DEL in string");
-            // Normalize CRLF to LF.
-            if (c == '\r') {
-                if (self.peekAt(1) == '\n') {
-                    self.advance();
-                    continue;
-                }
-                return self.setError("bare CR in multiline string");
-            }
-            if (c >= 0x80) {
-                const before = self.pos;
-                try self.validateUtf8();
-                try buf.appendSlice(self.arena, self.input[before..self.pos]);
-                continue;
-            }
-            try buf.append(self.arena, c);
-            self.advance();
-        }
-        return self.setError("unterminated multiline string");
-    }
-
-    fn parseMultilineLiteralString(self: *Self) Error![]const u8 {
-        self.token_start = self.pos;
-        _ = self.match('\'');
-        _ = self.match('\'');
-        _ = self.match('\'');
-        // Trim at most one newline (LF or CRLF pair) immediately after the
-        // opening delimiter. A lone CR is NOT a newline per TOML ABNF and
-        // must fall through to the body loop where it is rejected.
-        if (!self.eof() and self.peek() == '\r' and self.peekAt(1) == '\n') {
-            self.advance();
-            self.advance();
-        } else if (!self.eof() and self.peek() == '\n') {
-            self.advance();
-        }
-
-        // Try zero-copy: scan for ''' without any special processing.
-        const start = self.pos;
-        var zero_copy_possible = true;
-        while (!self.eof()) {
-            const c = self.peek();
-            if (c == '\r' and self.peekAt(1) == '\n') {
-                // Zero-copy would preserve CR -- TOML wants LF only here.
-                zero_copy_possible = false;
-                break;
-            }
-            if (c == '\'') {
-                if (self.peekAt(1) == '\'' and self.peekAt(2) == '\'') {
-                    const end = self.pos;
-                    self.advance();
-                    self.advance();
-                    self.advance();
-                    // Content may have up to 2 trailing single quotes folded in.
-                    var tail: usize = 0;
-                    while (tail < 2 and !self.eof() and self.peek() == '\'') {
-                        self.advance();
-                        tail += 1;
-                    }
-                    if (tail == 0) {
-                        return self.input[start..end];
-                    }
-                    // Fall through: we consumed extras, need copy path.
-                    var buf: ArrayList(u8) = .empty;
-                    try buf.appendSlice(self.arena, self.input[start..end]);
-                    var k: usize = 0;
-                    while (k < tail) : (k += 1) try buf.append(self.arena, '\'');
-                    return buf.items;
-                }
-            }
-            // Lone CR (not followed by LF) is invalid per TOML 1.1.
-            if (c == 0x0D and self.peekAt(1) != '\n') return self.setError("lone CR in literal string");
-            if (c < 0x20 and c != 0x09 and c != 0x0A and c != 0x0D) return self.setError("control character in literal string");
-            if (c == 0x7F) return self.setError("DEL in literal string");
-            if (c >= 0x80) {
-                try self.validateUtf8();
-                continue;
-            }
-            self.advance();
-        }
-        if (!zero_copy_possible) {
-            // Rewind to start of body and walk with copy path.
-            self.pos = start;
-            // Recompute line/col is impractical here; for simplicity the
-            // error location may be off by at most this single string,
-            // which is acceptable for diagnostics.
             var buf: ArrayList(u8) = .empty;
+            try buf.appendSlice(self.arena, self.input[start..self.pos]);
             while (!self.eof()) {
+                // Bulk-advance past plain ASCII.
+                const skip = scanBasicStringFast(self.input[self.pos..]);
+                if (skip > 0) {
+                    try buf.appendSlice(self.arena, self.input[self.pos .. self.pos + skip]);
+                    self.pos += skip;
+                    if (self.eof()) break;
+                }
+
                 const c = self.peek();
-                if (c == '\r' and self.peekAt(1) == '\n') {
-                    try buf.append(self.arena, '\n');
+                if (c == '"') {
                     self.advance();
-                    self.advance();
+                    return buf.items;
+                }
+                if (c == '\\') {
+                    try self.consumeEscape(&buf, false);
                     continue;
                 }
-                if (c == '\'') {
-                    if (self.peekAt(1) == '\'' and self.peekAt(2) == '\'') {
-                        self.advance();
-                        self.advance();
-                        self.advance();
-                        var tail: usize = 0;
-                        while (tail < 2 and !self.eof() and self.peek() == '\'') {
-                            try buf.append(self.arena, '\'');
-                            self.advance();
-                            tail += 1;
-                        }
-                        return buf.items;
-                    }
-                }
-                // CRLF was consumed above, so any remaining CR is lone and
-                // invalid per TOML 1.1, exactly as in the zero-copy scan.
-                if (c == 0x0D) return self.setError("lone CR in literal string");
-                if (c < 0x20 and c != 0x09 and c != 0x0A and c != 0x0D) return self.setError("control character in literal string");
-                if (c == 0x7F) return self.setError("DEL in literal string");
+                if (c == '\n' or c == '\r') return self.setError("newline in basic string");
+                if (c < 0x20 and c != 0x09) return self.setError("control character in string");
+                if (c == 0x7F) return self.setError("DEL in string");
                 if (c >= 0x80) {
                     const before = self.pos;
                     try self.validateUtf8();
@@ -1781,365 +1484,662 @@ pub fn ParserOf(comptime Sink: type) type {
                 try buf.append(self.arena, c);
                 self.advance();
             }
-            return self.setError("unterminated multiline literal string");
-        }
-        return self.setError("unterminated multiline literal string");
-    }
-
-    // Booleans
-
-    fn parseBoolean(self: *Self) Error!Value {
-        self.token_start = self.pos;
-        if (self.matchStr("true")) return .{ .boolean = true };
-        if (self.matchStr("false")) return .{ .boolean = false };
-        // Scan the bareword so we can give a suggestion.
-        const word_start = self.pos;
-        while (self.pos < self.input.len) {
-            const c = self.input[self.pos];
-            if (std.ascii.isAlphanumeric(c) or c == '_') {
-                self.pos += 1;
-            } else break;
-        }
-        const word = self.input[word_start..self.pos];
-        const known = [_][]const u8{ "true", "false", "inf", "nan" };
-        const suggestion = lev.closestMatch(word, &known, lev.suggestionThreshold(word.len));
-        const msg = std.fmt.allocPrint(self.arena, "invalid value '{s}'", .{word}) catch return error.OutOfMemory;
-        return self.setErrorWithSuggestion(msg, suggestion);
-    }
-
-    // Numbers / datetimes
-
-    /// Unified entry point for unquoted values: integers, floats, inf/nan,
-    /// and datetimes. Needs lookahead because `1979-05-27` looks like a
-    /// subtraction in integer context.
-    fn parseNumberOrDateTime(self: *Self) Error!Value {
-        self.token_start = self.pos;
-        // Scan the token.
-        const start = self.pos;
-        // Allow a leading sign for numbers only.
-        var has_sign = false;
-        if (self.peek() == '+' or self.peek() == '-') {
-            has_sign = true;
-            self.advance();
+            return self.setError("unterminated string");
         }
 
-        // inf / nan keywords
-        if (self.peekKeyword("inf")) {
-            _ = self.matchStr("inf");
-            const f: f64 = if (self.input[start] == '-') -std.math.inf(f64) else std.math.inf(f64);
-            return .{ .float = f };
-        }
-        if (self.peekKeyword("nan")) {
-            _ = self.matchStr("nan");
-            // Bit-set nan; sign preserved for completeness but TOML reader
-            // treats nan as nan regardless.
-            const base = std.math.nan(f64);
-            const f: f64 = if (self.input[start] == '-') -base else base;
-            return .{ .float = f };
-        }
-
-        // Collect the token. For a datetime we need at least 4 digits + '-',
-        // so look ahead.
-        if (!has_sign and self.pos + 4 < self.input.len and
-            isDig(self.input[self.pos]) and isDig(self.input[self.pos + 1]) and
-            isDig(self.input[self.pos + 2]) and isDig(self.input[self.pos + 3]) and
-            self.input[self.pos + 4] == '-')
-        {
-            // Likely a date/datetime. Scan to end of token.
-            const token = self.scanDateTimeLiteral();
-            const parsed = dt.parseAny(token) catch return self.setError("invalid datetime");
-            return switch (parsed) {
-                .datetime => |d| .{ .datetime = d },
-                .date => |d| .{ .date = d },
-                .time => |t| .{ .time = t },
-            };
-        }
-        // Time literal: HH:MM:SS...
-        if (!has_sign and self.pos + 2 < self.input.len and
-            isDig(self.input[self.pos]) and isDig(self.input[self.pos + 1]) and self.input[self.pos + 2] == ':')
-        {
-            const token = self.scanTimeLiteral();
-            const parsed = dt.parseAny(token) catch return self.setError("invalid time");
-            return switch (parsed) {
-                .time => |t| .{ .time = t },
-                else => self.setError("invalid time"),
-            };
-        }
-
-        // Number. Distinguish integer from float by scanning.
-        // Check for radix prefix (only after optional sign and only if no sign).
-        if (!has_sign and self.pos + 1 < self.input.len and self.input[self.pos] == '0') {
-            const prefix = self.input[self.pos + 1];
-            if (prefix == 'x' or prefix == 'o' or prefix == 'b') {
-                self.advance();
-                self.advance();
-                return switch (prefix) {
-                    'x' => self.parseRadixInteger(16),
-                    'o' => self.parseRadixInteger(8),
-                    'b' => self.parseRadixInteger(2),
-                    else => unreachable,
-                };
-            }
-        }
-
-        // Decimal int or float. Scan digits, check for `.` or `e`/`E`.
-        var has_dot = false;
-        var has_exp = false;
-        var scan = self.pos;
-        while (scan < self.input.len) : (scan += 1) {
-            const c = self.input[scan];
-            switch (c) {
-                '0'...'9', '_' => {},
-                '.' => {
-                    if (has_dot or has_exp) break;
-                    has_dot = true;
-                },
-                'e', 'E' => {
-                    if (has_exp) break;
-                    has_exp = true;
-                    // optional sign follows
-                    if (scan + 1 < self.input.len and (self.input[scan + 1] == '+' or self.input[scan + 1] == '-')) scan += 1;
-                },
-                else => break,
-            }
-        }
-        const end = scan;
-
-        if (has_dot or has_exp) {
-            // float
-            const raw = self.input[start..end];
-            const f = parseFloatRaw(self.arena, raw) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.InvalidFloat => return self.setError("invalid float"),
-            };
-            // Advance parser.
-            while (self.pos < end) self.advance();
-            return .{ .float = f };
-        }
-
-        // integer (decimal)
-        const raw = self.input[start..end];
-        const i = parseDecFast(raw) orelse
-            (parseDecIntRaw(raw) catch return self.setError("invalid integer"));
-        while (self.pos < end) self.advance();
-        return .{ .integer = i };
-    }
-
-    fn peekKeyword(self: *Self, kw: []const u8) bool {
-        if (self.pos + kw.len > self.input.len) return false;
-        if (!std.mem.eql(u8, self.input[self.pos .. self.pos + kw.len], kw)) return false;
-        // Must be followed by a non-identifier char.
-        const after_idx = self.pos + kw.len;
-        if (after_idx < self.input.len) {
-            const c = self.input[after_idx];
-            if ((c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_') return false;
-        }
-        return true;
-    }
-
-    fn scanDateTimeLiteral(self: *Self) []const u8 {
-        // Scan characters valid in a TOML datetime literal:
-        // digits, `-`, `:`, `T`, `t`, ` `, `.`, `+`, `Z`, `z`.
-        // Stop at whitespace/comma/]/}/#/newline.
-        const start = self.pos;
-        var last_nonspace_end = start;
-        // The space separator between date and time complicates this:
-        // `1979-05-27 07:32:00` -- the space is content. We allow a single
-        // space only if immediately followed by a digit (time section).
-        while (self.pos < self.input.len) {
-            const c = self.input[self.pos];
-            switch (c) {
-                '0'...'9', '-', ':', '.', '+', 'T', 't', 'Z', 'z' => {
+        fn consumeEscape(self: *Self, buf: *ArrayList(u8), multiline: bool) Error!void {
+            _ = self.match('\\');
+            if (self.eof()) return self.setError("unterminated escape");
+            const e = self.peek();
+            switch (e) {
+                'b' => {
+                    try buf.append(self.arena, 0x08);
                     self.advance();
-                    last_nonspace_end = self.pos;
                 },
-                ' ' => {
-                    // Only valid if it separates date from time (first space only).
-                    if (self.pos + 1 < self.input.len and isDig(self.input[self.pos + 1]) and self.pos - start == 10) {
-                        self.advance();
-                        last_nonspace_end = self.pos;
-                    } else break;
+                't' => {
+                    try buf.append(self.arena, 0x09);
+                    self.advance();
                 },
-                else => break,
-            }
-        }
-        self.pos = last_nonspace_end;
-        // Recompute is unnecessary for pos-only consumers; line/col is
-        // whatever we walked to.
-        return self.input[start..last_nonspace_end];
-    }
-
-    fn scanTimeLiteral(self: *Self) []const u8 {
-        const start = self.pos;
-        while (self.pos < self.input.len) {
-            const c = self.input[self.pos];
-            switch (c) {
-                '0'...'9', ':', '.' => self.advance(),
-                else => break,
-            }
-        }
-        return self.input[start..self.pos];
-    }
-
-    fn parseArray(self: *Self) Error!Value {
-        self.token_start = self.pos;
-        if (self.depth >= self.max_depth) return self.setDepthError();
-        self.depth += 1;
-        defer self.depth -= 1;
-        _ = self.match('[');
-        var arr: ArrayList(Value) = .empty;
-        try self.skipWsAndComments();
-        if (self.match(']')) return .{ .array = arr };
-        var idx: usize = 0;
-        while (true) : (idx += 1) {
-            try self.skipWsAndComments();
-
-            // Push `[N]` onto the current path so parseValue records the
-            // element span at e.g. `users[0]` rather than the parent's path.
-            const prev = try self.pushIndex(idx);
-            const value = try self.parseValue();
-            self.popPath(prev);
-
-            try arr.append(self.arena, value);
-            try self.skipWsAndComments();
-            if (self.match(',')) {
-                try self.skipWsAndComments();
-                if (self.match(']')) return .{ .array = arr };
-                continue;
-            }
-            if (self.match(']')) return .{ .array = arr };
-            return self.setError("expected ',' or ']'");
-        }
-    }
-
-    fn parseInlineTable(self: *Self) Error!Value {
-        self.token_start = self.pos;
-        if (self.depth >= self.max_depth) return self.setDepthError();
-        self.depth += 1;
-        defer self.depth -= 1;
-        _ = self.match('{');
-        var tbl: StringArrayHashMap(Value) = .empty;
-        // Local seal set: paths (as joined dotted keys) that have been
-        // directly assigned within THIS inline-table literal and therefore
-        // cannot be extended via dotted-key in a later kv entry.
-        var sealed: StringHashMap(void) = .empty;
-        defer sealed.deinit(self.arena);
-
-        // TOML 1.1 allows newlines, comments, and trailing commas inside
-        // inline tables.
-        try self.skipWsAndComments();
-        if (self.match('}')) return .{ .table = tbl };
-        while (true) {
-            try self.skipWsAndComments();
-            // Trailing comma support: closer may immediately follow.
-            if (self.match('}')) return .{ .table = tbl };
-            var parts: ArrayList([]const u8) = .empty;
-            defer parts.deinit(self.arena);
-            try self.parseKeyPath(&parts);
-            self.skipWs();
-            if (!self.match('=')) return self.setError("expected '=' in inline table");
-            try self.skipWsAndComments();
-
-            // Build the path incrementally so we can check the seal set.
-            var fkbuf: ArrayList(u8) = .empty;
-            defer fkbuf.deinit(self.arena);
-
-            var t = &tbl;
-            for (parts.items[0 .. parts.items.len - 1], 0..) |part, i| {
-                if (i > 0) try fkbuf.append(self.arena, '.');
-                try fkbuf.appendSlice(self.arena, part);
-                if (sealed.contains(fkbuf.items)) {
-                    return self.setErrorFmt("cannot extend inline key '{s}'", .{fkbuf.items});
-                }
-                if (t.getPtr(part)) |existing| {
-                    switch (existing.*) {
-                        .table => t = &existing.table,
-                        else => return self.setError("key is not a table"),
+                'n' => {
+                    try buf.append(self.arena, 0x0A);
+                    self.advance();
+                },
+                'f' => {
+                    try buf.append(self.arena, 0x0C);
+                    self.advance();
+                },
+                'r' => {
+                    try buf.append(self.arena, 0x0D);
+                    self.advance();
+                },
+                'e' => {
+                    // TOML 1.1: \e -> U+001B (ESC).
+                    try buf.append(self.arena, 0x1B);
+                    self.advance();
+                },
+                '"' => {
+                    try buf.append(self.arena, '"');
+                    self.advance();
+                },
+                '\\' => {
+                    try buf.append(self.arena, '\\');
+                    self.advance();
+                },
+                'x' => {
+                    // TOML 1.1: \xHH -> single byte. The two hex digits form
+                    // a codepoint < 256; emit as UTF-8.
+                    self.advance();
+                    const cp = try self.parseUnicodeEscape(2);
+                    try appendCodepoint(buf, self.arena, cp);
+                },
+                'u' => {
+                    self.advance();
+                    const cp = try self.parseUnicodeEscape(4);
+                    try appendCodepoint(buf, self.arena, cp);
+                },
+                'U' => {
+                    self.advance();
+                    const cp = try self.parseUnicodeEscape(8);
+                    try appendCodepoint(buf, self.arena, cp);
+                },
+                '\n', '\r', ' ', '\t' => {
+                    if (!multiline) return self.setError("invalid escape");
+                    // Line-ending backslash: eat whitespace+newline+whitespace.
+                    // Must reach a newline or the sequence is an error.
+                    // Skip trailing spaces/tabs on this line.
+                    while (!self.eof() and (self.peek() == ' ' or self.peek() == '\t')) self.advance();
+                    if (self.eof()) return self.setError("unterminated string");
+                    if (self.peek() == '\r') self.advance();
+                    if (self.eof() or self.peek() != '\n') return self.setError("invalid line-ending backslash");
+                    self.advance();
+                    // Now skip ALL subsequent whitespace incl. newlines.
+                    while (!self.eof()) {
+                        const k = self.peek();
+                        if (k == ' ' or k == '\t' or k == '\n' or k == '\r') self.advance() else break;
                     }
-                } else {
-                    // Zero-copy: `part` is a slice into self.input.
-                    try t.put(self.arena, part, .{ .table = .empty });
-                    t = &t.getPtr(part).?.table;
-                }
+                },
+                else => return self.setError("invalid escape"),
             }
-            const last = parts.items[parts.items.len - 1];
-            if (parts.items.len > 1) try fkbuf.append(self.arena, '.');
-            try fkbuf.appendSlice(self.arena, last);
-            if (sealed.contains(fkbuf.items)) {
-                return self.setErrorFmt("cannot redefine inline key '{s}'", .{fkbuf.items});
-            }
-            if (t.contains(last)) return self.setError("duplicate key in inline table");
-
-            // Push `.fkbuf` onto current_path so parseValue records the
-            // span at the right path inside this inline table literal.
-            const prev = try self.pushPath('.', fkbuf.items);
-            const value = try self.parseValue();
-            self.popPath(prev);
-
-            // Zero-copy: `last` is a slice into self.input.
-            try t.put(self.arena, last, value);
-            // Seal key MUST be duped: fkbuf is a temporary buffer.
-            const seal_key = try self.arena.dupe(u8, fkbuf.items);
-            try sealed.put(self.arena, seal_key, {});
-
-            try self.skipWsAndComments();
-            if (self.match(',')) {
-                try self.skipWsAndComments();
-                continue;
-            }
-            if (self.match('}')) return .{ .table = tbl };
-            return self.setError("expected ',' or '}'");
         }
-    }
 
-    fn parseRadixInteger(self: *Self, comptime base: u8) Error!Value {
-        const start = self.pos;
-        var last_was_underscore = true; // require digit first
-        while (self.pos < self.input.len) {
-            const c = self.peek();
-            if (c == '_') {
-                if (last_was_underscore) return self.setError("invalid underscore in integer");
-                last_was_underscore = true;
-                self.advance();
-                continue;
-            }
-            const ok = switch (base) {
-                16 => (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F'),
-                8 => c >= '0' and c <= '7',
-                2 => c == '0' or c == '1',
-                else => unreachable,
-            };
-            if (!ok) break;
-            last_was_underscore = false;
-            self.advance();
-        }
-        if (last_was_underscore) return self.setError("trailing underscore in integer");
-        if (self.pos == start) return self.setError("missing digits");
-
-        // Parse. Build from bytes skipping underscores.
-        var acc: u64 = 0;
-        var i: usize = start;
-        while (i < self.pos) : (i += 1) {
-            const c = self.input[i];
-            if (c == '_') continue;
-            const d: u64 = switch (base) {
-                16 => switch (c) {
+        fn parseUnicodeEscape(self: *Self, n: usize) Error!u32 {
+            if (self.pos + n > self.input.len) return self.setError("short unicode escape");
+            var cp: u32 = 0;
+            var i: usize = 0;
+            while (i < n) : (i += 1) {
+                const c = self.peek();
+                const d: u32 = switch (c) {
                     '0'...'9' => c - '0',
                     'a'...'f' => c - 'a' + 10,
                     'A'...'F' => c - 'A' + 10,
-                    else => unreachable,
-                },
-                8 => c - '0',
-                2 => c - '0',
-                else => unreachable,
-            };
-            // Overflow-aware multiply+add.
-            const mul = std.math.mul(u64, acc, base) catch return self.setError("integer overflow");
-            acc = std.math.add(u64, mul, d) catch return self.setError("integer overflow");
-            if (acc > @as(u64, std.math.maxInt(i64))) return self.setError("integer overflow");
+                    else => return self.setError("invalid hex in \\u escape"),
+                };
+                cp = cp * 16 + d;
+                self.advance();
+            }
+            if (cp > 0x10FFFF) return self.setError("\\U code point out of range");
+            // Surrogates are invalid.
+            if (cp >= 0xD800 and cp <= 0xDFFF) return self.setError("surrogate code point in \\u escape");
+            return cp;
         }
-        return .{ .integer = @intCast(acc) };
-    }
+
+        fn appendCodepoint(buf: *ArrayList(u8), arena: Allocator, cp: u32) Error!void {
+            var utf8: [4]u8 = undefined;
+            const n = std.unicode.utf8Encode(@intCast(cp), &utf8) catch return error.TomlParseError;
+            try buf.appendSlice(arena, utf8[0..n]);
+        }
+
+        fn parseLiteralString(self: *Self) Error![]const u8 {
+            self.token_start = self.pos;
+            if (!self.match('\'')) return self.setError("expected '\\''");
+            const start = self.pos;
+            while (!self.eof()) {
+                const c = self.peek();
+                if (c == '\'') {
+                    const slice = self.input[start..self.pos];
+                    self.advance();
+                    return slice;
+                }
+                if (c == '\n' or c == '\r') return self.setError("newline in literal string");
+                if (c < 0x20 and c != 0x09) return self.setError("control character in literal string");
+                if (c == 0x7F) return self.setError("DEL in literal string");
+                if (c >= 0x80) {
+                    try self.validateUtf8();
+                    continue;
+                }
+                self.advance();
+            }
+            return self.setError("unterminated literal string");
+        }
+
+        fn parseMultilineBasicString(self: *Self) Error![]const u8 {
+            self.token_start = self.pos;
+            // consume opening """
+            _ = self.match('"');
+            _ = self.match('"');
+            _ = self.match('"');
+            // Trim at most one newline (LF or CRLF pair) immediately after the
+            // opening delimiter. A lone CR is NOT a newline per TOML ABNF and
+            // must fall through to the body loop where it is rejected.
+            if (!self.eof() and self.peek() == '\r' and self.peekAt(1) == '\n') {
+                self.advance();
+                self.advance();
+            } else if (!self.eof() and self.peek() == '\n') {
+                self.advance();
+            }
+
+            var buf: ArrayList(u8) = .empty;
+
+            while (!self.eof()) {
+                // Look for closing """
+                if (self.peek() == '"') {
+                    if (self.peekAt(1) == '"' and self.peekAt(2) == '"') {
+                        // Consume three ", then allow up to 2 more as content.
+                        self.advance();
+                        self.advance();
+                        self.advance();
+                        if (!self.eof() and self.peek() == '"') {
+                            try buf.append(self.arena, '"');
+                            self.advance();
+                            if (!self.eof() and self.peek() == '"') {
+                                try buf.append(self.arena, '"');
+                                self.advance();
+                            }
+                        }
+                        return buf.items;
+                    }
+                    // else: single/double " not at terminator
+                    try buf.append(self.arena, '"');
+                    self.advance();
+                    continue;
+                }
+                if (self.peek() == '\\') {
+                    try self.consumeEscape(&buf, true);
+                    continue;
+                }
+                const c = self.peek();
+                if (c < 0x20 and c != 0x09 and c != 0x0A and c != 0x0D) return self.setError("control character in string");
+                if (c == 0x7F) return self.setError("DEL in string");
+                // Normalize CRLF to LF.
+                if (c == '\r') {
+                    if (self.peekAt(1) == '\n') {
+                        self.advance();
+                        continue;
+                    }
+                    return self.setError("bare CR in multiline string");
+                }
+                if (c >= 0x80) {
+                    const before = self.pos;
+                    try self.validateUtf8();
+                    try buf.appendSlice(self.arena, self.input[before..self.pos]);
+                    continue;
+                }
+                try buf.append(self.arena, c);
+                self.advance();
+            }
+            return self.setError("unterminated multiline string");
+        }
+
+        fn parseMultilineLiteralString(self: *Self) Error![]const u8 {
+            self.token_start = self.pos;
+            _ = self.match('\'');
+            _ = self.match('\'');
+            _ = self.match('\'');
+            // Trim at most one newline (LF or CRLF pair) immediately after the
+            // opening delimiter. A lone CR is NOT a newline per TOML ABNF and
+            // must fall through to the body loop where it is rejected.
+            if (!self.eof() and self.peek() == '\r' and self.peekAt(1) == '\n') {
+                self.advance();
+                self.advance();
+            } else if (!self.eof() and self.peek() == '\n') {
+                self.advance();
+            }
+
+            // Try zero-copy: scan for ''' without any special processing.
+            const start = self.pos;
+            var zero_copy_possible = true;
+            while (!self.eof()) {
+                const c = self.peek();
+                if (c == '\r' and self.peekAt(1) == '\n') {
+                    // Zero-copy would preserve CR -- TOML wants LF only here.
+                    zero_copy_possible = false;
+                    break;
+                }
+                if (c == '\'') {
+                    if (self.peekAt(1) == '\'' and self.peekAt(2) == '\'') {
+                        const end = self.pos;
+                        self.advance();
+                        self.advance();
+                        self.advance();
+                        // Content may have up to 2 trailing single quotes folded in.
+                        var tail: usize = 0;
+                        while (tail < 2 and !self.eof() and self.peek() == '\'') {
+                            self.advance();
+                            tail += 1;
+                        }
+                        if (tail == 0) {
+                            return self.input[start..end];
+                        }
+                        // Fall through: we consumed extras, need copy path.
+                        var buf: ArrayList(u8) = .empty;
+                        try buf.appendSlice(self.arena, self.input[start..end]);
+                        var k: usize = 0;
+                        while (k < tail) : (k += 1) try buf.append(self.arena, '\'');
+                        return buf.items;
+                    }
+                }
+                // Lone CR (not followed by LF) is invalid per TOML 1.1.
+                if (c == 0x0D and self.peekAt(1) != '\n') return self.setError("lone CR in literal string");
+                if (c < 0x20 and c != 0x09 and c != 0x0A and c != 0x0D) return self.setError("control character in literal string");
+                if (c == 0x7F) return self.setError("DEL in literal string");
+                if (c >= 0x80) {
+                    try self.validateUtf8();
+                    continue;
+                }
+                self.advance();
+            }
+            if (!zero_copy_possible) {
+                // Rewind to start of body and walk with copy path.
+                self.pos = start;
+                // Recompute line/col is impractical here; for simplicity the
+                // error location may be off by at most this single string,
+                // which is acceptable for diagnostics.
+                var buf: ArrayList(u8) = .empty;
+                while (!self.eof()) {
+                    const c = self.peek();
+                    if (c == '\r' and self.peekAt(1) == '\n') {
+                        try buf.append(self.arena, '\n');
+                        self.advance();
+                        self.advance();
+                        continue;
+                    }
+                    if (c == '\'') {
+                        if (self.peekAt(1) == '\'' and self.peekAt(2) == '\'') {
+                            self.advance();
+                            self.advance();
+                            self.advance();
+                            var tail: usize = 0;
+                            while (tail < 2 and !self.eof() and self.peek() == '\'') {
+                                try buf.append(self.arena, '\'');
+                                self.advance();
+                                tail += 1;
+                            }
+                            return buf.items;
+                        }
+                    }
+                    // CRLF was consumed above, so any remaining CR is lone and
+                    // invalid per TOML 1.1, exactly as in the zero-copy scan.
+                    if (c == 0x0D) return self.setError("lone CR in literal string");
+                    if (c < 0x20 and c != 0x09 and c != 0x0A and c != 0x0D) return self.setError("control character in literal string");
+                    if (c == 0x7F) return self.setError("DEL in literal string");
+                    if (c >= 0x80) {
+                        const before = self.pos;
+                        try self.validateUtf8();
+                        try buf.appendSlice(self.arena, self.input[before..self.pos]);
+                        continue;
+                    }
+                    try buf.append(self.arena, c);
+                    self.advance();
+                }
+                return self.setError("unterminated multiline literal string");
+            }
+            return self.setError("unterminated multiline literal string");
+        }
+
+        // Booleans
+
+        fn parseBoolean(self: *Self) Error!Value {
+            self.token_start = self.pos;
+            if (self.matchStr("true")) return .{ .boolean = true };
+            if (self.matchStr("false")) return .{ .boolean = false };
+            // Scan the bareword so we can give a suggestion.
+            const word_start = self.pos;
+            while (self.pos < self.input.len) {
+                const c = self.input[self.pos];
+                if (std.ascii.isAlphanumeric(c) or c == '_') {
+                    self.pos += 1;
+                } else break;
+            }
+            const word = self.input[word_start..self.pos];
+            const known = [_][]const u8{ "true", "false", "inf", "nan" };
+            const suggestion = lev.closestMatch(word, &known, lev.suggestionThreshold(word.len));
+            const msg = std.fmt.allocPrint(self.arena, "invalid value '{s}'", .{word}) catch return error.OutOfMemory;
+            return self.setErrorWithSuggestion(msg, suggestion);
+        }
+
+        // Numbers / datetimes
+
+        /// Unified entry point for unquoted values: integers, floats, inf/nan,
+        /// and datetimes. Needs lookahead because `1979-05-27` looks like a
+        /// subtraction in integer context.
+        fn parseNumberOrDateTime(self: *Self) Error!Value {
+            self.token_start = self.pos;
+            // Scan the token.
+            const start = self.pos;
+            // Allow a leading sign for numbers only.
+            var has_sign = false;
+            if (self.peek() == '+' or self.peek() == '-') {
+                has_sign = true;
+                self.advance();
+            }
+
+            // inf / nan keywords
+            if (self.peekKeyword("inf")) {
+                _ = self.matchStr("inf");
+                const f: f64 = if (self.input[start] == '-') -std.math.inf(f64) else std.math.inf(f64);
+                return .{ .float = f };
+            }
+            if (self.peekKeyword("nan")) {
+                _ = self.matchStr("nan");
+                // Bit-set nan; sign preserved for completeness but TOML reader
+                // treats nan as nan regardless.
+                const base = std.math.nan(f64);
+                const f: f64 = if (self.input[start] == '-') -base else base;
+                return .{ .float = f };
+            }
+
+            // Collect the token. For a datetime we need at least 4 digits + '-',
+            // so look ahead.
+            if (!has_sign and self.pos + 4 < self.input.len and
+                isDig(self.input[self.pos]) and isDig(self.input[self.pos + 1]) and
+                isDig(self.input[self.pos + 2]) and isDig(self.input[self.pos + 3]) and
+                self.input[self.pos + 4] == '-')
+            {
+                // Likely a date/datetime. Scan to end of token.
+                const token = self.scanDateTimeLiteral();
+                const parsed = dt.parseAny(token) catch return self.setError("invalid datetime");
+                return switch (parsed) {
+                    .datetime => |d| .{ .datetime = d },
+                    .date => |d| .{ .date = d },
+                    .time => |t| .{ .time = t },
+                };
+            }
+            // Time literal: HH:MM:SS...
+            if (!has_sign and self.pos + 2 < self.input.len and
+                isDig(self.input[self.pos]) and isDig(self.input[self.pos + 1]) and self.input[self.pos + 2] == ':')
+            {
+                const token = self.scanTimeLiteral();
+                const parsed = dt.parseAny(token) catch return self.setError("invalid time");
+                return switch (parsed) {
+                    .time => |t| .{ .time = t },
+                    else => self.setError("invalid time"),
+                };
+            }
+
+            // Number. Distinguish integer from float by scanning.
+            // Check for radix prefix (only after optional sign and only if no sign).
+            if (!has_sign and self.pos + 1 < self.input.len and self.input[self.pos] == '0') {
+                const prefix = self.input[self.pos + 1];
+                if (prefix == 'x' or prefix == 'o' or prefix == 'b') {
+                    self.advance();
+                    self.advance();
+                    return switch (prefix) {
+                        'x' => self.parseRadixInteger(16),
+                        'o' => self.parseRadixInteger(8),
+                        'b' => self.parseRadixInteger(2),
+                        else => unreachable,
+                    };
+                }
+            }
+
+            // Decimal int or float. Scan digits, check for `.` or `e`/`E`.
+            var has_dot = false;
+            var has_exp = false;
+            var scan = self.pos;
+            while (scan < self.input.len) : (scan += 1) {
+                const c = self.input[scan];
+                switch (c) {
+                    '0'...'9', '_' => {},
+                    '.' => {
+                        if (has_dot or has_exp) break;
+                        has_dot = true;
+                    },
+                    'e', 'E' => {
+                        if (has_exp) break;
+                        has_exp = true;
+                        // optional sign follows
+                        if (scan + 1 < self.input.len and (self.input[scan + 1] == '+' or self.input[scan + 1] == '-')) scan += 1;
+                    },
+                    else => break,
+                }
+            }
+            const end = scan;
+
+            if (has_dot or has_exp) {
+                // float
+                const raw = self.input[start..end];
+                const f = parseFloatRaw(self.arena, raw) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.InvalidFloat => return self.setError("invalid float"),
+                };
+                // Advance parser.
+                while (self.pos < end) self.advance();
+                return .{ .float = f };
+            }
+
+            // integer (decimal)
+            const raw = self.input[start..end];
+            const i = parseDecFast(raw) orelse
+                (parseDecIntRaw(raw) catch return self.setError("invalid integer"));
+            while (self.pos < end) self.advance();
+            return .{ .integer = i };
+        }
+
+        fn peekKeyword(self: *Self, kw: []const u8) bool {
+            if (self.pos + kw.len > self.input.len) return false;
+            if (!std.mem.eql(u8, self.input[self.pos .. self.pos + kw.len], kw)) return false;
+            // Must be followed by a non-identifier char.
+            const after_idx = self.pos + kw.len;
+            if (after_idx < self.input.len) {
+                const c = self.input[after_idx];
+                if ((c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_') return false;
+            }
+            return true;
+        }
+
+        fn scanDateTimeLiteral(self: *Self) []const u8 {
+            // Scan characters valid in a TOML datetime literal:
+            // digits, `-`, `:`, `T`, `t`, ` `, `.`, `+`, `Z`, `z`.
+            // Stop at whitespace/comma/]/}/#/newline.
+            const start = self.pos;
+            var last_nonspace_end = start;
+            // The space separator between date and time complicates this:
+            // `1979-05-27 07:32:00` -- the space is content. We allow a single
+            // space only if immediately followed by a digit (time section).
+            while (self.pos < self.input.len) {
+                const c = self.input[self.pos];
+                switch (c) {
+                    '0'...'9', '-', ':', '.', '+', 'T', 't', 'Z', 'z' => {
+                        self.advance();
+                        last_nonspace_end = self.pos;
+                    },
+                    ' ' => {
+                        // Only valid if it separates date from time (first space only).
+                        if (self.pos + 1 < self.input.len and isDig(self.input[self.pos + 1]) and self.pos - start == 10) {
+                            self.advance();
+                            last_nonspace_end = self.pos;
+                        } else break;
+                    },
+                    else => break,
+                }
+            }
+            self.pos = last_nonspace_end;
+            // Recompute is unnecessary for pos-only consumers; line/col is
+            // whatever we walked to.
+            return self.input[start..last_nonspace_end];
+        }
+
+        fn scanTimeLiteral(self: *Self) []const u8 {
+            const start = self.pos;
+            while (self.pos < self.input.len) {
+                const c = self.input[self.pos];
+                switch (c) {
+                    '0'...'9', ':', '.' => self.advance(),
+                    else => break,
+                }
+            }
+            return self.input[start..self.pos];
+        }
+
+        fn parseArray(self: *Self) Error!Value {
+            self.token_start = self.pos;
+            if (self.depth >= self.max_depth) return self.setDepthError();
+            self.depth += 1;
+            defer self.depth -= 1;
+            _ = self.match('[');
+            var arr: ArrayList(Value) = .empty;
+            try self.skipWsAndComments();
+            if (self.match(']')) return .{ .array = arr };
+            var idx: usize = 0;
+            while (true) : (idx += 1) {
+                try self.skipWsAndComments();
+
+                // Push `[N]` onto the current path so parseValue records the
+                // element span at e.g. `users[0]` rather than the parent's path.
+                const prev = try self.pushIndex(idx);
+                const value = try self.parseValue();
+                self.popPath(prev);
+
+                try arr.append(self.arena, value);
+                try self.skipWsAndComments();
+                if (self.match(',')) {
+                    try self.skipWsAndComments();
+                    if (self.match(']')) return .{ .array = arr };
+                    continue;
+                }
+                if (self.match(']')) return .{ .array = arr };
+                return self.setError("expected ',' or ']'");
+            }
+        }
+
+        fn parseInlineTable(self: *Self) Error!Value {
+            self.token_start = self.pos;
+            if (self.depth >= self.max_depth) return self.setDepthError();
+            self.depth += 1;
+            defer self.depth -= 1;
+            _ = self.match('{');
+            var tbl: StringArrayHashMap(Value) = .empty;
+            // Local seal set: paths (as joined dotted keys) that have been
+            // directly assigned within THIS inline-table literal and therefore
+            // cannot be extended via dotted-key in a later kv entry.
+            var sealed: StringHashMap(void) = .empty;
+            defer sealed.deinit(self.arena);
+
+            // TOML 1.1 allows newlines, comments, and trailing commas inside
+            // inline tables.
+            try self.skipWsAndComments();
+            if (self.match('}')) return .{ .table = tbl };
+            while (true) {
+                try self.skipWsAndComments();
+                // Trailing comma support: closer may immediately follow.
+                if (self.match('}')) return .{ .table = tbl };
+                var parts: ArrayList([]const u8) = .empty;
+                defer parts.deinit(self.arena);
+                try self.parseKeyPath(&parts);
+                self.skipWs();
+                if (!self.match('=')) return self.setError("expected '=' in inline table");
+                try self.skipWsAndComments();
+
+                // Build the path incrementally so we can check the seal set.
+                var fkbuf: ArrayList(u8) = .empty;
+                defer fkbuf.deinit(self.arena);
+
+                var t = &tbl;
+                for (parts.items[0 .. parts.items.len - 1], 0..) |part, i| {
+                    if (i > 0) try fkbuf.append(self.arena, '.');
+                    try fkbuf.appendSlice(self.arena, part);
+                    if (sealed.contains(fkbuf.items)) {
+                        return self.setErrorFmt("cannot extend inline key '{s}'", .{fkbuf.items});
+                    }
+                    if (t.getPtr(part)) |existing| {
+                        switch (existing.*) {
+                            .table => t = &existing.table,
+                            else => return self.setError("key is not a table"),
+                        }
+                    } else {
+                        // Zero-copy: `part` is a slice into self.input.
+                        try t.put(self.arena, part, .{ .table = .empty });
+                        t = &t.getPtr(part).?.table;
+                    }
+                }
+                const last = parts.items[parts.items.len - 1];
+                if (parts.items.len > 1) try fkbuf.append(self.arena, '.');
+                try fkbuf.appendSlice(self.arena, last);
+                if (sealed.contains(fkbuf.items)) {
+                    return self.setErrorFmt("cannot redefine inline key '{s}'", .{fkbuf.items});
+                }
+                if (t.contains(last)) return self.setError("duplicate key in inline table");
+
+                // Push `.fkbuf` onto current_path so parseValue records the
+                // span at the right path inside this inline table literal.
+                const prev = try self.pushPath('.', fkbuf.items);
+                const value = try self.parseValue();
+                self.popPath(prev);
+
+                // Zero-copy: `last` is a slice into self.input.
+                try t.put(self.arena, last, value);
+                // Seal key MUST be duped: fkbuf is a temporary buffer.
+                const seal_key = try self.arena.dupe(u8, fkbuf.items);
+                try sealed.put(self.arena, seal_key, {});
+
+                try self.skipWsAndComments();
+                if (self.match(',')) {
+                    try self.skipWsAndComments();
+                    continue;
+                }
+                if (self.match('}')) return .{ .table = tbl };
+                return self.setError("expected ',' or '}'");
+            }
+        }
+
+        fn parseRadixInteger(self: *Self, comptime base: u8) Error!Value {
+            const start = self.pos;
+            var last_was_underscore = true; // require digit first
+            while (self.pos < self.input.len) {
+                const c = self.peek();
+                if (c == '_') {
+                    if (last_was_underscore) return self.setError("invalid underscore in integer");
+                    last_was_underscore = true;
+                    self.advance();
+                    continue;
+                }
+                const ok = switch (base) {
+                    16 => (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F'),
+                    8 => c >= '0' and c <= '7',
+                    2 => c == '0' or c == '1',
+                    else => unreachable,
+                };
+                if (!ok) break;
+                last_was_underscore = false;
+                self.advance();
+            }
+            if (last_was_underscore) return self.setError("trailing underscore in integer");
+            if (self.pos == start) return self.setError("missing digits");
+
+            // Parse. Build from bytes skipping underscores.
+            var acc: u64 = 0;
+            var i: usize = start;
+            while (i < self.pos) : (i += 1) {
+                const c = self.input[i];
+                if (c == '_') continue;
+                const d: u64 = switch (base) {
+                    16 => switch (c) {
+                        '0'...'9' => c - '0',
+                        'a'...'f' => c - 'a' + 10,
+                        'A'...'F' => c - 'A' + 10,
+                        else => unreachable,
+                    },
+                    8 => c - '0',
+                    2 => c - '0',
+                    else => unreachable,
+                };
+                // Overflow-aware multiply+add.
+                const mul = std.math.mul(u64, acc, base) catch return self.setError("integer overflow");
+                acc = std.math.add(u64, mul, d) catch return self.setError("integer overflow");
+                if (acc > @as(u64, std.math.maxInt(i64))) return self.setError("integer overflow");
+            }
+            return .{ .integer = @intCast(acc) };
+        }
     };
 }
 

@@ -1454,7 +1454,7 @@ test "regression: inline-table sealing blocks later dotted extension" {
 }
 
 test "regression: dotted-key sibling extension inside inline tables works" {
-    // Bug 6: inside an inline table, `{a.b = 1, a.c = 2}` should succeed  - 
+    // Bug 6: inside an inline table, `{a.b = 1, a.c = 2}` should succeed  -
     // the inline table's own 'a' subtable may have multiple dotted children.
     var p = try parseOk("x = {a.b = 1, a.c = 2}\n");
     defer p.deinit();
@@ -1968,4 +1968,3 @@ test "table: dotted key-value with quoted dotted segment is distinct" {
     try testing.expectEqual(@as(i64, 1), getPath(p.value, &.{ "a", "b.c" }).?.integer);
     try testing.expectEqual(@as(i64, 2), getPath(p.value, &.{ "a", "b", "c" }).?.integer);
 }
-

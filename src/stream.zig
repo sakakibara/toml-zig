@@ -2279,4 +2279,3 @@ test "gate J: 256 KiB multi-line string with interior brackets equals buffered (
     try testing.expect(Value.eql(buffered, streamed));
     try testing.expectEqual(@as(i64, 7), streamed.get("tail").?.get("n").?.integer);
 }
-

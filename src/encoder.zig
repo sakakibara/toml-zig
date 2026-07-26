@@ -415,8 +415,7 @@ fn writeTypedValue(comptime T: type, value: T, w: *std.Io.Writer, arena: std.mem
                 try writeTypedValue(p.child, item, w, arena);
             }
             break :blk w.writeByte(']');
-        } else
-            @compileError("encodeTyped: unsupported pointer type " ++ @typeName(T)),
+        } else @compileError("encodeTyped: unsupported pointer type " ++ @typeName(T)),
         .array => |a| blk: {
             try w.writeByte('[');
             // Guard avoids a compile error for [0]T: Zig rejects indexing

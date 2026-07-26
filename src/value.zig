@@ -607,9 +607,9 @@ test "Value.getT: typed access" {
     try testing.expectEqual(@as(?u16, 8080), v.getT(u16, "port"));
     try testing.expectEqualStrings("x", v.getT([]const u8, "name").?);
     try testing.expectEqual(@as(?bool, true), v.getT(bool, "tls"));
-    try testing.expect(v.getT(u16, "name") == null);    // type mismatch
+    try testing.expect(v.getT(u16, "name") == null); // type mismatch
     try testing.expect(v.getT(u16, "missing") == null); // missing path
-    try testing.expect(v.getT(u8, "port") == null);     // overflow
+    try testing.expect(v.getT(u8, "port") == null); // overflow
 }
 
 test "Value.makeTable + tablePut + tableGet: build a table" {
@@ -1004,4 +1004,3 @@ test "Value.set: setAtPath depth limit returns PathTooDeep, not segfault" {
     var root: Value = .{ .table = .empty };
     try testing.expectError(error.PathTooDeep, root.set(a, path, @as(i64, 42)));
 }
-
