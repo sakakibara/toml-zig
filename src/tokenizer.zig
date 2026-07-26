@@ -110,10 +110,10 @@ pub const Tokenizer = struct {
     const Container = enum { array, table };
 
     const State = enum {
-        top,         // statement start
-        after_eq,    // after a top-level `=`, expecting a value
+        top, // statement start
+        after_eq, // after a top-level `=`, expecting a value
         array_value, // inside `[ ... ]`, expecting a value or `]`
-        table_key,   // inside `{ ... }`, expecting a key, `.`, or `=`
+        table_key, // inside `{ ... }`, expecting a key, `.`, or `=`
         table_value, // inside `{ ... }` after `=`, expecting a value
         after_value, // a value just ended; `,` / closer / EOL by context
     };
@@ -702,8 +702,9 @@ fn expectKinds(src: []const u8, want: []const Kind) !void {
 test "tokenizer: multi-element array" {
     try expectKinds("k = [1, 2]\n", &.{
         .key_segment, .equals,
-        .array_punct, .value_integer, .array_punct, .value_integer, .array_punct,
-        .eol,
+        .array_punct, .value_integer,
+        .array_punct, .value_integer,
+        .array_punct, .eol,
     });
 }
 
@@ -732,22 +733,28 @@ test "tokenizer: inline table with multiple pairs" {
 
 test "tokenizer: inline table inside array" {
     try expectKinds("k = [{ a = true }, 2]\n", &.{
-        .key_segment,        .equals,
-        .array_punct,        .inline_table_punct,
-        .key_segment,        .equals,
-        .value_bool,         .inline_table_punct,
-        .array_punct,        .value_integer,
-        .array_punct,        .eol,
+        .key_segment, .equals,
+        .array_punct, .inline_table_punct,
+        .key_segment, .equals,
+        .value_bool,  .inline_table_punct,
+        .array_punct, .value_integer,
+        .array_punct, .eol,
     });
 }
 
 test "tokenizer: array spanning lines keeps container context" {
-    try expectKinds("k = [\n  1,\n  [2],\n]\nx = 3\n", &.{
-        .key_segment, .equals, .array_punct, .eol,
-        .value_integer, .array_punct, .eol,
-        .array_punct, .value_integer, .array_punct, .array_punct, .eol,
-        .array_punct, .eol,
-        .key_segment, .equals, .value_integer, .eol,
+    // One expected-kinds row per input line.
+    const rows = [_][]const Kind{
+        &.{ .key_segment, .equals, .array_punct, .eol },
+        &.{ .value_integer, .array_punct, .eol },
+        &.{ .array_punct, .value_integer, .array_punct, .array_punct, .eol },
+        &.{ .array_punct, .eol },
+        &.{ .key_segment, .equals, .value_integer, .eol },
+    };
+    try expectKinds("k = [\n  1,\n  [2],\n]\nx = 3\n", comptime blk: {
+        var all: []const Kind = &.{};
+        for (rows) |row| all = all ++ row;
+        break :blk all;
     });
 }
 
@@ -838,8 +845,8 @@ test "tokenizer: resumable CRLF at buffer boundary emits one EOL matching whole-
         "a = 1\r\nb = 2\r\n\r\nc = 3\r\n",
         "[x]\r\nk = \"v\"\r\n",
         "ml = \"\"\"\r\nline1\r\nline2\r\n\"\"\"\r\n[after]\r\nk = 1\r\n",
-        "a = 1\r",          // lone \r at EOF
-        "\r\na = 1\r\n",    // \r\n at start
+        "a = 1\r", // lone \r at EOF
+        "\r\na = 1\r\n", // \r\n at start
     };
     for (cases) |src| {
         // Oracle: whole-input, non-resumable.
