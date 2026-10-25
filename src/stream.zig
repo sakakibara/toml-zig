@@ -1365,7 +1365,7 @@ const ChunkedReader = struct {
         const self: *ChunkedReader = @fieldParentPtr("reader", io_r);
         if (self.pos >= self.src.len) return error.EndOfStream;
         const want = @min(self.step, self.src.len - self.pos);
-        const give = @min(want, @intFromEnum(limit));
+        const give = @min(want, @backingInt(limit));
         const n = try w.write(self.src[self.pos..][0..give]);
         self.pos += n;
         return n;
@@ -1442,7 +1442,7 @@ const SplitAtReader = struct {
         const self: *SplitAtReader = @fieldParentPtr("reader", io_r);
         if (self.pos >= self.src.len) return error.EndOfStream;
         const end = if (self.pos < self.at) self.at else self.src.len;
-        const give = @min(@intFromEnum(limit), end - self.pos);
+        const give = @min(@backingInt(limit), end - self.pos);
         const n = try w.write(self.src[self.pos..][0..give]);
         self.pos += n;
         return n;

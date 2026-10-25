@@ -79,8 +79,8 @@ pub fn build(b: *std.Build) void {
         const bench_step = b.step("bench", "Run microbenchmarks");
         bench_step.dependOn(&run_bench.step);
 
-        // Random-input fuzzer. Sidesteps the broken `zig test --fuzz`
-        // mode in 0.16.0 and gives us a portable, scriptable harness.
+        // Random-input fuzzer: a portable, scriptable harness that does
+        // not depend on `zig test --fuzz`.
         const fuzz_exe = b.addExecutable(.{
             .name = "toml-fuzz",
             .root_module = b.createModule(.{
@@ -92,7 +92,7 @@ pub fn build(b: *std.Build) void {
         });
         b.installArtifact(fuzz_exe);
         const run_fuzz = b.addRunArtifact(fuzz_exe);
-        if (b.args) |args| run_fuzz.addArgs(args);
+        run_fuzz.addPassthruArgs();
         const fuzz_step = b.step("fuzz", "Run the random-input fuzzer (pass --iters N etc. via -- )");
         fuzz_step.dependOn(&run_fuzz.step);
 

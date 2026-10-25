@@ -248,7 +248,7 @@ pub const Value = union(enum) {
                 },
                 else => null,
             },
-            .pointer => |p| if (p.size == .slice and p.child == u8 and p.is_const)
+            .pointer => |p| if (p.size == .slice and p.child == u8 and p.attrs.@"const")
                 (if (v == .string) v.string else null)
             else
                 @compileError("Value.getT: only []const u8 slices supported, got " ++ @typeName(T)),
@@ -398,10 +398,10 @@ pub fn fromAny(arena: Allocator, comptime T: type, value: T) (Allocator.Error ||
         .int, .comptime_int => .{ .integer = std.math.cast(i64, value) orelse return error.IntegerOverflow },
         .float, .comptime_float => .{ .float = @floatCast(value) },
         .pointer => |p| blk: {
-            if (p.size == .slice and p.child == u8 and p.is_const) {
+            if (p.size == .slice and p.child == u8 and p.attrs.@"const") {
                 break :blk Value.fromString(arena, value);
             }
-            if (p.size == .one and p.is_const) {
+            if (p.size == .one and p.attrs.@"const") {
                 const child_info = @typeInfo(p.child);
                 if (child_info == .array and child_info.array.child == u8) {
                     const as_slice: []const u8 = value;

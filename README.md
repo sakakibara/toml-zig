@@ -32,7 +32,7 @@ const cfg = try toml.parseInto(Config, arena, src, .{});
 
 ## Install
 
-Requires Zig 0.16.0 or newer.
+Requires Zig 0.17.
 
 ```sh
 zig fetch --save git+https://github.com/sakakibara/toml-zig

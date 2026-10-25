@@ -113,16 +113,16 @@ pub fn encodeTyped(w: *std.Io.Writer, value: anytype, arena: std.mem.Allocator, 
 /// a rename collision keeps declaration order. `sort_keys` iterates this order
 /// per structural pass; a flattened field's members sort within their own
 /// group at the flattened field's position, not interleaved with siblings.
-fn sortedFieldOrder(comptime T: type) [@typeInfo(T).@"struct".fields.len]usize {
-    const fields = @typeInfo(T).@"struct".fields;
-    var order: [fields.len]usize = undefined;
-    for (0..fields.len) |i| order[i] = i;
-    for (1..fields.len) |i| {
+fn sortedFieldOrder(comptime T: type) [@typeInfo(T).@"struct".field_names.len]usize {
+    const names = @typeInfo(T).@"struct".field_names;
+    var order: [names.len]usize = undefined;
+    for (0..names.len) |i| order[i] = i;
+    for (1..names.len) |i| {
         var j = i;
         while (j > 0 and std.mem.lessThan(
             u8,
-            renamedKey(T, fields[order[j]].name),
-            renamedKey(T, fields[order[j - 1]].name),
+            renamedKey(T, names[order[j]]),
+            renamedKey(T, names[order[j - 1]]),
         )) : (j -= 1) {
             const tmp = order[j];
             order[j] = order[j - 1];
@@ -145,9 +145,9 @@ fn encodeTaggedUnion(
     const tag_field = T.toml_tag;
     const active_tag = std.meta.activeTag(value);
 
-    inline for (@typeInfo(T).@"union".fields) |union_field| {
-        if (active_tag == @field(std.meta.Tag(T), union_field.name)) {
-            const variant_name = union_field.name;
+    const u = @typeInfo(T).@"union";
+    inline for (u.field_names, u.field_types) |variant_name, PayloadType| {
+        if (active_tag == @field(std.meta.Tag(T), variant_name)) {
             const effective_name = comptime renamedKey(T, variant_name);
 
             // Emit the discriminator first.
@@ -158,7 +158,6 @@ fn encodeTaggedUnion(
 
             // Pass 1: flat scalars from the payload.
             // Pass 2: sub-tables from the payload.
-            const PayloadType = union_field.type;
             if (PayloadType != void) {
                 const payload = @field(value, variant_name);
                 // true because the discriminator key was already emitted
@@ -211,18 +210,19 @@ fn emitStructSubTables(
     const s = @typeInfo(T).@"struct";
     if (options.sort_keys) {
         inline for (comptime sortedFieldOrder(T)) |fi| {
-            try emitSubTableField(T, s.fields[fi], value, w, path, path_alloc, arena, is_root, has_any_kv, options);
+            try emitSubTableField(T, s.field_names[fi], s.field_types[fi], value, w, path, path_alloc, arena, is_root, has_any_kv, options);
         }
     } else {
-        inline for (s.fields) |field| {
-            try emitSubTableField(T, field, value, w, path, path_alloc, arena, is_root, has_any_kv, options);
+        inline for (s.field_names, s.field_types) |name, Field| {
+            try emitSubTableField(T, name, Field, value, w, path, path_alloc, arena, is_root, has_any_kv, options);
         }
     }
 }
 
 fn emitSubTableField(
     comptime T: type,
-    comptime field: std.builtin.Type.StructField,
+    comptime name: [:0]const u8,
+    comptime Field: type,
     value: T,
     w: *std.Io.Writer,
     path: *ArrayList([]const u8),
@@ -232,18 +232,18 @@ fn emitSubTableField(
     has_any_kv: *bool,
     options: EncodeOptions,
 ) EncodeError!void {
-    if (comptime isSkipped(T, field.name)) return;
-    const fv = @field(value, field.name);
-    if (comptime isFlattened(T, field.name)) {
+    if (comptime isSkipped(T, name)) return;
+    const fv = @field(value, name);
+    if (comptime isFlattened(T, name)) {
         // Descend into the flattened struct's sub-tables at the current path
         // level (do NOT push the flattened field's own key).
-        try emitStructSubTables(field.type, fv, w, path, path_alloc, arena, is_root, has_any_kv, options);
+        try emitStructSubTables(Field, fv, w, path, path_alloc, arena, is_root, has_any_kv, options);
         return;
     }
-    if (comptime !fieldHasSubTable(field.type)) return;
-    const eff_key = comptime renamedKey(T, field.name);
-    const is_opt = comptime @typeInfo(field.type) == .optional;
-    const ActualType = comptime if (is_opt) @typeInfo(field.type).optional.child else field.type;
+    if (comptime !fieldHasSubTable(Field)) return;
+    const eff_key = comptime renamedKey(T, name);
+    const is_opt = comptime @typeInfo(Field) == .optional;
+    const ActualType = comptime if (is_opt) @typeInfo(Field).optional.child else Field;
     // Unwrap ?T: null -> absent section (mirrors decode's absent-table -> null).
     const should_emit: bool = if (comptime is_opt) fv != null else true;
     if (!should_emit) return;
@@ -314,38 +314,39 @@ fn emitFlatScalars(
     const s = @typeInfo(T).@"struct";
     if (options.sort_keys) {
         inline for (comptime sortedFieldOrder(T)) |fi| {
-            try emitScalarField(T, s.fields[fi], value, w, arena, has_any_kv, options);
+            try emitScalarField(T, s.field_names[fi], s.field_types[fi], value, w, arena, has_any_kv, options);
         }
     } else {
-        inline for (s.fields) |field| {
-            try emitScalarField(T, field, value, w, arena, has_any_kv, options);
+        inline for (s.field_names, s.field_types) |name, Field| {
+            try emitScalarField(T, name, Field, value, w, arena, has_any_kv, options);
         }
     }
 }
 
 fn emitScalarField(
     comptime T: type,
-    comptime field: std.builtin.Type.StructField,
+    comptime name: [:0]const u8,
+    comptime Field: type,
     value: T,
     w: *std.Io.Writer,
     arena: std.mem.Allocator,
     has_any_kv: *bool,
     options: EncodeOptions,
 ) EncodeError!void {
-    if (comptime isSkipped(T, field.name)) return;
-    const fv = @field(value, field.name);
-    if (comptime isFlattened(T, field.name)) {
-        try emitFlatScalars(field.type, fv, w, arena, has_any_kv, options);
+    if (comptime isSkipped(T, name)) return;
+    const fv = @field(value, name);
+    if (comptime isFlattened(T, name)) {
+        try emitFlatScalars(Field, fv, w, arena, has_any_kv, options);
         return;
     }
-    if (comptime fieldHasSubTable(field.type)) return;
+    if (comptime fieldHasSubTable(Field)) return;
     // Null optional fields are omitted entirely; decode treats an absent key
     // as null for optional fields, so this round-trips.
-    const emit: bool = if (comptime @typeInfo(field.type) == .optional) fv != null else true;
+    const emit: bool = if (comptime @typeInfo(Field) == .optional) fv != null else true;
     if (emit) {
-        try writeKey(w, comptime renamedKey(T, field.name));
+        try writeKey(w, comptime renamedKey(T, name));
         try w.writeAll(" = ");
-        try writeTypedValue(field.type, fv, w, arena);
+        try writeTypedValue(Field, fv, w, arena);
         try w.writeByte('\n');
         has_any_kv.* = true;
     }
@@ -388,7 +389,7 @@ fn writeTypedValue(comptime T: type, value: T, w: *std.Io.Writer, arena: std.mem
     if (comptime (@typeInfo(T) == .@"struct" and @hasDecl(T, "toToml"))) {
         comptime {
             const fn_info = @typeInfo(@TypeOf(T.toToml)).@"fn";
-            if (fn_info.params.len != 2) {
+            if (fn_info.param_types.len != 2) {
                 @compileError(@typeName(T) ++ ".toToml must take exactly 2 params: (Self, Allocator)");
             }
         }
@@ -406,7 +407,7 @@ fn writeTypedValue(comptime T: type, value: T, w: *std.Io.Writer, arena: std.mem
             break :blk w.print("{d}", .{i});
         },
         .float, .comptime_float => writeFloat(w, @floatCast(value)),
-        .pointer => |p| if (p.size == .slice and p.child == u8 and p.is_const)
+        .pointer => |p| if (p.size == .slice and p.child == u8 and p.attrs.@"const")
             writeQuotedString(w, value)
         else if (p.size == .slice) blk: {
             try w.writeByte('[');
@@ -1474,7 +1475,7 @@ test "encode multiline string: CR escaped as \\r, CRLF round-trip byte-exact" {
     // Build the initial value by parsing a single-line TOML that uses \r\n
     // escape sequences. The decoded string has literal CR and LF bytes. At
     // 62 bytes (>= multiline_threshold=60, has LF) it re-encodes as multiline.
-    const toml_src = "v = \"\\r\\n" ++ ("x" ** 60) ++ "\"\n";
+    const toml_src = "v = \"\\r\\n" ++ &@as([60]u8, @splat('x')) ++ "\"\n";
     var arena1: ArenaAllocator = .init(testing.allocator);
     defer arena1.deinit();
     const parsed1 = try parser.parse(arena1.allocator(), toml_src, .{});
@@ -1496,7 +1497,7 @@ test "encode multiline string: CR escaped as \\r, CRLF round-trip byte-exact" {
 
 test "encode multiline string: multiple CRs and CRLF pairs all escaped" {
     // "start\r\n" ++ 58*'x' ++ "\r\nend" -> 70-byte value (>= 60, has LF).
-    const toml_src = "v = \"start\\r\\n" ++ ("x" ** 58) ++ "\\r\\nend\"\n";
+    const toml_src = "v = \"start\\r\\n" ++ &@as([58]u8, @splat('x')) ++ "\\r\\nend\"\n";
     var arena1: ArenaAllocator = .init(testing.allocator);
     defer arena1.deinit();
     const parsed1 = try parser.parse(arena1.allocator(), toml_src, .{});

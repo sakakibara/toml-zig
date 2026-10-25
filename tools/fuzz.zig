@@ -8,8 +8,8 @@
 //!   - document.parse + emit produces byte-identical output for any
 //!     input it accepts
 //!
-//! This sidesteps `zig test --fuzz`, which is broken in Zig 0.16.0
-//! (test_runner type mismatch on `@errorReturnTrace`).
+//! A portable, scriptable harness that does not depend on
+//! `zig test --fuzz`.
 //!
 //! CLI:
 //!   toml-fuzz [--iters N] [--seed S] [--max-input M]
@@ -275,7 +275,7 @@ fn eqlT(comptime T: type, x: T, y: T) bool {
             break :blk eqlT(o.child, x.?, y.?);
         },
         .pointer => |p| blk: {
-            if (p.child == u8 and p.is_const) break :blk std.mem.eql(u8, x, y);
+            if (p.child == u8 and p.attrs.@"const") break :blk std.mem.eql(u8, x, y);
             if (x.len != y.len) break :blk false;
             for (x, y) |xe, ye| {
                 if (!eqlT(p.child, xe, ye)) break :blk false;
@@ -283,8 +283,8 @@ fn eqlT(comptime T: type, x: T, y: T) bool {
             break :blk true;
         },
         .@"struct" => |st| blk: {
-            inline for (st.fields) |f| {
-                if (!eqlT(f.type, @field(x, f.name), @field(y, f.name))) break :blk false;
+            inline for (st.field_names, st.field_types) |name, Field| {
+                if (!eqlT(Field, @field(x, name), @field(y, name))) break :blk false;
             }
             break :blk true;
         },
