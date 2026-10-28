@@ -58,7 +58,7 @@ const PathBuilder = struct {
 
     pub fn pushIndex(self: *PathBuilder, arena: Allocator, idx: usize) Allocator.Error!usize {
         const prev = self.buf.items.len;
-        const s = try std.fmt.allocPrint(arena, "[{d}]", .{idx});
+        const s = try arena.print("[{d}]", .{idx});
         try self.buf.appendSlice(arena, s);
         return prev;
     }
@@ -85,7 +85,7 @@ fn addDiagSuggest(
     args: anytype,
 ) Allocator.Error!void {
     const list = options.errors orelse return;
-    const msg = try std.fmt.allocPrint(arena, fmt, args);
+    const msg = try arena.print(fmt, args);
     const path_owned: ?[]const u8 = if (path.slice().len > 0) try arena.dupe(u8, path.slice()) else null;
     try list.append(arena, .{
         .message = msg,
@@ -974,7 +974,7 @@ test "decode: tagged union errors report diagnostics" {
         const v = try parse(a, "[plugin]\nkind = \"xyz\"\nhost = \"localhost\"\n", .{});
         try testing.expectError(error.InvalidEnumValue, decode(Wrapper, a, v, .{ .errors = &errs }));
         try testing.expectEqual(@as(usize, 1), errs.items.len);
-        try testing.expect(std.mem.indexOf(u8, errs.items[0].message, "invalid enum value `xyz`") != null);
+        try testing.expect(std.mem.find(u8, errs.items[0].message, "invalid enum value `xyz`") != null);
     }
 
     // Non-string discriminator.

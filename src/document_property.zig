@@ -144,7 +144,7 @@ fn genContainer(arena: Allocator, rng: std.Random, model: *Model, w: *Io.Writer,
 
 fn genAotBlock(arena: Allocator, rng: std.Random, model: *Model, w: *Io.Writer) !void {
     model.counter += 1;
-    const name = try std.fmt.allocPrint(arena, "aot{d}", .{model.counter});
+    const name = try arena.print("aot{d}", .{model.counter});
     try w.writeByte('\n');
     var elem: u8 = 0;
     while (elem < 2) : (elem += 1) {
@@ -168,7 +168,7 @@ fn maybeBlankOrComment(arena: Allocator, rng: std.Random, model: *Model, w: *Io.
         try w.writeByte('\n');
     } else if (roll < 30) {
         model.counter += 1;
-        const text = try std.fmt.allocPrint(arena, "# note {d}\n", .{model.counter});
+        const text = try arena.print("# note {d}\n", .{model.counter});
         try w.writeAll(text);
         try model.comments.append(arena, text);
         try model.comment_owners.append(arena, owner);
@@ -223,7 +223,7 @@ fn freshKey(arena: Allocator, rng: std.Random, model: *Model, used: *std.ArrayLi
     }
     model.counter += 1;
     const base = bare_pool[rng.uintLessThan(usize, bare_pool.len)];
-    const key = try std.fmt.allocPrint(arena, "{s}{d}", .{ base, model.counter });
+    const key = try arena.print("{s}{d}", .{ base, model.counter });
     try used.append(arena, key);
     return key;
 }
@@ -298,7 +298,7 @@ fn genTableValue(arena: Allocator, rng: std.Random, model: *Model) Allocator.Err
     var i: u32 = 0;
     while (i < n) : (i += 1) {
         model.counter += 1;
-        const key = try std.fmt.allocPrint(arena, "f{d}", .{model.counter});
+        const key = try arena.print("f{d}", .{model.counter});
         try tbl.put(arena, key, try genValue(arena, rng, model, false));
     }
     return .{ .table = tbl };
@@ -351,7 +351,7 @@ fn pickTarget(arena: Allocator, rng: std.Random, model: *Model) !Target {
     var i: u32 = 0;
     while (i < chain_len) : (i += 1) {
         model.counter += 1;
-        const seg = try std.fmt.allocPrint(arena, "new{d}", .{model.counter});
+        const seg = try arena.print("new{d}", .{model.counter});
         path = try appendSeg(arena, path, seg);
     }
     return .{ .segments = path, .kind = .missing_chain };

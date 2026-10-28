@@ -73,7 +73,7 @@ jobs:
         run: zig build test --summary all
 
       - name: zig build (release)
-        run: zig build -Doptimize=ReleaseFast --summary all
+        run: zig build -Doptimize=fast --summary all
 
       - name: install toml-test (unix)
         if: runner.os != 'Windows'
@@ -154,7 +154,7 @@ jobs:
           restore-keys: |
             zig-cache-cross-${{ matrix.target }}-${{ env.ZIG_VERSION }}-
       - name: build for ${{ matrix.target }}
-        run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSafe
+        run: zig build -Dtarget=${{ matrix.target }} -Doptimize=safe
 
   # Random-input fuzzing. Asserts no panic, round-trip invariant on
   # parse/encode, byte-identical lossless on document model, and span

@@ -663,7 +663,7 @@ pub const Document = struct {
     pub fn addCommentBefore(self: *Document, path: []const u8, text: []const u8) Error!void {
         const idx = try self.editableKvIndex(path);
         try rejectMultilineComment(text);
-        const raw = try std.fmt.allocPrint(self.arena, "# {s}\n", .{text});
+        const raw = try self.arena.print("# {s}\n", .{text});
         try self.items.insert(self.arena, idx, .{ .comment = raw });
         self.shiftIndices(idx, 1);
         self.refreshParsed() catch |e| {
@@ -678,7 +678,7 @@ pub const Document = struct {
         const idx = try self.editableKvIndex(path);
         try rejectMultilineComment(text);
         try self.ensureItemEndsWithNewline(idx);
-        const raw = try std.fmt.allocPrint(self.arena, "# {s}\n", .{text});
+        const raw = try self.arena.print("# {s}\n", .{text});
         try self.items.insert(self.arena, idx + 1, .{ .comment = raw });
         self.shiftIndices(idx + 1, 1);
         self.refreshParsed() catch |e| {
@@ -725,11 +725,11 @@ pub const Document = struct {
 
         // The line ending: the trailing region is "<whitespace>[# comment]<newline>".
         // Find where the newline is so we can rebuild.
-        const nl = std.mem.indexOfScalar(u8, after_value, '\n') orelse after_value.len;
+        const nl = std.mem.findScalar(u8, after_value, '\n') orelse after_value.len;
         const line_end = if (nl < after_value.len) "\n" else "";
 
         const new_tail = if (text) |t|
-            try std.fmt.allocPrint(self.arena, "  # {s}{s}", .{ t, line_end })
+            try self.arena.print("  # {s}{s}", .{ t, line_end })
         else
             try self.arena.dupe(u8, line_end);
 
@@ -858,7 +858,7 @@ pub const Document = struct {
             try self.items.append(self.arena, .{ .blank = "\n" });
         }
         const rendered = try renderHeaderSegments(self.arena, enclosing);
-        const raw = try std.fmt.allocPrint(self.arena, "[{s}]\n", .{rendered});
+        const raw = try self.arena.print("[{s}]\n", .{rendered});
         const path_segments = try dupeSegments(self.arena, enclosing);
         const header_item: Item = .{ .header = .{
             .raw = raw,
@@ -1040,7 +1040,7 @@ const FormattedKv = struct { line: []const u8, value_offset: usize };
 fn formatKvLine(arena: Allocator, key: []const u8, value: []const u8) !FormattedKv {
     const key_raw = try encodeKey(arena, key);
     const value_offset: usize = key_raw.len + " = ".len;
-    const line = try std.fmt.allocPrint(arena, "{s} = {s}\n", .{ key_raw, value });
+    const line = try arena.print("{s} = {s}\n", .{ key_raw, value });
     return .{ .line = line, .value_offset = value_offset };
 }
 
@@ -1070,13 +1070,13 @@ fn writeInlineValue(w: *Io.Writer, value: Value) (Io.Writer.Error || error{ Nest
 /// A comment is a single source line. Reject any embedded line break so a
 /// comment edit cannot splice in a new statement that re-parses live.
 fn rejectMultilineComment(text: []const u8) Error!void {
-    if (std.mem.indexOfAny(u8, text, "\n\r") != null) return error.InvalidComment;
+    if (std.mem.findAny(u8, text, "\n\r") != null) return error.InvalidComment;
 }
 
 /// True when `path` uses `[N]` array-index syntax, which `get` honors but
 /// the structural editors (setLiteral/remove) cannot act on.
 fn pathHasArrayIndex(path: []const u8) bool {
-    return std.mem.indexOfScalar(u8, path, '[') != null;
+    return std.mem.findScalar(u8, path, '[') != null;
 }
 
 /// Validate that `raw` is a single TOML value literal, not a fragment that
@@ -1086,7 +1086,7 @@ fn pathHasArrayIndex(path: []const u8) bool {
 /// header and reparent unrelated keys. Require the parse to yield exactly the
 /// one wrapper key `_v` so the literal can only ever replace one value.
 fn validateValueLiteral(arena: Allocator, raw: []const u8) Error!void {
-    const wrapped = std.fmt.allocPrint(arena, "_v = {s}", .{raw}) catch return error.OutOfMemory;
+    const wrapped = arena.print("_v = {s}", .{raw}) catch return error.OutOfMemory;
     const parsed = parser_mod.parse(arena, wrapped, .{}) catch return error.InvalidValue;
     if (parsed != .table or parsed.table.count() != 1 or parsed.table.get("_v") == null) {
         return error.InvalidValue;
@@ -1179,18 +1179,18 @@ fn appendInlineEntry(arena: Allocator, layout: *InlineTableLayout, key: []const 
         break :blk try std.mem.concat(arena, u8, &.{ ",", open_trail });
     };
 
-    if (std.mem.indexOfScalar(u8, last.trailing, '#')) |hash| {
+    if (std.mem.findScalar(u8, last.trailing, '#')) |hash| {
         // The old last entry carries an inline comment. Keep the comment on
         // its entry: add the separating comma before it when missing, end
         // the comment's line, and indent the new entry like its siblings.
         // The bytes after the comment's line break (close-side padding)
         // move to the new entry.
-        const nl = std.mem.indexOfScalarPos(u8, last.trailing, hash, '\n');
+        const nl = std.mem.findScalarPos(u8, last.trailing, hash, '\n');
         const new_entry_trailing: []const u8 = if (nl) |n|
             try arena.dupe(u8, last.trailing[n..])
         else
             "";
-        const comma: []const u8 = if (std.mem.indexOfScalar(u8, last.trailing, ',') == null) "," else "";
+        const comma: []const u8 = if (std.mem.findScalar(u8, last.trailing, ',') == null) "," else "";
         const head = if (nl) |n| last.trailing[0..n] else last.trailing;
         const sep = try arena.dupe(u8, last.sep);
         last.trailing = try std.mem.concat(arena, u8, &.{ comma, head, "\n", wsTail(inter_pattern) });
@@ -1234,17 +1234,17 @@ fn appendInlineEntry(arena: Allocator, layout: *InlineTableLayout, key: []const 
 /// Drop an inline `# ...` comment from a trailing-bytes pattern, keeping the
 /// comma and the line-break/indent structure around it.
 fn stripInlineComment(arena: Allocator, t: []const u8) Error![]const u8 {
-    const hash = std.mem.indexOfScalar(u8, t, '#') orelse return arena.dupe(u8, t);
+    const hash = std.mem.findScalar(u8, t, '#') orelse return arena.dupe(u8, t);
     var head_end = hash;
     while (head_end > 0 and (t[head_end - 1] == ' ' or t[head_end - 1] == '\t')) head_end -= 1;
-    const nl = std.mem.indexOfScalarPos(u8, t, hash, '\n') orelse t.len;
+    const nl = std.mem.findScalarPos(u8, t, hash, '\n') orelse t.len;
     return std.mem.concat(arena, u8, &.{ t[0..head_end], t[nl..] });
 }
 
 /// The indentation bytes after the last line break of `pattern`, or an
 /// empty slice for a single-line pattern.
 fn wsTail(pattern: []const u8) []const u8 {
-    if (std.mem.lastIndexOfScalar(u8, pattern, '\n')) |n| return pattern[n + 1 ..];
+    if (std.mem.findScalarLast(u8, pattern, '\n')) |n| return pattern[n + 1 ..];
     return "";
 }
 
@@ -1296,7 +1296,7 @@ fn removeFromLayout(arena: Allocator, layout: *InlineTableLayout, segments: []co
                 // before `}` stays symmetric (`{ x = 1 }`, not `{ x = 1}`).
                 if (i > 0 and i == layout.entries.items.len) {
                     var prev = &layout.entries.items[i - 1];
-                    if (std.mem.lastIndexOfScalar(u8, prev.trailing, ',')) |comma_pos| {
+                    if (std.mem.findScalarLast(u8, prev.trailing, ',')) |comma_pos| {
                         var all_ws = true;
                         for (prev.trailing[comma_pos + 1 ..]) |c| {
                             if (c != ' ' and c != '\t' and c != '\n' and c != '\r') {
@@ -2117,8 +2117,8 @@ test "document: setLiteral creates new section if missing" {
     defer aw.deinit();
     try doc.emit(&aw.writer);
     const out = aw.written();
-    try testing.expect(std.mem.indexOf(u8, out, "[client]") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "timeout = 30") != null);
+    try testing.expect(std.mem.find(u8, out, "[client]") != null);
+    try testing.expect(std.mem.find(u8, out, "timeout = 30") != null);
 }
 
 test "document: remove drops the line" {
@@ -2324,8 +2324,8 @@ test "document: setLiteral edits inside an inline table" {
     defer aw.deinit();
     try doc.emit(&aw.writer);
     const out = aw.written();
-    try testing.expect(std.mem.indexOf(u8, out, "x = 99") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "y = 2") != null);
+    try testing.expect(std.mem.find(u8, out, "x = 99") != null);
+    try testing.expect(std.mem.find(u8, out, "y = 2") != null);
 }
 
 test "document: setLiteral adds new key inside an inline table" {
@@ -2342,7 +2342,7 @@ test "document: setLiteral adds new key inside an inline table" {
     defer aw.deinit();
     try doc.emit(&aw.writer);
     const out = aw.written();
-    try testing.expect(std.mem.indexOf(u8, out, "z = 3") != null);
+    try testing.expect(std.mem.find(u8, out, "z = 3") != null);
 }
 
 test "document: append to inline table does not duplicate entry comments" {
@@ -2393,8 +2393,8 @@ test "document: moveSection swaps section order" {
     defer aw.deinit();
     try doc.emit(&aw.writer);
     const out = aw.written();
-    const client_idx = std.mem.indexOf(u8, out, "[client]").?;
-    const server_idx = std.mem.indexOf(u8, out, "[server]").?;
+    const client_idx = std.mem.find(u8, out, "[client]").?;
+    const server_idx = std.mem.find(u8, out, "[server]").?;
     try testing.expect(client_idx < server_idx);
 }
 
@@ -3029,7 +3029,7 @@ test "Document.set: u64 >= 2^63 returns IntegerOverflow" {
     var aw: std.Io.Writer.Allocating = .init(arena.allocator());
     defer aw.deinit();
     try doc.emit(&aw.writer);
-    try testing.expect(std.mem.indexOf(u8, aw.written(), "9000") != null);
+    try testing.expect(std.mem.find(u8, aw.written(), "9000") != null);
 }
 
 test "Document.parse accepts a normal small input (guard no false positive)" {
@@ -3056,9 +3056,9 @@ test "document: new section with a space in the name re-encodes the header" {
     defer aw.deinit();
     try doc.emit(&aw.writer);
     const out = aw.written();
-    try testing.expect(std.mem.indexOf(u8, out, "[\"my server\"]") != null);
+    try testing.expect(std.mem.find(u8, out, "[\"my server\"]") != null);
     // The bare, unquoted form would be invalid TOML and must not appear.
-    try testing.expect(std.mem.indexOf(u8, out, "[my server]") == null);
+    try testing.expect(std.mem.find(u8, out, "[my server]") == null);
     // The document round-trips and the value is reachable by decoded path.
     try testing.expectEqual(@as(i64, 80), doc.get("my server.port").?.integer);
 }
@@ -3075,7 +3075,7 @@ test "document: dotted new section re-encodes each segment" {
     defer aw.deinit();
     try doc.emit(&aw.writer);
     const out = aw.written();
-    try testing.expect(std.mem.indexOf(u8, out, "[a.\"my key\"]") != null);
+    try testing.expect(std.mem.find(u8, out, "[a.\"my key\"]") != null);
     try testing.expectEqual(@as(i64, 1), doc.get("a.my key.v").?.integer);
 }
 

@@ -698,8 +698,15 @@ pub fn ParserOf(comptime Sink: type) type {
             if (seq_len == 0) return self.setError("invalid UTF-8 byte");
             if (self.pos + seq_len > self.input.len) return self.setError("truncated UTF-8 sequence");
             const bytes = self.input[self.pos .. self.pos + seq_len];
-            const cp = std.unicode.utf8Decode(bytes) catch return self.setError("invalid UTF-8 sequence");
-            // Surrogates (encoded as 3 bytes) are rejected by utf8Decode,
+            const decoded = switch (seq_len) {
+                1 => bytes[0],
+                2 => std.unicode.utf8Decode2(bytes[0..2].*),
+                3 => std.unicode.utf8Decode3(bytes[0..3].*),
+                4 => std.unicode.utf8Decode4(bytes[0..4].*),
+                else => unreachable,
+            };
+            const cp = decoded catch return self.setError("invalid UTF-8 sequence");
+            // Surrogates (encoded as 3 bytes) are rejected by utf8Decode3,
             // but double-check code point range.
             if (cp > 0x10FFFF) return self.setError("code point out of range");
             var i: usize = 0;
@@ -743,7 +750,7 @@ pub fn ParserOf(comptime Sink: type) type {
         /// `error.NestingTooDeep`, which the document recovery loop never swallows.
         fn setDepthError(self: *Self) Error {
             if (self.errors) |list| {
-                const msg = std.fmt.allocPrint(self.arena, "nesting depth exceeds limit ({d})", .{self.max_depth}) catch return error.OutOfMemory;
+                const msg = self.arena.print("nesting depth exceeds limit ({d})", .{self.max_depth}) catch return error.OutOfMemory;
                 list.append(self.arena, .{
                     .message = msg,
                     .span = self.diagSpan(),
@@ -754,7 +761,7 @@ pub fn ParserOf(comptime Sink: type) type {
 
         fn setErrorFmt(self: *Self, comptime fmt: []const u8, args: anytype) Error {
             if (self.errors) |list| {
-                const msg = std.fmt.allocPrint(self.arena, fmt, args) catch return error.OutOfMemory;
+                const msg = self.arena.print(fmt, args) catch return error.OutOfMemory;
                 list.append(self.arena, .{
                     .message = msg,
                     .span = self.diagSpan(),
@@ -1115,7 +1122,7 @@ pub fn ParserOf(comptime Sink: type) type {
         /// element-qualified `current_seen_prefix` (`base[N].rest`), so they are
         /// already element-scoped and untouched.
         fn resetAotSubPaths(self: *Self, base: []const u8) Error!void {
-            const prefix = try std.fmt.allocPrint(self.arena, "{s}.", .{base});
+            const prefix = try self.arena.print("{s}.", .{base});
             inline for (.{
                 &self.seen.defined_tables,
                 &self.seen.implicit_tables,
@@ -1803,7 +1810,7 @@ pub fn ParserOf(comptime Sink: type) type {
             const word = self.input[word_start..self.pos];
             const known = [_][]const u8{ "true", "false", "inf", "nan" };
             const suggestion = lev.closestMatch(word, &known, lev.suggestionThreshold(word.len));
-            const msg = std.fmt.allocPrint(self.arena, "invalid value '{s}'", .{word}) catch return error.OutOfMemory;
+            const msg = self.arena.print("invalid value '{s}'", .{word}) catch return error.OutOfMemory;
             return self.setErrorWithSuggestion(msg, suggestion);
         }
 
@@ -3070,10 +3077,10 @@ test "Diagnostic.renderRich: basic shape" {
     try d.renderRich(&aw, src);
     const out = aw.buffered();
 
-    try testing.expect(std.mem.indexOf(u8, out, "error at 2:8") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "expected integer") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "port = \"8080\"") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "^") != null);
+    try testing.expect(std.mem.find(u8, out, "error at 2:8") != null);
+    try testing.expect(std.mem.find(u8, out, "expected integer") != null);
+    try testing.expect(std.mem.find(u8, out, "port = \"8080\"") != null);
+    try testing.expect(std.mem.find(u8, out, "^") != null);
 }
 
 test "Diagnostic.renderRich: includes path and suggestion" {
@@ -3089,8 +3096,8 @@ test "Diagnostic.renderRich: includes path and suggestion" {
     try d.renderRich(&aw, src);
     const out = aw.buffered();
 
-    try testing.expect(std.mem.indexOf(u8, out, "at config.prt") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "did you mean `port`?") != null);
+    try testing.expect(std.mem.find(u8, out, "at config.prt") != null);
+    try testing.expect(std.mem.find(u8, out, "did you mean `port`?") != null);
 }
 
 test "Diagnostic.renderRich: emits notes" {
@@ -3108,8 +3115,8 @@ test "Diagnostic.renderRich: emits notes" {
     try d.renderRich(&aw, src);
     const out = aw.buffered();
 
-    try testing.expect(std.mem.indexOf(u8, out, "previously declared here") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "1:1") != null);
+    try testing.expect(std.mem.find(u8, out, "previously declared here") != null);
+    try testing.expect(std.mem.find(u8, out, "1:1") != null);
 }
 
 test "end-to-end: multi-error parse + rich rendering of each" {

@@ -462,8 +462,8 @@ pub const Tokenizer = struct {
             .value_bool
         else if (looksLikeDateOrTime(slice))
             .value_datetime
-        else if (std.mem.indexOfScalar(u8, slice, '.') != null or
-            std.mem.indexOfAny(u8, slice, "eE") != null or
+        else if (std.mem.findScalar(u8, slice, '.') != null or
+            std.mem.findAny(u8, slice, "eE") != null or
             std.mem.eql(u8, slice, "inf") or std.mem.eql(u8, slice, "+inf") or
             std.mem.eql(u8, slice, "-inf") or std.mem.eql(u8, slice, "nan") or
             std.mem.eql(u8, slice, "+nan") or std.mem.eql(u8, slice, "-nan"))

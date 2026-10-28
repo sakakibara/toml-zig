@@ -737,7 +737,7 @@ fn writeTime(w: *Io.Writer, t: v.Time) EncodeError!void {
 
     // Trim trailing zeros from the 9-digit nanosecond field.
     var buf: [10]u8 = undefined;
-    _ = std.fmt.bufPrint(&buf, "{d:0>9}", .{t.nanos}) catch unreachable;
+    _ = std.mem.print(&buf, "{d:0>9}", .{t.nanos}) catch unreachable;
     var end: usize = 9;
     while (end > 1 and buf[end - 1] == '0') : (end -= 1) {}
     try w.writeByte('.');
@@ -818,7 +818,7 @@ test "encode special float forms" {
 
 test "encode large-magnitude floats round-trip bit-exact" {
     // Regression: writeFloat used a 64-byte buffer; decimal-mode f64 needs up
-    // to 347 bytes, so these would overflow bufPrint and panic before the fix.
+    // to 347 bytes, so these would overflow std.mem.print's buffer and panic before the fix.
     const cases = [_]f64{
         1e300,
         -1e300,
@@ -904,7 +904,7 @@ test "encode long multi-line string uses triple-quote form" {
     const v1 = try parser.parse(arena.allocator(), src, .{});
     const encoded = try allocEncode(alloc, v1);
     defer alloc.free(encoded);
-    try testing.expect(std.mem.indexOf(u8, encoded, "\"\"\"") != null);
+    try testing.expect(std.mem.find(u8, encoded, "\"\"\"") != null);
 
     var arena2: ArenaAllocator = .init(alloc);
     defer arena2.deinit();
@@ -930,9 +930,9 @@ test "encodeTyped: un-annotated struct matches encode output" {
     try encodeTyped(&aw, cfg, a, .{});
     const out = aw.buffered();
 
-    try testing.expect(std.mem.indexOf(u8, out, "name = \"ef\"") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "port = 8080") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "tls = true") != null);
+    try testing.expect(std.mem.find(u8, out, "name = \"ef\"") != null);
+    try testing.expect(std.mem.find(u8, out, "port = 8080") != null);
+    try testing.expect(std.mem.find(u8, out, "tls = true") != null);
 }
 
 test "encodeTyped: toml_rename emits renamed key" {
@@ -948,8 +948,8 @@ test "encodeTyped: toml_rename emits renamed key" {
     var aw: std.Io.Writer = .fixed(&buf);
     try encodeTyped(&aw, cfg, arena.allocator(), .{});
     const out = aw.buffered();
-    try testing.expect(std.mem.indexOf(u8, out, "listen-addr = \"0.0.0.0\"") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "listen_addr") == null);
+    try testing.expect(std.mem.find(u8, out, "listen-addr = \"0.0.0.0\"") != null);
+    try testing.expect(std.mem.find(u8, out, "listen_addr") == null);
 }
 
 test "encodeTyped: toml_flatten inlines sub-fields at parent level" {
@@ -968,11 +968,11 @@ test "encodeTyped: toml_flatten inlines sub-fields at parent level" {
     try encodeTyped(&aw, cfg, arena.allocator(), .{});
     const out = aw.buffered();
 
-    try testing.expect(std.mem.indexOf(u8, out, "name = \"foo\"") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "x = 42") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "y = 99") != null);
+    try testing.expect(std.mem.find(u8, out, "name = \"foo\"") != null);
+    try testing.expect(std.mem.find(u8, out, "x = 42") != null);
+    try testing.expect(std.mem.find(u8, out, "y = 99") != null);
     // No [inner] section.
-    try testing.expect(std.mem.indexOf(u8, out, "[inner]") == null);
+    try testing.expect(std.mem.find(u8, out, "[inner]") == null);
 }
 
 test "encodeTyped: toml_skip omits field from output" {
@@ -989,8 +989,8 @@ test "encodeTyped: toml_skip omits field from output" {
     var aw: std.Io.Writer = .fixed(&buf);
     try encodeTyped(&aw, cfg, arena.allocator(), .{});
     const out = aw.buffered();
-    try testing.expect(std.mem.indexOf(u8, out, "name = \"foo\"") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "internal") == null);
+    try testing.expect(std.mem.find(u8, out, "name = \"foo\"") != null);
+    try testing.expect(std.mem.find(u8, out, "internal") == null);
 }
 
 test "encodeTyped: toToml hook bypasses built-in encoding" {
@@ -1000,7 +1000,7 @@ test "encodeTyped: toToml hook bypasses built-in encoding" {
         patch: u32,
 
         pub fn toToml(self: @This(), arena: std.mem.Allocator) std.mem.Allocator.Error!Value {
-            const s = try std.fmt.allocPrint(arena, "{d}.{d}.{d}", .{
+            const s = try arena.print("{d}.{d}.{d}", .{
                 self.major, self.minor, self.patch,
             });
             return Value{ .string = s };
@@ -1017,7 +1017,7 @@ test "encodeTyped: toToml hook bypasses built-in encoding" {
     var aw: std.Io.Writer = .fixed(&buf);
     try encodeTyped(&aw, cfg, arena.allocator(), .{});
     const out = aw.buffered();
-    try testing.expect(std.mem.indexOf(u8, out, "v = \"1.2.3\"") != null);
+    try testing.expect(std.mem.find(u8, out, "v = \"1.2.3\"") != null);
 }
 
 test "encodeTyped: tagged union writes discriminator + payload" {
@@ -1039,9 +1039,9 @@ test "encodeTyped: tagged union writes discriminator + payload" {
     try encodeTyped(&aw, cfg, arena.allocator(), .{});
     const out = aw.buffered();
 
-    try testing.expect(std.mem.indexOf(u8, out, "kind = \"http\"") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "host = \"localhost\"") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "port = 8080") != null);
+    try testing.expect(std.mem.find(u8, out, "kind = \"http\"") != null);
+    try testing.expect(std.mem.find(u8, out, "host = \"localhost\"") != null);
+    try testing.expect(std.mem.find(u8, out, "port = 8080") != null);
 }
 
 test "encode nesting depth guard: deep array tree errors, shallow succeeds" {
@@ -1135,13 +1135,13 @@ test "encodeTyped: toml_flatten with nested sub-table round-trips" {
     const out = aw.buffered();
 
     // Flat scalars from inner must appear at the root level.
-    try testing.expect(std.mem.indexOf(u8, out, "name = \"flat-sub\"") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "x = 10") != null);
+    try testing.expect(std.mem.find(u8, out, "name = \"flat-sub\"") != null);
+    try testing.expect(std.mem.find(u8, out, "x = 10") != null);
     // inner's [sub] section must appear (not be silently dropped).
-    try testing.expect(std.mem.indexOf(u8, out, "[sub]") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "z = 99") != null);
+    try testing.expect(std.mem.find(u8, out, "[sub]") != null);
+    try testing.expect(std.mem.find(u8, out, "z = 99") != null);
     // The flattened field's own key must not appear as a section header.
-    try testing.expect(std.mem.indexOf(u8, out, "[inner]") == null);
+    try testing.expect(std.mem.find(u8, out, "[inner]") == null);
 
     // Full round-trip: encode then decode must recover all fields.
     const decode_mod = @import("decode.zig");
@@ -1169,10 +1169,10 @@ test "encodeTyped: toml_flatten scalars-only still works after refactor" {
     try encodeTyped(&aw, cfg, arena.allocator(), .{});
     const out = aw.buffered();
 
-    try testing.expect(std.mem.indexOf(u8, out, "name = \"foo\"") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "x = 42") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "y = 99") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "[inner]") == null);
+    try testing.expect(std.mem.find(u8, out, "name = \"foo\"") != null);
+    try testing.expect(std.mem.find(u8, out, "x = 42") != null);
+    try testing.expect(std.mem.find(u8, out, "y = 99") != null);
+    try testing.expect(std.mem.find(u8, out, "[inner]") == null);
 }
 
 test "encodeTyped: tagged union payload with nested sub-table round-trips" {
@@ -1206,12 +1206,12 @@ test "encodeTyped: tagged union payload with nested sub-table round-trips" {
     const out = aw.buffered();
 
     // Discriminator and flat scalar from the union payload.
-    try testing.expect(std.mem.indexOf(u8, out, "kind = \"http\"") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "host = \"localhost\"") != null);
+    try testing.expect(std.mem.find(u8, out, "kind = \"http\"") != null);
+    try testing.expect(std.mem.find(u8, out, "host = \"localhost\"") != null);
     // The nested sub-table inside the union payload must appear.
-    try testing.expect(std.mem.indexOf(u8, out, "[p.backend]") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "address = \"10.0.0.1\"") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "timeout = 30") != null);
+    try testing.expect(std.mem.find(u8, out, "[p.backend]") != null);
+    try testing.expect(std.mem.find(u8, out, "address = \"10.0.0.1\"") != null);
+    try testing.expect(std.mem.find(u8, out, "timeout = 30") != null);
 
     // Full round-trip via decode.
     const decode_mod = @import("decode.zig");
@@ -1244,9 +1244,9 @@ test "encodeTyped: tagged union scalars-only still works after refactor" {
     try encodeTyped(&aw, cfg, arena.allocator(), .{});
     const out = aw.buffered();
 
-    try testing.expect(std.mem.indexOf(u8, out, "kind = \"http\"") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "host = \"localhost\"") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "port = 8080") != null);
+    try testing.expect(std.mem.find(u8, out, "kind = \"http\"") != null);
+    try testing.expect(std.mem.find(u8, out, "host = \"localhost\"") != null);
+    try testing.expect(std.mem.find(u8, out, "port = 8080") != null);
 }
 
 test "encodeTyped: toml_flatten two levels deep merges all scalars at root" {
@@ -1275,13 +1275,13 @@ test "encodeTyped: toml_flatten two levels deep merges all scalars at root" {
     const out = aw.buffered();
 
     // All scalars from all three struct types must appear at the root level.
-    try testing.expect(std.mem.indexOf(u8, out, "name = \"test\"") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "x = 10") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "a = 1") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "b = 2") != null);
+    try testing.expect(std.mem.find(u8, out, "name = \"test\"") != null);
+    try testing.expect(std.mem.find(u8, out, "x = 10") != null);
+    try testing.expect(std.mem.find(u8, out, "a = 1") != null);
+    try testing.expect(std.mem.find(u8, out, "b = 2") != null);
     // Neither intermediate type may appear as a section header.
-    try testing.expect(std.mem.indexOf(u8, out, "[inner]") == null);
-    try testing.expect(std.mem.indexOf(u8, out, "[deep]") == null);
+    try testing.expect(std.mem.find(u8, out, "[inner]") == null);
+    try testing.expect(std.mem.find(u8, out, "[deep]") == null);
 }
 
 test "encodeTyped: u64 field exceeding i64 max -> IntegerOverflow" {
@@ -1303,7 +1303,7 @@ test "encodeTyped: u64 within i64 range round-trips" {
     var aw: std.Io.Writer = .fixed(&buf);
     try encodeTyped(&aw, cfg, arena.allocator(), .{});
     const out = aw.buffered();
-    try testing.expect(std.mem.indexOf(u8, out, "n = 100") != null);
+    try testing.expect(std.mem.find(u8, out, "n = 100") != null);
 }
 
 test "encodeTyped: []const i64 emits TOML array and round-trips" {
@@ -1317,7 +1317,7 @@ test "encodeTyped: []const i64 emits TOML array and round-trips" {
     var aw: std.Io.Writer = .fixed(&buf);
     try encodeTyped(&aw, cfg, a, .{});
     const out = aw.buffered();
-    try testing.expect(std.mem.indexOf(u8, out, "nums = [1, 2, 3]") != null);
+    try testing.expect(std.mem.find(u8, out, "nums = [1, 2, 3]") != null);
     const decode_mod = @import("decode.zig");
     const v1 = try parser.parse(a, out, .{});
     const cfg2 = try decode_mod.decode(Config, a, v1, .{});
@@ -1355,7 +1355,7 @@ test "encodeTyped: [3]u8 fixed array is array of ints (not string)" {
     var aw: std.Io.Writer = .fixed(&buf);
     try encodeTyped(&aw, cfg, a, .{});
     const out = aw.buffered();
-    try testing.expect(std.mem.indexOf(u8, out, "bytes = [1, 2, 3]") != null);
+    try testing.expect(std.mem.find(u8, out, "bytes = [1, 2, 3]") != null);
     const decode_mod = @import("decode.zig");
     const v1 = try parser.parse(a, out, .{});
     const cfg2 = try decode_mod.decode(Config, a, v1, .{});
@@ -1372,7 +1372,7 @@ test "encodeTyped: [3]i64 fixed array round-trips" {
     var aw: std.Io.Writer = .fixed(&buf);
     try encodeTyped(&aw, cfg, a, .{});
     const out = aw.buffered();
-    try testing.expect(std.mem.indexOf(u8, out, "vals = [10, 20, 30]") != null);
+    try testing.expect(std.mem.find(u8, out, "vals = [10, 20, 30]") != null);
     const decode_mod = @import("decode.zig");
     const v1 = try parser.parse(a, out, .{});
     const cfg2 = try decode_mod.decode(Config, a, v1, .{});
@@ -1389,7 +1389,7 @@ test "encodeTyped: [0]i64 emits empty TOML array and round-trips" {
     var aw: std.Io.Writer = .fixed(&buf);
     try encodeTyped(&aw, cfg, a, .{});
     const out = aw.buffered();
-    try testing.expect(std.mem.indexOf(u8, out, "empty = []") != null);
+    try testing.expect(std.mem.find(u8, out, "empty = []") != null);
     const decode_mod = @import("decode.zig");
     const v1 = try parser.parse(a, out, .{});
     const cfg2 = try decode_mod.decode(Config, a, v1, .{});
@@ -1406,7 +1406,7 @@ test "encodeTyped: ?i64 non-null emits key and round-trips" {
     var aw: std.Io.Writer = .fixed(&buf);
     try encodeTyped(&aw, cfg, a, .{});
     const out = aw.buffered();
-    try testing.expect(std.mem.indexOf(u8, out, "x = 5") != null);
+    try testing.expect(std.mem.find(u8, out, "x = 5") != null);
     const decode_mod = @import("decode.zig");
     const v1 = try parser.parse(a, out, .{});
     const cfg2 = try decode_mod.decode(Config, a, v1, .{});
@@ -1424,8 +1424,8 @@ test "encodeTyped: ?i64 null omits key entirely; decode yields null" {
     try encodeTyped(&aw, cfg, a, .{});
     const out = aw.buffered();
     // x must be absent from the TOML output.
-    try testing.expect(std.mem.indexOf(u8, out, "x") == null);
-    try testing.expect(std.mem.indexOf(u8, out, "y = 7") != null);
+    try testing.expect(std.mem.find(u8, out, "x") == null);
+    try testing.expect(std.mem.find(u8, out, "y = 7") != null);
     const decode_mod = @import("decode.zig");
     const v1 = try parser.parse(a, out, .{});
     const cfg2 = try decode_mod.decode(Config, a, v1, .{});
@@ -1444,7 +1444,7 @@ test "encodeTyped: enum field emits tag name as string and round-trips" {
     var aw: std.Io.Writer = .fixed(&buf);
     try encodeTyped(&aw, cfg, a, .{});
     const out = aw.buffered();
-    try testing.expect(std.mem.indexOf(u8, out, "color = \"red\"") != null);
+    try testing.expect(std.mem.find(u8, out, "color = \"red\"") != null);
     const decode_mod = @import("decode.zig");
     const v1 = try parser.parse(a, out, .{});
     const cfg2 = try decode_mod.decode(Config, a, v1, .{});
@@ -1462,7 +1462,7 @@ test "encodeTyped: []const []const u8 emits array of strings and round-trips" {
     var aw: std.Io.Writer = .fixed(&buf);
     try encodeTyped(&aw, cfg, a, .{});
     const out = aw.buffered();
-    try testing.expect(std.mem.indexOf(u8, out, "tags = [\"foo\", \"bar\", \"baz\"]") != null);
+    try testing.expect(std.mem.find(u8, out, "tags = [\"foo\", \"bar\", \"baz\"]") != null);
     const decode_mod = @import("decode.zig");
     const v1 = try parser.parse(a, out, .{});
     const cfg2 = try decode_mod.decode(Config, a, v1, .{});
@@ -1484,9 +1484,9 @@ test "encode multiline string: CR escaped as \\r, CRLF round-trip byte-exact" {
     defer testing.allocator.free(encoded);
 
     // Must use multiline form.
-    try testing.expect(std.mem.indexOf(u8, encoded, "\"\"\"") != null);
+    try testing.expect(std.mem.find(u8, encoded, "\"\"\"") != null);
     // No literal CR byte anywhere in the encoded TOML.
-    try testing.expect(std.mem.indexOfScalar(u8, encoded, '\r') == null);
+    try testing.expect(std.mem.findScalar(u8, encoded, '\r') == null);
 
     // Round-trip: re-parse and compare structurally.
     var arena2: ArenaAllocator = .init(testing.allocator);
@@ -1505,8 +1505,8 @@ test "encode multiline string: multiple CRs and CRLF pairs all escaped" {
     const encoded = try allocEncode(testing.allocator, parsed1);
     defer testing.allocator.free(encoded);
 
-    try testing.expect(std.mem.indexOf(u8, encoded, "\"\"\"") != null);
-    try testing.expect(std.mem.indexOfScalar(u8, encoded, '\r') == null);
+    try testing.expect(std.mem.find(u8, encoded, "\"\"\"") != null);
+    try testing.expect(std.mem.findScalar(u8, encoded, '\r') == null);
 
     var arena2: ArenaAllocator = .init(testing.allocator);
     defer arena2.deinit();
@@ -1526,11 +1526,11 @@ test "encode key with embedded newline: single-line basic string, no multiline f
     defer testing.allocator.free(encoded);
 
     // Key token (everything before the first " = ") must be single-line.
-    const eq_idx = std.mem.indexOf(u8, encoded, " = ").?;
+    const eq_idx = std.mem.find(u8, encoded, " = ").?;
     const key_token = encoded[0..eq_idx];
-    try testing.expect(std.mem.indexOf(u8, key_token, "\"\"\"") == null);
-    try testing.expect(std.mem.indexOfScalar(u8, key_token, '\n') == null);
-    try testing.expect(std.mem.indexOfScalar(u8, key_token, '\r') == null);
+    try testing.expect(std.mem.find(u8, key_token, "\"\"\"") == null);
+    try testing.expect(std.mem.findScalar(u8, key_token, '\n') == null);
+    try testing.expect(std.mem.findScalar(u8, key_token, '\r') == null);
 
     // Round-trip: re-parse and structural equality.
     var arena2: ArenaAllocator = .init(testing.allocator);
@@ -1549,11 +1549,11 @@ test "encode key with embedded CR: single-line basic string, no multiline form" 
     const encoded = try allocEncode(testing.allocator, parsed1);
     defer testing.allocator.free(encoded);
 
-    const eq_idx = std.mem.indexOf(u8, encoded, " = ").?;
+    const eq_idx = std.mem.find(u8, encoded, " = ").?;
     const key_token = encoded[0..eq_idx];
-    try testing.expect(std.mem.indexOf(u8, key_token, "\"\"\"") == null);
-    try testing.expect(std.mem.indexOfScalar(u8, key_token, '\n') == null);
-    try testing.expect(std.mem.indexOfScalar(u8, key_token, '\r') == null);
+    try testing.expect(std.mem.find(u8, key_token, "\"\"\"") == null);
+    try testing.expect(std.mem.findScalar(u8, key_token, '\n') == null);
+    try testing.expect(std.mem.findScalar(u8, key_token, '\r') == null);
 
     var arena2: ArenaAllocator = .init(testing.allocator);
     defer arena2.deinit();
@@ -1575,9 +1575,9 @@ test "encodeTyped: optional sub-table present round-trips" {
     try encodeTyped(&aw, cfg, a, .{});
     const out = aw.buffered();
 
-    try testing.expect(std.mem.indexOf(u8, out, "[sub]") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "x = 1") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "y = 2") != null);
+    try testing.expect(std.mem.find(u8, out, "[sub]") != null);
+    try testing.expect(std.mem.find(u8, out, "x = 1") != null);
+    try testing.expect(std.mem.find(u8, out, "y = 2") != null);
 
     const decode_mod = @import("decode.zig");
     const v1 = try parser.parse(a, out, .{});
@@ -1603,8 +1603,8 @@ test "encodeTyped: optional sub-table null emits no header" {
     const out = aw.buffered();
 
     // No [sub] section header when the optional sub-table is null.
-    try testing.expect(std.mem.indexOf(u8, out, "[sub]") == null);
-    try testing.expect(std.mem.indexOf(u8, out, "name = \"hello\"") != null);
+    try testing.expect(std.mem.find(u8, out, "[sub]") == null);
+    try testing.expect(std.mem.find(u8, out, "name = \"hello\"") != null);
 
     const decode_mod = @import("decode.zig");
     const v1 = try parser.parse(a, out, .{});
@@ -1629,9 +1629,9 @@ test "encodeTyped: nested optional sub-tables round-trip" {
         var aw: std.Io.Writer = .fixed(&buf);
         try encodeTyped(&aw, cfg, a, .{});
         const out = aw.buffered();
-        try testing.expect(std.mem.indexOf(u8, out, "[a]") != null);
-        try testing.expect(std.mem.indexOf(u8, out, "[a.b]") != null);
-        try testing.expect(std.mem.indexOf(u8, out, "v = 42") != null);
+        try testing.expect(std.mem.find(u8, out, "[a]") != null);
+        try testing.expect(std.mem.find(u8, out, "[a.b]") != null);
+        try testing.expect(std.mem.find(u8, out, "v = 42") != null);
         const decode_mod = @import("decode.zig");
         const v1 = try parser.parse(a, out, .{});
         const cfg2 = try decode_mod.decode(Root, a, v1, .{});
@@ -1646,9 +1646,9 @@ test "encodeTyped: nested optional sub-tables round-trip" {
         var aw: std.Io.Writer = .fixed(&buf);
         try encodeTyped(&aw, cfg, a, .{});
         const out = aw.buffered();
-        try testing.expect(std.mem.indexOf(u8, out, "[a]") != null);
+        try testing.expect(std.mem.find(u8, out, "[a]") != null);
         // Inner null means no [a.b] section.
-        try testing.expect(std.mem.indexOf(u8, out, "[a.b]") == null);
+        try testing.expect(std.mem.find(u8, out, "[a.b]") == null);
         const decode_mod = @import("decode.zig");
         const v1 = try parser.parse(a, out, .{});
         const cfg2 = try decode_mod.decode(Root, a, v1, .{});
@@ -1663,7 +1663,7 @@ test "encodeTyped: nested optional sub-tables round-trip" {
         var aw: std.Io.Writer = .fixed(&buf);
         try encodeTyped(&aw, cfg, a, .{});
         const out = aw.buffered();
-        try testing.expect(std.mem.indexOf(u8, out, "[a]") == null);
+        try testing.expect(std.mem.find(u8, out, "[a]") == null);
         const decode_mod = @import("decode.zig");
         const v1 = try parser.parse(a, out, .{});
         const cfg2 = try decode_mod.decode(Root, a, v1, .{});
@@ -1692,10 +1692,10 @@ test "encodeTyped: slice-of-struct emits [[array-of-tables]] and round-trips" {
     const out = aw.buffered();
 
     // Three [[items]] headers, one per element.
-    try testing.expect(std.mem.indexOf(u8, out, "[[items]]") != null);
+    try testing.expect(std.mem.find(u8, out, "[[items]]") != null);
     var count: usize = 0;
     var i: usize = 0;
-    while (std.mem.indexOfPos(u8, out, i, "[[items]]")) |pos| : (i = pos + 1) count += 1;
+    while (std.mem.findPos(u8, out, i, "[[items]]")) |pos| : (i = pos + 1) count += 1;
     try testing.expectEqual(@as(usize, 3), count);
 
     const decode_mod = @import("decode.zig");
@@ -1724,7 +1724,7 @@ test "encodeTyped: ?[]const struct null emits nothing, present emits blocks" {
         var aw: std.Io.Writer = .fixed(&buf);
         try encodeTyped(&aw, cfg, a, .{});
         const out = aw.buffered();
-        try testing.expect(std.mem.indexOf(u8, out, "[[items]]") == null);
+        try testing.expect(std.mem.find(u8, out, "[[items]]") == null);
         const v1 = try parser.parse(a, out, .{});
         const cfg2 = try decode_mod.decode(Config, a, v1, .{});
         try testing.expectEqual(@as(?[]const Item, null), cfg2.items);
@@ -1738,7 +1738,7 @@ test "encodeTyped: ?[]const struct null emits nothing, present emits blocks" {
         var aw: std.Io.Writer = .fixed(&buf);
         try encodeTyped(&aw, cfg, a, .{});
         const out = aw.buffered();
-        try testing.expect(std.mem.indexOf(u8, out, "[[items]]") != null);
+        try testing.expect(std.mem.find(u8, out, "[[items]]") != null);
         const v1 = try parser.parse(a, out, .{});
         const cfg2 = try decode_mod.decode(Config, a, v1, .{});
         try testing.expect(cfg2.items != null);
@@ -1763,7 +1763,7 @@ test "encodeTyped: empty slice-of-struct emits no blocks, round-trips empty" {
     var aw: std.Io.Writer = .fixed(&buf);
     try encodeTyped(&aw, cfg, a, .{});
     const out = aw.buffered();
-    try testing.expect(std.mem.indexOf(u8, out, "[[items]]") == null);
+    try testing.expect(std.mem.find(u8, out, "[[items]]") == null);
 
     const decode_mod = @import("decode.zig");
     const v1 = try parser.parse(a, out, .{});
@@ -1790,8 +1790,8 @@ test "encodeTyped: nested array-of-tables emits [[a]] + [[a.b]] and round-trips"
     try encodeTyped(&aw, cfg, a, .{});
     const out = aw.buffered();
 
-    try testing.expect(std.mem.indexOf(u8, out, "[[a]]") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "[[a.b]]") != null);
+    try testing.expect(std.mem.find(u8, out, "[[a]]") != null);
+    try testing.expect(std.mem.find(u8, out, "[[a.b]]") != null);
 
     const decode_mod = @import("decode.zig");
     const v1 = try parser.parse(a, out, .{});
@@ -1831,9 +1831,9 @@ test "encodeTyped: array-of-tables element mixing scalar and sub-table field" {
     // Two [[items]] element headers, each with its own scalar and [items.sub].
     var count: usize = 0;
     var i: usize = 0;
-    while (std.mem.indexOfPos(u8, out, i, "[[items]]")) |pos| : (i = pos + 1) count += 1;
+    while (std.mem.findPos(u8, out, i, "[[items]]")) |pos| : (i = pos + 1) count += 1;
     try testing.expectEqual(@as(usize, 2), count);
-    try testing.expect(std.mem.indexOf(u8, out, "[items.sub]") != null);
+    try testing.expect(std.mem.find(u8, out, "[items.sub]") != null);
 
     const decode_mod = @import("decode.zig");
     const v1 = try parser.parse(a, out, .{});
@@ -1858,7 +1858,7 @@ test "encodeTyped: [N]struct fixed array emits [[array-of-tables]] and round-tri
     var aw: std.Io.Writer = .fixed(&buf);
     try encodeTyped(&aw, cfg, a, .{});
     const out = aw.buffered();
-    try testing.expect(std.mem.indexOf(u8, out, "[[items]]") != null);
+    try testing.expect(std.mem.find(u8, out, "[[items]]") != null);
 
     const decode_mod = @import("decode.zig");
     const v1 = try parser.parse(a, out, .{});

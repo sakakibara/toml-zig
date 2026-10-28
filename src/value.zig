@@ -173,7 +173,7 @@ pub const Value = union(enum) {
         while (rest.len > 0) {
             // Array index `[N]` immediately after a value.
             if (rest[0] == '[') {
-                const close = std.mem.indexOfScalarPos(u8, rest, 1, ']') orelse return null;
+                const close = std.mem.findScalarPos(u8, rest, 1, ']') orelse return null;
                 const idx = std.fmt.parseInt(usize, rest[1..close], 10) catch return null;
                 if (cur != .array) return null;
                 if (idx >= cur.array.items.len) return null;
@@ -429,7 +429,7 @@ fn setAtPath(arena: Allocator, root: *Value, path: []const u8, new: Value, depth
     // Array index `[N]` at the start of the remaining path.
     if (path[0] == '[') {
         if (root.* != .array) return error.InvalidPath;
-        const close = std.mem.indexOfScalarPos(u8, path, 1, ']') orelse return error.InvalidPath;
+        const close = std.mem.findScalarPos(u8, path, 1, ']') orelse return error.InvalidPath;
         const idx = std.fmt.parseInt(usize, path[1..close], 10) catch return error.InvalidPath;
         var rest = path[close + 1 ..];
         if (rest.len > 0 and rest[0] == '.') rest = rest[1..];

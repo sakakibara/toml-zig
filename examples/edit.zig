@@ -5,11 +5,10 @@
 const std = @import("std");
 const toml = @import("toml");
 
-pub fn main() !void {
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa.deinit();
+pub fn main(init: std.process.Init) !void {
+    const gpa = init.gpa;
 
-    var arena: std.heap.ArenaAllocator = .init(gpa.allocator());
+    var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
 
     const src =
@@ -36,7 +35,7 @@ pub fn main() !void {
     // try doc.setLiteral("server.tags", "[\"alpha\", \"beta\"]");
 
     // Emit. Comments and ordering are preserved.
-    var aw: std.Io.Writer.Allocating = .init(gpa.allocator());
+    var aw: std.Io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
     try doc.emit(&aw.writer);
 

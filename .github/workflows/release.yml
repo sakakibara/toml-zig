@@ -68,7 +68,7 @@ jobs:
         run: zig build test --summary all
 
       - name: zig build (release)
-        run: zig build -Doptimize=ReleaseFast --summary all
+        run: zig build -Doptimize=fast --summary all
 
       - name: install toml-test
         shell: bash

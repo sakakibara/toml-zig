@@ -31,7 +31,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = root,
             .target = target,
-            .optimize = .Debug,
+            .optimize = .debug,
         }),
     });
     const docs_install = b.addInstallDirectory(.{
@@ -65,13 +65,13 @@ pub fn build(b: *std.Build) void {
             b.installArtifact(exe);
         }
 
-        // Microbenchmarks. Always built ReleaseFast for representative timing.
+        // Microbenchmarks. Always built in the fast optimize mode for representative timing.
         const bench_exe = b.addExecutable(.{
             .name = "toml-bench",
             .root_module = b.createModule(.{
                 .root_source_file = b.path("bench/main.zig"),
                 .target = target,
-                .optimize = .ReleaseFast,
+                .optimize = .fast,
                 .imports = &.{.{ .name = "toml", .module = toml_module }},
             }),
         });
@@ -86,7 +86,7 @@ pub fn build(b: *std.Build) void {
             .root_module = b.createModule(.{
                 .root_source_file = b.path("tools/fuzz.zig"),
                 .target = target,
-                .optimize = .ReleaseFast,
+                .optimize = .fast,
                 .imports = &.{.{ .name = "toml", .module = toml_module }},
             }),
         });

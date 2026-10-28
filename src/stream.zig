@@ -283,7 +283,7 @@ pub const EventReader = struct {
     fn compact(self: *EventReader, consumed: usize) void {
         if (consumed == 0) return;
         const keep = self.doc_buf.items.len - consumed;
-        std.mem.copyForwards(u8, self.doc_buf.items[0..keep], self.doc_buf.items[consumed..]);
+        @memmove(self.doc_buf.items[0..keep], self.doc_buf.items[consumed..]);
         self.doc_buf.shrinkRetainingCapacity(keep);
         self.base += consumed;
     }
@@ -1042,7 +1042,7 @@ fn ensurePath(arena: std.mem.Allocator, root: *Value, dotted: []const u8, is_arr
         const existing = root.get(dotted);
         const idx = if (existing) |e| (if (e == .array) e.array.items.len else 0) else 0;
         var buf: [600]u8 = undefined;
-        const p = std.fmt.bufPrint(&buf, "{s}[{d}]", .{ dotted, idx }) catch return;
+        const p = std.mem.print(&buf, "{s}[{d}]", .{ dotted, idx }) catch return;
         root.set(arena, p, Value.makeTable()) catch {};
     } else {
         if (root.get(dotted) == null) {
@@ -1124,7 +1124,7 @@ fn resolveHeaderIndex(arena: std.mem.Allocator, root: *Value, header: *std.Array
     if (arr.array.items.len == 0) return p;
     const idx = arr.array.items.len - 1;
     const rest = p[header.items.len..];
-    return std.fmt.allocPrint(arena, "{s}[{d}]{s}", .{ header.items, idx, rest });
+    return arena.print("{s}[{d}]{s}", .{ header.items, idx, rest });
 }
 
 fn parseBuffered(arena: std.mem.Allocator, src: []const u8) !Value {
@@ -1537,7 +1537,7 @@ test "frameNextUnit: a [ inside a string is not a boundary" {
     const r = frameNextUnit(src, true);
     try testing.expect(r == .complete);
     // The unit is the leading kv line, ending at the real header.
-    const idx = std.mem.indexOf(u8, src, "[real]").?;
+    const idx = std.mem.find(u8, src, "[real]").?;
     try testing.expectEqual(idx, r.complete);
 }
 
