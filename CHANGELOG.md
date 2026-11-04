@@ -6,11 +6,15 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-05
+
 ### Changed
 
 - **BREAKING:** requires Zig 0.17.0 (`minimum_zig_version`). On Zig 0.16,
   stay on 0.6.x:
   `zig fetch --save git+https://github.com/sakakibara/toml-zig#v0.6.0`.
+  0.6.x takes fixes on the `zig-0.16` branch; the README's Compatibility
+  section gives the dates.
 
 ## [0.6.0] - 2026-07-22
 
@@ -302,7 +306,10 @@ hand-rolled fast-path decimal integer parser (`parseDecFast`), and
 inlined parser primitives (`peek`, `peekAt`, `advance`, `match`,
 `eof`).
 
-[Unreleased]: https://github.com/sakakibara/toml-zig/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/sakakibara/toml-zig/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/sakakibara/toml-zig/compare/v0.6.0...v0.7.0
+[0.6.0]: https://github.com/sakakibara/toml-zig/compare/v0.5.0...v0.6.0
+[0.5.0]: https://github.com/sakakibara/toml-zig/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/sakakibara/toml-zig/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/sakakibara/toml-zig/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/sakakibara/toml-zig/compare/v0.2.0...v0.3.0
