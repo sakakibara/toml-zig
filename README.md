@@ -515,8 +515,7 @@ The fixtures are a package manifest (small), a Cargo-style lock file
 
 The hot path uses SIMD basic-string scanning and SIMD encoder escape
 scanning (`@Vector(16, u8)`) plus a hand-rolled fast-path decimal
-integer parser. The biggest wins are on string-heavy inputs (medium
-parse, medium encode). See `CHANGELOG.md` for details.
+integer parser. See `CHANGELOG.md` for details.
 
 ## Memory model
 
